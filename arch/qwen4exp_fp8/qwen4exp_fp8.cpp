@@ -110,6 +110,7 @@ struct Layer {
     QsaIndexer   qsa;        /* full-attention layers only; inert when the checkpoint has none */
     GdnFP8       gdn;
     MoeFP8       mlp;
+    MoeFP8       mlp_r;      /* local (aux device, split): the experts on the rank's card */
     /* The control vector's projection, applied to the wide stream right after this layer's
      * feed-forward write -- where llama.cpp's `build_cvec(res_hc, il)` sits in the `qwen4exp`
      * graph. Inert (no op) when the deployment has no vector or this layer is outside its range
@@ -158,11 +159,16 @@ struct Model {
     /* the routed feed-forward's */
     rad_buf b_rlogits = 0, b_eids = 0, b_ew = 0, b_sorted = 0, b_eoff = 0, b_ecnt = 0;
     rad_buf b_egu = 0, b_edn = 0, b_emoe = 0, b_sgu = 0, b_sout = 0, b_sgate = 0;
+    rad_buf b_sorted2 = 0, b_eoff2 = 0;   /* local: the second piece's routing planes (step_auxpipe) */
     ActFP8  a_eff{}, a_sff{};
     /* The rotated codes of the block input, for the routed arm only: `q` and `s` are used and `x`
      * stays zero, since the bf16 source is `a_x`, unrotated. Declared only when the container asks
      * for a rotation; zero handles tell the MoE block the pair is absent. */
     ActFP8  a_hr{};
+    ActFP8  a_hr_h{};      /* local (aux split): host copy of a_hr for the aux card */
+    int64_t aux_r = 0;     /* local: routed experts per layer on the rank's card (split) */
+    rad_buf b_sorted_r = 0, b_eoff_r = 0, b_ecnt_r = 0, b_egu_r = 0, b_edn_r = 0;
+    ActFP8  a_eff_r{};
 
     rad_buf b_hout = 0, b_logits = 0;
 
@@ -194,6 +200,9 @@ struct Model {
      * from the real declare, so it declares the same ops. */
     bool      span_on = false;
     bool      pipe_on = false;
+    bool      aux = false;      /* local: routed experts on the aux device */
+    bool      auxpipe_noted = false;
+    int32_t*  auxpipe_tbl = nullptr;   /* pinned {0, 64 j} pairs, j = 0..rows/64: piece bounds */
     /* {0, pass, T} for a step wider than a pass (pipe_bounds): the windows of the indexer's score
      * plane and the delta net's pieces. A transient (declare), uploaded by every step that reads
      * it -- the first two from the pinned host copy `pipe_cu_h`, made once. */
@@ -872,27 +881,73 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* The model's expert count, not this rank's: the router is replicated and scores every
      * expert. */
+    /* Local (aux device): the routed arm's buffers in pinned host memory, which both cards address;
+     * the aux card runs the expert GEMMs and the gather and must never read the rank's VRAM. */
+    m.aux = rad_aux_device(b) >= 0 && std::getenv("RADIANCE_AUX_MOE_OFF") == nullptr;
+    const int xdom = m.aux ? RAD_DOMAIN_HOST : RAD_DOMAIN_DEVICE;
+    /* Local (aux split): the last `aux_r` expert ids of every layer on the rank's card (an even
+     * count, so the parity classes line up), from RADIANCE_AUX_R_EXPERTS. */
+    m.aux_r = 0;
+    if (m.aux) {
+        const char* e = std::getenv("RADIANCE_AUX_R_EXPERTS");
+        const long long v = e ? std::atoll(e) : (long long)rad_aux_split(b);
+        if (v > 0 && v < m.moecfg.n_expert && m.moecfg.n_ff_shared > 0 && m.moecfg.expert_rot)
+            m.aux_r = v & ~3LL;
+    }
     m.b_rlogits = decl_b(b, nm.f("moe_logits"), g.act_dtype, {T, m.moecfg.n_expert_all});
     m.b_eids    = decl_b(b, nm.f("moe_ids"),    RAD_I32,     {T, m.moecfg.top_k});
-    m.b_ew      = decl_b(b, nm.f("moe_ew"),     g.act_dtype, {T, m.moecfg.top_k});
-    m.b_eoff    = decl_b(b, nm.f("moe_eoff"),   RAD_I32,     {m.moecfg.n_expert + 1});
+    m.b_ew      = decl_b(b, nm.f("moe_ew"),     g.act_dtype, {T, m.moecfg.top_k}, RAD_BUF_TRANSIENT, xdom);
+    m.b_eoff    = decl_b(b, nm.f("moe_eoff"),   RAD_I32,     {m.moecfg.n_expert + 1}, RAD_BUF_TRANSIENT, xdom);
     /* PERSIST, not transient. `moe_scatter` writes the per-expert histogram and no declared op
      * reads it (rad_route_report is a handoff, not an op), so as a transient liveness would let a
      * later buffer alias it, and a wide prefill chunk would corrupt the counts (even negative).
      * One int32 per expert. */
     m.b_ecnt    = decl_b(b, nm.f("moe_ecnt"),   RAD_I32,     {m.moecfg.n_expert},
                          RAD_BUF_PERSIST);
-    m.b_sorted  = decl_b(b, nm.f("moe_sorted"), RAD_I32,     {ER});
-    m.b_egu     = decl_b(b, nm.f("moe_egu"),    g.act_dtype, {ER, 2 * m.moecfg.n_ff_exp});
-    m.a_eff.x   = decl_b(b, nm.f("moe_eff"),    g.act_dtype, {ER, m.moecfg.n_ff_exp});
+    m.b_sorted  = decl_b(b, nm.f("moe_sorted"), RAD_I32,     {ER}, RAD_BUF_TRANSIENT, xdom);
+    m.b_egu     = decl_b(b, nm.f("moe_egu"),    g.act_dtype, {ER, 2 * m.moecfg.n_ff_exp}, RAD_BUF_TRANSIENT, xdom);
+    m.a_eff.x   = decl_b(b, nm.f("moe_eff"),    g.act_dtype, {ER, m.moecfg.n_ff_exp}, RAD_BUF_TRANSIENT, xdom);
     /* ER rows, not max_tok: an expert plane has one row per (token, slot). declare_qs's default
      * would make it `top_k` times too short and the gated quantiser would overrun it (see
      * ActFP8::declare_qs). */
-    RAD_ARCH_TRY(m.a_eff.declare_qs(b, nm, g, "moe_eff", m.moecfg.n_ff_exp, ER));
-    if (m.moecfg.expert_rot)
-        RAD_ARCH_TRY(m.a_hr.declare_qs(b, nm, g, "moe_hr", g.n_embd));
-    m.b_edn     = decl_b(b, nm.f("moe_edn"),    g.act_dtype, {ER, g.n_embd});
-    m.b_emoe    = decl_b(b, nm.f("moe_out"),    g.act_dtype, {T, g.n_embd});
+    RAD_ARCH_TRY(m.a_eff.declare_qs(b, nm, g, "moe_eff", m.moecfg.n_ff_exp, ER, false, true, xdom));
+    if (m.moecfg.expert_rot) {
+        /* Split: the connection writes the codes in VRAM for the rank's experts and the aux
+         * instance reads a host copy (MoeFP8::pass_aux pushes it). */
+        RAD_ARCH_TRY(m.a_hr.declare_qs(b, nm, g, "moe_hr", g.n_embd, 0, false, true,
+                                       m.aux_r ? RAD_DOMAIN_DEVICE : xdom));
+        if (m.aux_r)
+            RAD_ARCH_TRY(m.a_hr_h.declare_qs(b, nm, g, "moe_hr_h", g.n_embd, 0, false, true,
+                                             RAD_DOMAIN_HOST));
+    }
+    if (m.aux_r) {
+        const int64_t nr = m.aux_r;
+        m.b_sorted_r = decl_b(b, nm.f("moe_sorted_r"), RAD_I32, {ER});
+        m.b_eoff_r   = decl_b(b, nm.f("moe_eoff_r"), RAD_I32, {m.moecfg.n_expert + 1});
+        m.b_ecnt_r   = decl_b(b, nm.f("moe_ecnt_r"), RAD_I32, {m.moecfg.n_expert}, RAD_BUF_PERSIST);
+        m.b_egu_r    = decl_b(b, nm.f("moe_egu_r"), g.act_dtype, {ER, 2 * m.moecfg.n_ff_exp});
+        m.a_eff_r.x  = decl_b(b, nm.f("moe_eff_r"), g.act_dtype, {ER, m.moecfg.n_ff_exp});
+        RAD_ARCH_TRY(m.a_eff_r.declare_qs(b, nm, g, "moe_eff_r", m.moecfg.n_ff_exp, ER));
+        m.b_edn_r    = decl_b(b, nm.f("moe_edn_r"), g.act_dtype, {ER, g.n_embd});
+        if (!m.b_sorted_r || !m.b_eoff_r || !m.b_ecnt_r || !m.b_egu_r || !m.b_edn_r)
+            return RAD_E_INVAL;
+        fprintf(stderr, "radiance: qwen4exp: aux split -- experts %lld..%lld of each layer on the "
+                        "rank's card, the rest on the aux device\n",
+                (long long)(m.moecfg.n_expert - nr), (long long)m.moecfg.n_expert - 1);
+    }
+    m.b_edn     = decl_b(b, nm.f("moe_edn"),    g.act_dtype, {ER, g.n_embd}, RAD_BUF_TRANSIENT, xdom);
+    m.b_emoe    = decl_b(b, nm.f("moe_out"),    g.act_dtype, {T, g.n_embd}, RAD_BUF_TRANSIENT, xdom);
+    /* Local (aux device): the second of two passes in flight routes into its own planes. */
+    if (m.aux) {
+        m.b_sorted2 = decl_b(b, nm.f("moe_sorted2"), RAD_I32, {ER}, RAD_BUF_PERSIST, RAD_DOMAIN_HOST);
+        m.b_eoff2   = decl_b(b, nm.f("moe_eoff2"), RAD_I32, {m.moecfg.n_expert + 1}, RAD_BUF_PERSIST,
+                             RAD_DOMAIN_HOST);
+        if (!m.b_sorted2 || !m.b_eoff2) return RAD_E_INVAL;
+    }
+    /* Local (aux device): the expert planes only the aux card touches live in its own memory. */
+    if (m.aux)
+        for (rad_buf x : { m.b_egu, m.a_eff.x, m.a_eff.q, m.a_eff.s, m.a_eff.q8, m.a_eff.s8, m.b_edn })
+            if (x) RAD_ARCH_TRY(rad_buf_aux_local(b, x));
     if (m.moecfg.n_ff_shared > 0) {
         m.b_sgu   = decl_b(b, nm.f("moe_sgu"),   g.act_dtype, {T, 2 * m.moecfg.n_ff_shared});
         m.a_sff.x = decl_b(b, nm.f("moe_sff"),   g.act_dtype, {T, m.moecfg.n_ff_shared});
@@ -994,6 +1049,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     mw.x = m.b_h; mw.h = m.a_x; mw.hr = m.a_hr;
     mw.logits = m.b_rlogits; mw.ids = m.b_eids; mw.ew = m.b_ew;
     mw.sorted = m.b_sorted;  mw.eoff = m.b_eoff; mw.ecnt = m.b_ecnt;
+    mw.sorted2 = m.b_sorted2; mw.eoff2 = m.b_eoff2;
+    if (m.aux_r && m.a_hr_h.q) mw.hr = m.a_hr_h;   /* the aux instance and the MTP head read the host copy */
     mw.egu = m.b_egu; mw.eff = m.a_eff; mw.edn = m.b_edn; mw.moe = m.b_emoe;
     mw.sgu = m.b_sgu; mw.sff = m.a_sff; mw.sout = m.b_sout; mw.sgate = m.b_sgate;
 
@@ -1173,11 +1230,67 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         lay.mlp.ar_out_take = lay.hc_ffn.ar_take();
         lay.mlp.hr_in = fcfg.rotate != 0;
+        lay.mlp.aux = m.aux;
+        if (m.aux_r) {
+            /* Split: this instance holds ids [0, n - aux_r) on the aux card and routes; the
+             * partner holds the rest and the shared arm on the rank's card. */
+            /* The boundary moves by one where it would leave either side an odd count of
+             * quantised experts (a whole bf16 expert is served apart, MoeFP8's `prot`). */
+            int64_t nb = m.moecfg.n_expert - m.aux_r;
+            {
+                auto plain = [&](int64_t e) {
+                    RadEncoding en{};
+                    return weight_enc(b, nm.f("blk.%lld.ffn_gate_up_exps.%lld.weight",
+                                              (long long)l, (long long)e), &en) &&
+                           en.n_planes == 1 && en.plane[0].dtype == RAD_BF16;
+                };
+                /* The nearest even boundary leaving each side an even count of plain experts:
+                 * each instance needs an even total and an even quantised count. */
+                std::vector<int64_t> pls;
+                for (int64_t e = 0; e < m.moecfg.n_expert; ++e) if (plain(e)) pls.push_back(e);
+                auto ok = [&](int64_t at) {
+                    int64_t k = 0;
+                    for (int64_t e : pls) k += e < at;
+                    return at > 0 && at < m.moecfg.n_expert && at % 2 == 0 && k % 2 == 0;
+                };
+                const int64_t want = nb;
+                for (int64_t d = 0; d < m.moecfg.n_expert; d += 2) {
+                    if (ok(want - d)) { nb = want - d; break; }
+                    if (ok(want + d)) { nb = want + d; break; }
+                }
+                int64_t pl = 0, pr = 0;
+                for (int64_t e : pls) (e < nb ? pl : pr)++;
+                if (l < 3 || pl || pr)
+                    fprintf(stderr, "radiance: qwen4exp: layer %lld split at %lld (%lld + %lld plain)\n",
+                            (long long)l, (long long)nb, (long long)pl, (long long)pr);
+            }
+            MoeFP8::Src mi = ms;
+            mi.cfg.n_expert = nb;
+            mi.shared = nullptr; mi.shared_gate = nullptr;
+            lay.mlp.rpart = &lay.mlp_r;
+            RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, mi, false, false, kArNone,
+                                         lay.hc_ffn.op_ar_write != 0));
+            MoeFP8::Src mr = ms;
+            mr.cfg.n_expert    = m.moecfg.n_expert - nb;
+            mr.cfg.expert_base = nb;
+            MoeFP8::Wire wr = mw;
+            wr.hr = m.a_hr;
+            wr.sorted = m.b_sorted_r; wr.eoff = m.b_eoff_r; wr.ecnt = m.b_ecnt_r;
+            wr.sorted2 = 0; wr.eoff2 = 0;
+            wr.egu = m.b_egu_r; wr.eff = m.a_eff_r; wr.edn = m.b_edn_r;
+            lay.mlp_r.ar_out_take = lay.mlp.ar_out_take;
+            lay.mlp_r.hr_in = lay.mlp.hr_in;
+            lay.mlp_r.ext_route = true;
+            RAD_ARCH_TRY(lay.mlp_r.declare(b, nm, g, (int)l, wr, mr, false, false, kArNone,
+                                           lay.hc_ffn.op_ar_write != 0));
+            RAD_ARCH_TRY(lay.mlp.declare_split_combine(b));
+        } else
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms, false, false, kArNone,
                                      lay.hc_ffn.op_ar_write != 0));
         /* The write behind the block takes its gather where it can, declared after the block so
-         * the buffers it reads are the block's outputs in declaration order. */
-        {
+         * the buffers it reads are the block's outputs in declaration order. Not beside an aux
+         * device: the gather runs there, so the expert rows never cross the link. */
+        if (!m.aux) {
             HyperConn::GatherSrc gs{};
             gs.ye     = lay.mlp.w.edn;
             gs.ew     = lay.mlp.w.ew;
@@ -1377,6 +1490,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
 
         m.mtp.media = m.media;
+        m.mtp.aux = m.aux;
         RAD_ARCH_TRY(m.mtp.declare(b, nm, g, (int)g.n_layer, m.kv_full, &m.kv_qsa_bkey, m.n_rot,
                                    m.w_tok, m.w_lm_head, m.hccfg, g.max_spec, tw, ts));
         /* A head pass refills the rope table ahead of the head's ops (step), while the carry
@@ -1601,6 +1715,130 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     }
 }
 
+/* Local (aux device): a step of one prefill sequence in two pieces (a span of 2), the routed experts
+ * of one piece on the aux card while the rank's card runs the other piece's mixer. Per layer, on the
+ * rank's card: the mixer's first piece; at its hand-off the previous layer's second piece finishes
+ * (wait for its experts, combine, write, read this layer's input) and this layer's first piece goes
+ * to the aux card; the mixer's second piece (beside those experts); the second piece goes to the aux
+ * card; the first piece finishes. A layer whose mixer reads every row first (full attention, whose
+ * indexer and attention run whole) and the PLE layer finish both pieces before it. Each piece routes
+ * into its own planes (Wire::sorted2) and is waited for by its own lane mark. */
+static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu);
+struct AuxPipe {
+    RadCtx* c; Model* m; const RadBatch* batch;
+    int64_t T, R, li;
+    bool    pending, prepped0;
+    int64_t r0(int p) const { return p ? R : 0; }
+    int64_t rn(int p) const { return p ? T - R : R; }
+};
+static void auxpipe_prep(AuxPipe& a, int64_t li, int p) {
+    const Layer& l = a.m->layers[(size_t)li];
+    l.hc_mix.write(a.c, a.T, a.r0(p), a.rn(p));
+    l.hc_ffn.read(a.c, a.T, a.r0(p), a.rn(p));
+    l.mlp.pass(a.c, a.T, a.r0(p), a.rn(p), false, p, 1);
+}
+static void auxpipe_fin(AuxPipe& a, int64_t li, int p, bool read_next) {
+    const Layer& l = a.m->layers[(size_t)li];
+    l.mlp.pass(a.c, a.T, a.r0(p), a.rn(p), false, p, 2);
+    l.hc_ffn.write(a.c, a.T, a.r0(p), a.rn(p));
+    l.proj.step(a.c, a.batch, a.r0(p), a.rn(p));
+    if (read_next && li + 1 < (int64_t)a.m->layers.size())
+        a.m->layers[(size_t)li + 1].hc_mix.read(a.c, a.T, a.r0(p), a.rn(p));
+}
+/* This layer's first piece goes to the aux card before the previous layer's second piece is
+ * waited for: it touches other rows and other routing planes, and the aux card's queue then runs
+ * the two back to back instead of idling through that piece's combine and writes. */
+static void auxpipe_hand(void* u, int64_t, int64_t) {
+    AuxPipe& a = *(AuxPipe*)u;
+    if (!a.prepped0) { auxpipe_prep(a, a.li, 0); a.prepped0 = true; }
+    if (a.pending) { auxpipe_fin(a, a.li - 1, 1, true); a.pending = false; }
+}
+
+/* The rows of step_auxpipe's first piece: a pass for a spanned step, else half the step rounded to
+ * the delta net's chunk (64), so a step of one pass or less runs in two pieces too. 0 where the
+ * step is too short to cut. */
+static int64_t auxpipe_rows(const Model& m, int64_t T) {
+    const int64_t R = m.moecfg.rows;
+    if (T > R) return T <= 2 * R ? R : 0;
+    const int64_t h = ((T / 2) + 63) / 64 * 64;
+    return h >= 64 && h < T ? h : 0;
+}
+/* The step's piece bounds {0, R, T} on the card for a first piece of R rows: the pass case is
+ * pipe_bounds'; otherwise {0, R} from the pinned table (never rewritten, so a copy the card runs
+ * late reads the same bytes) and T from the step's cu_seqlens. */
+static const int32_t* auxpipe_bounds(RadCtx* c, const RadBatch* batch, Model& m, int64_t R,
+                                     const int32_t* pcu) {
+    if (R == m.moecfg.rows) return pcu;
+    if (!m.b_pipe_cu) return nullptr;
+    const int64_t n = m.moecfg.rows / 64 + 1;
+    if (!m.auxpipe_tbl) {
+        m.auxpipe_tbl = (int32_t*)rad_dev_alloc(n * 2 * sizeof(int32_t), RAD_MEM_HOST_PINNED);
+        if (!m.auxpipe_tbl) return nullptr;
+        for (int64_t j = 0; j < n; ++j) { m.auxpipe_tbl[2 * j] = 0; m.auxpipe_tbl[2 * j + 1] = (int32_t)(64 * j); }
+    }
+    int32_t* d = (int32_t*)rad_buf_ptr(c, m.b_pipe_cu);
+    const RadStream s = rad_stream(c);
+    if (rad_memcpy_async(d, m.auxpipe_tbl + 2 * (R / 64), 2 * sizeof(int32_t), s) != RAD_OK ||
+        rad_memcpy_async(d + 2, batch->cu_seqlens + 1, sizeof(int32_t), s) != RAD_OK)
+        return nullptr;
+    return d;
+}
+
+static void step_auxpipe(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu_pass,
+                         int64_t R) {
+    const Geom& g = m.g;
+    const int64_t T = batch->n_tok;
+    const int32_t* pcu = auxpipe_bounds(c, batch, m, R, pcu_pass);
+    if (!pcu) { step_serial(c, batch, m, pcu_pass); return; }
+    if (!m.auxpipe_noted) {
+        m.auxpipe_noted = true;
+        fprintf(stderr, "radiance: qwen4exp: prefill steps of %lld+ rows run two pieces of %lld, "
+                        "routed experts of one beside the other's mixer (aux device)\n",
+                (long long)R + 1, (long long)R);
+    }
+    RAD_ISSUE(c, m.op_embed,
+              praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
+    m.mrows.step(c, batch, m.a_x.x, T);
+    if (m.ple_layer >= 0) m.ple.ids(c, batch);
+    m.enter.step(c, T);
+    if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
+        RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
+
+    AuxPipe a{c, &m, batch, T, R, 0, false, false};
+    const int64_t L = (int64_t)m.layers.size();
+    if (L > 0) {
+        if (m.ple_layer == 0) m.ple.step(c, batch);
+        for (int p = 0; p < 2; ++p) m.layers[0].hc_mix.read(c, T, a.r0(p), a.rn(p));
+    }
+    for (int64_t li = 0; li < L; ++li) {
+        const Layer& l = m.layers[(size_t)li];
+        a.li = li;
+        a.prepped0 = false;
+        ArPieces pc{};
+        pc.rows = R; pc.done = auxpipe_hand; pc.u = &a; pc.cu = pcu; pc.in_ready = true;
+        const bool pieces = !l.full && l.gdn.takes_pieces(batch, &pc);
+        /* A mixer that reads every row first needs the previous layer's second piece now. */
+        if (!pieces && a.pending) { auxpipe_fin(a, li - 1, 1, true); a.pending = false; }
+        if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu_pass); l.attn.step(c, batch, false, &pc); }
+        else        l.gdn.step(c, batch, false, &pc);
+        if (!a.prepped0) { auxpipe_prep(a, li, 0); a.prepped0 = true; }
+        if (a.pending) { auxpipe_fin(a, li - 1, 1, true); a.pending = false; }
+        auxpipe_prep(a, li, 1);
+        l.mlp.route_report(c);
+        const bool ple_next = li + 1 == m.ple_layer;
+        auxpipe_fin(a, li, 0, !ple_next);
+        if (ple_next || li + 1 == L) {
+            auxpipe_fin(a, li, 1, !ple_next);
+            if (ple_next) {
+                m.ple.step(c, batch);
+                for (int p = 0; p < 2; ++p) m.layers[(size_t)li + 1].hc_mix.read(c, T, a.r0(p), a.rn(p));
+            }
+        } else {
+            a.pending = true;
+        }
+    }
+}
+
 /* The trunk one stream at a time over the whole step: every step a span of 1 makes, and every
  * other where step_pipelined's conditions do not hold. */
 static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
@@ -1675,7 +1913,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 
     const int32_t* pcu = pipe_bounds(c, batch, m);
-    if (pipelined(m, T)) step_pipelined(c, batch, m, pcu);
+    static const bool auxpipe_off = std::getenv("RADIANCE_AUXPIPE_OFF") != nullptr;
+    const int64_t apr = m.aux && !auxpipe_off && pcu && batch->n_seq == 1 &&
+                        batch->phase == RAD_PHASE_PREFILL ? auxpipe_rows(m, T) : 0;
+    if (apr > 0) step_auxpipe(c, batch, m, pcu, apr);
+    else if (pipelined(m, T)) step_pipelined(c, batch, m, pcu);
     else                 step_serial(c, batch, m, pcu);
 
     m.mixer.read_pieces(c, T);
