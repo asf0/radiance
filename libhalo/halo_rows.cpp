@@ -1832,7 +1832,7 @@ static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
                                          P_INTO("block_size") };
 static const RadParamSpec pMlaAttn[] = { P_INT("M"),      P_INT("latent_dim"), P_INT("heads"),
                                          P_INT("blocks"), P_INT("block_size"), P_F64("scale"),
-                                         P_STR("dtype") };
+                                         P_STR("dtype"), P_STRO("kv_dtype") };
 static const RadParamSpec pMlaProject[] = { P_INT("M"),          P_INT("heads"), P_INT("head_dim"),
                                             P_INT("latent_dim"), P_STR("mode"),  P_STR("dtype") };
 static const RadOperandSpec oMlaAttn[] = { { "q", RAD_OPD_IN, 0 },
@@ -2345,7 +2345,7 @@ static const RadParamSpec pLogprobs[] = {
 };
 static const RadOperandSpec oLogprobs[] = {
     { "logits", RAD_OPD_IN,  0 },
-    { "params", RAD_OPD_IN,  0 },
+    { "params", RAD_OPD_IN,  1 },   /* absent: every row */
     { "stats",  RAD_OPD_OUT, 0 },
 };
 static const RadOperandSpec oNarrow[] = {
