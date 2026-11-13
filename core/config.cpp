@@ -55,6 +55,9 @@ static const Flag g_flags[] = {
     { "--radiance-home",      "DIRS",   "where kernels/, architectures/ and quantizers/ live; several\n"
                                         "homes separated by ':' are searched in order, the first winning" },
     { "--kernels",            "LIST",   "the kernel libraries to use, separated by ',' or ':', first wins; unnamed ones are not loaded. Default: every library found" },
+    { "--aux-device",         "N",      "local: a second card (e.g. an iGPU) that runs the plugin's aux ops (routed experts)" },
+    { "--aux-kernels",        "LIST",   "local: the kernel libraries for --aux-device (e.g. libhalo)" },
+    { "--aux-split",          "N",      "local: routed experts per layer on the rank's card beside --aux-device: auto (default, what its VRAM holds) | 0 | N" },
 
     { "--tp",                 "N",      "tensor-parallel ranks" },
     { "--tp-wire",            "MODE",   "cross-rank all-reduce payload: exact (default) or wht6, a\n"
@@ -539,6 +542,13 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--model-revision"))        { if (!(v = need(i))) return RAD_E_INVAL; c->model_revision = v; }
         else if (S("--radiance-home"))         { if (!(v = need(i))) return RAD_E_INVAL; c->radiance_home = v; }
         else if (S("--kernels"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kernel_hierarchy = rad_split_kernel_list(v); }
+        else if (S("--aux-device"))            { int64_t d = -1; if (!num(0, 63, &d)) return RAD_E_INVAL; c->aux_device = (int)d; }
+        else if (S("--aux-kernels"))           { if (!(v = need(i))) return RAD_E_INVAL; c->aux_kernels = rad_split_kernel_list(v); }
+        else if (S("--aux-split")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) c->aux_split = -1;
+            else if (!parse_int(a.c_str(), v, 0, 4096, &c->aux_split)) return RAD_E_INVAL;
+        }
         else if (S("--tp"))                    { if (!num(1, INT32_MAX, &c->tp)) return RAD_E_INVAL; }
         else if (S("--tp-wire")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1351,6 +1361,12 @@ const ShowRow kShow[] = {
           std::string s;
           for (const std::string& k : c.kernel_hierarchy) s += (s.empty() ? "" : ",") + k;
           return or_none(s, "every library found"); } },
+    { "--aux-device",         [](const Config& c) { return c.aux_device < 0 ? std::string("none") : num(c.aux_device); } },
+    { "--aux-split",          [](const Config& c) { return c.aux_split < 0 ? std::string("auto") : num(c.aux_split); } },
+    { "--aux-kernels",        [](const Config& c) {
+          std::string s;
+          for (const std::string& k : c.aux_kernels) s += (s.empty() ? "" : ",") + k;
+          return or_none(s, "none"); } },
     { "--tp",                 [](const Config& c) { return num(c.tp); } },
     { "--tp-wire",            [](const Config& c) { return std::string(c.tp_wire_exact ? "exact" : "wht6"); } },
     { "--tp-attn-split",      [](const Config& c) { return std::string(c.tp_attn_rows ? "rows" : "heads"); } },

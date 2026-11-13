@@ -264,7 +264,7 @@ public:
 
     /* The lane subsequent issues launch on, and its stream. Lane 0 is `stream_`. See lane1_ for
      * the constraints on a second lane. */
-    RadStream       cur_stream() const { return lane_ ? lane1_ : stream_; }
+    RadStream       cur_stream() const { return lane_ == 0 ? stream_ : lane_ == 1 ? lane1_ : aux_stream_; }
     int             lane()       const { return lane_; }
     int             set_lane(int lane);
     /* Builds the second stream and its events on first use; free when no lane is asked for. */
@@ -272,6 +272,12 @@ public:
     /* Order `to` behind everything already issued on `from` (event record + stream wait). The
      * host does not block and neither stream is drained. */
     int             lane_join(int from, int to);
+    /* Local: lane 2 is the aux device's stream (Program::aux_device), built on first use. Joins
+     * with it use system-scope events, since the two queues are on different cards. */
+    int             aux_init();
+    int             lane_mark(int slot);
+    int             lane_wait_mark(int slot);
+    bool            has_aux() const { return program_ && program_->aux_device >= 0; }
 
     void* weight_ptr(rad_weight w);
     void* buf_ptr(rad_buf b);
@@ -712,7 +718,18 @@ private:
     RadStream lane1_      = nullptr;
     bool      own_lane1_  = false;
     int       lane_       = 0;
-    RadEvent  lane_ev_[2] = { nullptr, nullptr };
+    RadEvent  lane_ev_[3] = { nullptr, nullptr, nullptr };
+    /* Local (aux device): its stream, system-scope join events per lane, and its scratch, pinned
+     * host memory both cards address (Program::aux_scratch_bytes). wgp_count of the aux card. */
+    RadStream aux_stream_   = nullptr;
+    RadEvent  aux_ev_[3]    = { nullptr, nullptr, nullptr };
+    RadEvent  mark_ev_[RAD_LANE_MARKS] = {};   /* rad_lane_mark, system scope */
+    void*     aux_scratch_  = nullptr;
+    void*     aux_arena_    = nullptr;   /* mirror of the host arena on the aux card (aux_local) */
+    std::vector<uint8_t> buf_aux_;       /* per handle: an aux-local buffer */
+    int64_t   aux_scratch_bytes_ = 0;
+    int       aux_wgp_      = 0;
+    bool      aux_pending_  = false;   /* lane 2 has work lane 0 has not joined */
     /* An op was issued on lane 1 since lane 1 was last joined into lane 0; lane 0 joins it before
      * an op outside the second lane's window (Ctx::issue_body). */
     bool      lane1_pending_ = false;
@@ -721,24 +738,24 @@ private:
      * on each lane those complete no later than the last one. So a device op with a host-domain
      * operand re-records its lane's event, and a host op waits on those events instead of draining
      * the streams (see the host join in Ctx::issue). */
-    RadEvent  host_touch_ev_[2]      = { nullptr, nullptr };
-    bool      host_touch_pending_[2] = { false, false };
+    RadEvent  host_touch_ev_[3]      = { nullptr, nullptr, nullptr };
+    bool      host_touch_pending_[3] = { false, false, false };
     int       host_join(const RadOperand* opd, int n_opd);
     bool      host_join_drains(const RadOperand* opd, int n_opd) const;
     int       host_join_wait(bool drain);
     /* A lane issued a scratch user and the other lane has not been joined behind it since. Keeps
      * two lanes off the shared region at once; lane_join clears its `from` side. See the scratch
      * block in Ctx::issue. */
-    bool      scratch_open_[2]    = { false, false };
+    bool      scratch_open_[3]    = { false, false, false };
     bool      scratch_join_warned_ = false;
     /* Where in its region the next scratch user starts. Consecutive users get consecutive slices,
      * wrapping when one does not fit, so independent users share no bytes and may overlap
      * (haz_mark). Reset every pass, so a re-issued pass gets the same slices as its recording. */
-    int64_t   scratch_cur_[2]     = { 0, 0 };
+    int64_t   scratch_cur_[3]     = { 0, 0, 0 };
     void*     scratch_take(int region, int64_t bytes);
     /* The kernel that last opened each lane's scratch, and its row count, for the warning. */
-    const char* scratch_kernel_[2] = { nullptr, nullptr };
-    int64_t     scratch_n_[2]      = { 0, 0 };
+    const char* scratch_kernel_[3] = { nullptr, nullptr, nullptr };
+    int64_t     scratch_n_[3]      = { 0, 0, 0 };
 
     Arena arena_;        /* device: the buffer plan plus the shared scratch region */
     Arena host_arena_;   /* only if the program declares RAD_DOMAIN_HOST buffers */
@@ -765,7 +782,7 @@ private:
      * dense arm, which a decode step issues on lane 1 and an overlapped prefill on lane 0) must
      * still be waited on when lane 0 resolves it. Indexed by lane_, like the other per-lane state
      * here: set_lane admits lanes 0 and 1 only. */
-    std::vector<uint32_t>  waited_gen_[2];
+    std::vector<uint32_t>  waited_gen_[3];
 
     std::vector<OpPlan>                 plans_;
     /* Ops not yet seen issued. flush_issued walks only these and drops each once it fires. */

@@ -589,6 +589,10 @@ private:
      * tiers' copy staging, the second compute lane's queue). Bring-up's final VRAM reading is
      * checked against both. */
     int64_t  late_step_bytes_ = 0;
+    /* Local (--aux-split auto): the first declare runs without a split; plan() reads the budget it
+     * leaves, picks the split, and asks bring-up to declare and plan again (aux_redo_). */
+    bool     aux_auto_ = false;
+    bool     aux_redo_ = false;
     int64_t  late_lazy_bytes_ = 0;
     /* Linear-state snapshot store: pinned host memory, --checkpoint-slots slots, each holding every
      * rank's shard of one snapshot (KVManager::set_checkpoint_store). Off the card because no

@@ -28,6 +28,32 @@ Registry& rad_tools_registry() {
     return *r;
 }
 
+/* Local: the aux device's registry (--aux-device / --aux-kernels). Its device rows were checked
+ * against the aux card's code objects, so an aux op never resolves to a kernel that card cannot run.
+ * Never destroyed, for the reason above. */
+static std::vector<std::string> home_subdirs(const std::string& home, const char* sub);
+static int g_aux_device = -1;   /* set once the aux kernels loaded */
+int rad_tools_aux_device() { return g_aux_device; }
+static int64_t g_aux_split = 0;   /* the split the next declare uses (rad_aux_split) */
+void rad_tools_set_aux_split(int64_t n) { g_aux_split = n; }
+
+Registry& rad_aux_registry() {
+    static Registry* r = new Registry();
+    return *r;
+}
+
+int rad_tools_load_aux_kernels(const std::string& home, const std::vector<std::string>& hierarchy,
+                               int device) {
+    Registry& r = rad_aux_registry();
+    r.set_code_device(device);
+    std::vector<std::string> kdirs = home_subdirs(home, "kernels");
+    if (kdirs.empty()) kdirs.push_back(rad_home_dirs(home).front() + "/kernels");
+    const int s = r.load_dirs(kdirs, hierarchy);
+    if (s < 0) return s;
+    g_aux_device = device;
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ the reference-kernel gate */
 
 /* An op is "on the reference" when no band in any domain offers a non-reference kernel
@@ -407,6 +433,7 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
     }
 
     Builder b(r, meta, ctx);
+    if (g_aux_device >= 0) { b.set_aux(&rad_aux_registry(), g_aux_device); b.set_aux_split(g_aux_split); }
     if (ref) b.set_reference(ref);
     if (sources) b.set_sources(sources);
     b.set_instances(instances);

@@ -56,7 +56,9 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
                               ? (int32_t)prog.meta.n_layers : INT32_MAX;
     size_t c = 0;
     layers_ = routed_layers(
-        plan, [&](const MoveUnit& mu) { return mu.expert >= 0 && mu.layer < trunk; }, &c);
+        plan, [&](const MoveUnit& mu) {
+            /* Local: a host-forced unit (an aux device's expert) is read in place, never staged. */
+            return mu.expert >= 0 && mu.layer < trunk && !mu.host_forced; }, &c);
     /* Two layers' spans must not overlap: a layer's copies are given back at the next layer's
      * first op, which must be past every op that reads them. */
     if (c > 0) {

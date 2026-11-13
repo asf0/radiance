@@ -147,6 +147,13 @@ public:
     int op_writes(rad_op h, const rad_buf* b, int n);
     int buf_concurrent(rad_buf b);
     int lane1_window(bool end);
+    int aux_window(bool on);
+    int buf_aux_local(rad_buf buf);
+    /* Local: the aux device's registry and index (set by the engine before declare). */
+    void set_aux(Registry* r, int device) { aux_reg_ = r; prog_.aux_device = r ? device : -1; }
+    int  aux_device() const { return prog_.aux_device; }
+    void set_aux_split(int64_t n) { aux_split_ = n; }
+    int64_t aux_split() const { return aux_reg_ ? aux_split_ : 0; }
     int weight_shard_span(rad_weight w, int64_t lo, int64_t hi);
     int weight_shard_span_parts(rad_weight w, const int64_t* lo, const int64_t* hi,
                                 const int64_t* total, int n);
@@ -231,6 +238,9 @@ private:
     std::set<rad_buf> concurrent_bufs_;
     /* The second lane's window (rad_lane1_window_begin), first and last op handle; -1 when none. */
     int32_t lane1_w0_ = -1, lane1_w1_ = -1;
+    Registry* aux_reg_ = nullptr;
+    int64_t   aux_split_ = 0;
+    bool      aux_on_  = false;
 
     /* Parallel to prog_.kv_groups: where in the op list the group was declared, and the op found
      * to consume it. Declaration order is the only link between an op and a group; see

@@ -173,7 +173,8 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
      * (layer, expert). */
     struct U { int32_t layer = -1, expert = -1; int64_t bytes = 0; bool mapped = false;
                bool emb = false, ngram = false, host = true, direct = true;
-               int access = -1; };
+               int access = -1; bool aux = true; };
+    const std::vector<uint8_t> aux_only = aux_only_weights(prog);
     std::map<std::pair<int32_t, int32_t>, size_t> by_group;
     std::vector<U> units;
 
@@ -204,6 +205,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
         if (w < device_ok.size() && !device_ok[w]) mu.mapped = true;
         if (!weight_file_direct(wi, prog.ctx.world_size)) mu.direct = false;
         if (w < host_ok.size() && !host_ok[w]) mu.host = false;
+        if (!aux_only[w]) mu.aux = false;
         /* build_units: the group's strongest access class, which says whether it is a tower's. */
         if (mu.access < 0 || access_strength(wi.decl.access) > access_strength(mu.access))
             mu.access = wi.decl.access;
@@ -237,6 +239,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
          * placed in VRAM. */
         if (mu.mapped || (mu.ngram && ngram != TablePlacement::Vram)) out->mapped += b;
         else if (mu.emb && embedding == TablePlacement::Ram) out->hosted += b;
+        else if (mu.aux && prog.aux_device >= 0) out->hosted += b;   /* local: pin_aux */
         else if (mu.expert >= 0) {
             out->experts += b;
             layer_experts[mu.layer] += b;
@@ -982,6 +985,36 @@ bool read_only_by(const Program& prog, rad_weight w, const char* op) {
     return read;
 }
 
+/* Local: see Planner::pin_aux in planner.h. */
+int Planner::pin_aux(const Program& prog, Plan* p) const {
+    const std::vector<uint8_t> aux_only = aux_only_weights(prog);
+    int64_t n = 0, bytes = 0;
+    for (MoveUnit& mu : p->units) {
+        if (mu.weights.empty() || mu.preplaced()) continue;
+        bool all = true;
+        for (rad_weight w : mu.weights) if ((size_t)w >= aux_only.size() || !aux_only[w]) { all = false; break; }
+        if (!all) continue;
+        if (mu.slot_bytes > p->host_budget) {
+            RAD_ERR("placement: aux device: the units its ops read need more of the pinned host pool "
+                    "than --host-pool-mib leaves (%s after %lld units, %s); raise --host-pool-mib",
+                    humanb(p->host_budget).c_str(), (long long)n, humanb(bytes).c_str());
+            p->notes.push_back("aux device: its weights do not fit the host pool");
+            return RAD_E_NOMEM;
+        }
+        p->host_budget -= mu.slot_bytes;
+        mu.tier = Tier::HostPinned;
+        mu.site = Site::DeviceZeroCopy;
+        mu.movable = false;
+        mu.host_forced = true;
+        mu.reason = "aux device; read in place by that card";
+        ++n;
+        bytes += mu.slot_bytes;
+    }
+    RAD_INFO("placement: aux device: %lld units (%s) in the pinned host pool, read in place by "
+             "device %d", (long long)n, humanb(bytes).c_str(), prog.aux_device);
+    return RAD_OK;
+}
+
 /* --embedding-placement ram: the token embedding goes to the pinned host pool before any strategy
  * runs. The host pool is mapped (Pools::configure), so at the DeviceZeroCopy site the lookup
  * kernel reads its M rows over the link in place, a few KiB a decode step, and the table's VRAM
@@ -1197,6 +1230,7 @@ int Planner::plan(Plan* out) {
      * the host pool that. Before it the charge would be zero and the pool would not hold them.
      * Not RAD_TRY: a refusal still leaves `out` filled in far enough to print. */
     int hrc = pin_embedding(prog, cfg, out);
+    if (hrc >= 0 && prog.aux_device >= 0) hrc = pin_aux(prog, out);
     const int trc = pin_towers(cfg, out);
     if (hrc >= 0) hrc = trc;
     if (hrc >= 0) hrc = pin_draft_experts(prog, cfg, out);

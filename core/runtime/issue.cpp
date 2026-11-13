@@ -348,7 +348,11 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
             t.host[e] = t.cur[(size_t)e];
         }
         walked = t.n;
-        const int rc = rad_memcpy_async(t.dev, t.host, t.n * (int64_t)sizeof(void*), cur_stream());
+        /* Local: an aux op reads the pinned array itself (its entries never move), so nothing is
+         * uploaded to the rank's card, which the aux card must not read. */
+        const bool aux_tab = plans_[h].info && plans_[h].info->aux;
+        const int rc = aux_tab ? RAD_OK
+                               : rad_memcpy_async(t.dev, t.host, t.n * (int64_t)sizeof(void*), cur_stream());
         if (rc < 0)
             return abort_step_msg(h, rc,
                                   fmt("operand %d: the weight table could not be uploaded", operand));
@@ -357,11 +361,14 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
         /* Entries that may have moved: resolve each (which also orders the stream behind an
          * in-flight transfer) and patch only those whose pointer differs. */
         WtabPatch pt;
+        const bool aux_tab = plans_[h].info && plans_[h].info->aux;
         auto one = [&](int64_t e) -> int {
             void* p = nullptr;
             RAD_TRY(resolve(e, &p));
             ++walked;
             if (t.cur[(size_t)e] == p) return RAD_OK;
+            /* Local: an aux op's weights are pinned in the host pool for good. */
+            if (aux_tab) return RAD_E_STATE;
             t.cur[(size_t)e] = p;
             pt.dst[pt.n] = static_cast<void**>(t.dev) + e;
             pt.val[pt.n] = p;
@@ -427,7 +434,7 @@ int Ctx::weight_table_tensor(rad_op h, int operand, const WeightTable& t, const 
     out->rank      = e0.rank + 1;
     out->shape[0]  = t.n;
     out->stride[0] = 0;
-    out->data      = t.dev;
+    out->data      = plans_[h].info && plans_[h].info->aux ? (void*)t.host : t.dev;
     return RAD_OK;
 }
 
@@ -654,6 +661,17 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                               ? "has no host kernel for this band, and the placement planner put "
                                 "it on the host anyway"
                               : "has no device kernel for this band");
+    /* Local (aux device): an aux op runs only on lane 2, the aux card's stream, and lane 2 runs
+     * nothing else; its kernel has code for that card only, and its operands live where that card
+     * reads them. */
+    const bool aux_op = p.info && p.info->aux;
+    if (aux_op != (lane_ == 2))
+        return abort_step_msg(h, RAD_E_STATE,
+                              aux_op ? fmt("is an aux op (declared in rad_aux_window) issued on lane %d; "
+                                           "issue it on lane 2", lane_)
+                                     : std::string("is issued on lane 2 (the aux device) but was not "
+                                                   "declared in rad_aux_window"));
+    if (aux_op) aux_pending_ = true;
     /* The second lane's window (rad_lane1_window_begin): its concurrent buffers are live only across
      * it, so lane 1 runs nothing outside it, and lane 0 joins lane 1 before it runs an op outside
      * it, on either side: a transient of such an op may share bytes with a concurrent buffer. An op
@@ -722,6 +740,11 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
              * arena_base + BufferInfo::arena_offset. */
             tt = buf_tmpl_[bh];
             touches_host |= buf_host_[bh] != 0;
+            if (buf_aux_[bh] && !aux_op)
+                return abort_step_msg(h, RAD_E_STATE,
+                                      fmt("operand %d names buffer '%s', which lives on the aux card "
+                                          "(rad_buf_aux_local), and this op runs on the rank's card", i,
+                                          program_->buffers[bh].name.c_str()));
             if (o.offset) {
                 int64_t d;
                 if (!byte_delta(buf_bits_[bh], o.offset, &d))
@@ -980,7 +1003,14 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      * region 0 and the second user is ordered behind the first, giving up the overlap but not
      * correctness. That also covers lane 0 before lane 1 exists, since a lane built later has
      * nothing ordering it behind lane 0's earlier work. */
-    if (ip.args.scratch_bytes > 0 && dom != RAD_DOMAIN_HOST && arena_.scratch_regions() > 1) {
+    if (aux_op) {
+        /* Local: the aux scratch, bound at prepare; one stream uses it, in order. */
+        if (ip.args.scratch_bytes > aux_scratch_bytes_)
+            return abort_step_msg(h, RAD_E_SCRATCH,
+                                  fmt("aux kernel %s asks for %lld bytes of scratch; the aux region "
+                                      "holds %lld", ip.row && ip.row->info ? ip.row->info->name : "?",
+                                      (long long)ip.args.scratch_bytes, (long long)aux_scratch_bytes_));
+    } else if (ip.args.scratch_bytes > 0 && dom != RAD_DOMAIN_HOST && arena_.scratch_regions() > 1) {
         /* Per-lane regions: nothing to order. Region 1 holds what an op the second lane may issue
          * asked for at declare (Program::scratch_bytes_lane1); a larger request there comes from an
          * op with a transient buffer outside rad_buf_concurrent, which breaks Ctx::lane1_'s rule 3
@@ -1057,6 +1087,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     }
 
     int s;
+    /* Local: the backend's current device is per thread; an aux kernel's shim may ask it. */
+    if (aux_op) rad_dev_set(program_->aux_device);
     if (profiling_ && dom == RAD_DOMAIN_HOST) {
 
         /* A host-site op is timed on the host wall clock; a device event pair around it would
@@ -1134,6 +1166,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     } else {
         s = ip.launch(la, cur_stream());
     }
+    if (aux_op) rad_dev_set(device_);
     if (hold) {
         /* Always released, by a barrier unless the launch ended the hold itself
          * (RAD_LINK_ENDED); otherwise a list waiting on the hold never ends. */
@@ -1242,7 +1275,7 @@ bool Ctx::host_join_drains(const RadOperand* opd, int n_opd) const {
 int Ctx::host_join_wait(bool drain) {
     ++n_host_syncs_;
     if (drain) return rad_stream_sync(cur_stream());
-    for (int l = 0; l < 2; ++l) {
+    for (int l = 0; l < 3; ++l) {
         if (!host_touch_pending_[l]) continue;
         RAD_TRY(rad_event_sync(host_touch_ev_[l]));
         host_touch_pending_[l] = false;
@@ -1369,6 +1402,14 @@ int rad_lane_join(RadCtx* c, int from, int to) {
     if (!c) return RAD_E_INVAL;
     return static_cast<rad::Ctx*>(c)->lane_join(from, to);
 }
+int rad_lane_mark(RadCtx* c, int slot) {
+    if (!c) return RAD_E_INVAL;
+    return static_cast<rad::Ctx*>(c)->lane_mark(slot);
+}
+int rad_lane_wait_mark(RadCtx* c, int slot) {
+    if (!c) return RAD_E_INVAL;
+    return static_cast<rad::Ctx*>(c)->lane_wait_mark(slot);
+}
 
 int rad_route_report(RadCtx* c, int layer, const RadRouting* r) {
     if (!c) return RAD_E_INVAL;
@@ -1381,13 +1422,20 @@ int32_t* rad_route_counts(RadCtx* c, int layer, int64_t n_expert) {
 
 int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_buf h, int64_t r0, int64_t rows,
                         int64_t n_embd) {
-    return c ? static_cast<rad::Ctx*>(c)->xp_predict(next, h, r0, rows, n_embd) : RAD_E_INVAL;
+    if (!c) return RAD_E_INVAL;
+    /* Local: no expert prefetch beside an aux device (its tables must never see a VRAM copy). */
+    if (static_cast<rad::Ctx*>(c)->has_aux()) return RAD_OK;
+    return static_cast<rad::Ctx*>(c)->xp_predict(next, h, r0, rows, n_embd);
 }
 int rad_expert_prefetch_mark(RadCtx* c) {
-    return c ? static_cast<rad::Ctx*>(c)->xp_mark() : RAD_E_INVAL;
+    if (!c) return RAD_E_INVAL;
+    if (static_cast<rad::Ctx*>(c)->has_aux()) return RAD_OK;
+    return static_cast<rad::Ctx*>(c)->xp_mark();
 }
 int rad_expert_prefetch_step(RadCtx* c, int layer) {
-    return c ? static_cast<rad::Ctx*>(c)->xp_step(layer) : RAD_E_INVAL;
+    if (!c) return RAD_E_INVAL;
+    if (static_cast<rad::Ctx*>(c)->has_aux()) return RAD_OK;
+    return static_cast<rad::Ctx*>(c)->xp_step(layer);
 }
 
 void* rad_weight_ptr(RadCtx* c, rad_weight w) {

@@ -326,6 +326,9 @@ private:
     void build_units(const Program& prog, Plan* p);
     void pin_mapped(const Program& prog, Plan* p);
     int  pin_embedding(const Program& prog, const Config& cfg, Plan* p) const;
+    /* Local: units every reader of which is an aux op (rad_aux_window) go to the pinned host pool,
+     * read in place by the aux card, never moved. */
+    int  pin_aux(const Program& prog, Plan* p) const;
     int  pin_towers(const Config& cfg, Plan* p) const;
     int  pin_draft_experts(const Program& prog, const Config& cfg, Plan* p) const;
     void pin_hot(const Config& cfg, Plan* p) const;
@@ -436,6 +439,16 @@ int plan_check_weights_pool(const Plan& p, int64_t pool_bytes);
  * card is usable; a weight a GEMM also reads (an output head tied to the embedding) would stream
  * whole every step and is neither. Shared by the budget resolver and the planner. */
 bool read_only_by(const Program& prog, rad_weight w, const char* op);
+/* Local: per weight, 1 when at least one op reads it and every op that reads it is an aux op. */
+inline std::vector<uint8_t> aux_only_weights(const Program& prog) {
+    std::vector<uint8_t> st(prog.weights.size(), 0);   /* 0 unread, 1 aux only, 2 other reader */
+    for (const OpInfo& o : prog.ops)
+        for (rad_weight w : o.weights)
+            if ((size_t)w < st.size()) st[w] = o.aux ? (st[w] == 2 ? 2 : 1) : 2;
+    for (uint8_t& v : st) v = v == 1 ? 1 : 0;
+    return st;
+}
+
 inline bool is_embedding_table(const Program& prog, rad_weight w) {
     return read_only_by(prog, w, "embed_lookup");
 }
