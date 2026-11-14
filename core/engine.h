@@ -614,6 +614,8 @@ private:
     /* --calib-corpus, replacing run_server: the corpus, loaded before declare so the plugin is told
      * its token count (RadBuildCtx::calib_tokens), submitted as plain prefill requests. */
     int  run_calib();
+    /* Local: a synthetic prefill and a few decoded tokens before the server listens (RADIANCE_WARMUP). */
+    void warm_up();
     std::unique_ptr<Kld> calib_;
     /* --kld-record beside --calib-dir: the KL corpus's tokens, which the plugins record over. */
     long long calib_tokens_ = 0;

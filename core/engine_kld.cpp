@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -232,6 +233,56 @@ int Engine::run_kld() {
         return RAD_E_STATE;
     }
     return kld_->finish();
+}
+
+/* Local: the first request after start ran ~0.3 s slower than the next of its size (first launches
+ * of the prefill-height kernels, first touches of the step's buffers). Before the server listens,
+ * one prompt of a whole step and one short prompt run through the scheduler with a few decoded
+ * tokens each, so that cost lands in startup, which lmswap waits out on /health anyway. The tokens
+ * are a fixed pseudo-random draw from the vocabulary; their blocks may stay in the prefix cache,
+ * where nothing will match them. RADIANCE_WARMUP=0 skips it. */
+void Engine::warm_up() {
+    const char* e = std::getenv("RADIANCE_WARMUP");
+    if (e && std::atoi(e) == 0) return;
+    if (gen_ || cfg_.kld() || cfg_.calib() || !meta_.n_vocab) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t lens[2] = { std::min<int64_t>(cfg_.max_tok, 4096), 600 };
+    uint64_t x = 0x9e3779b97f4a7c15ull;
+    std::vector<std::unique_ptr<server::Sink>> sinks;
+    std::vector<std::unique_ptr<Request>> reqs;
+    for (int i = 0; i < 2; ++i) {
+        const int64_t n = cfg_.max_ctx > 64 ? std::min<int64_t>(lens[i], cfg_.max_ctx - 64) : lens[i];
+        if (n < 16) continue;
+        auto s = std::make_unique<server::Sink>(64);
+        auto r = std::make_unique<Request>();
+        r->id = (uint64_t)1 << 62 | (uint64_t)(i + 1);
+        r->prompt.resize((size_t)n);
+        for (auto& t : r->prompt) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            t = (int32_t)(1000 + x % (uint64_t)std::min<int64_t>(meta_.n_vocab - 1000, 100000));
+        }
+        r->max_tokens = 16;
+        r->ignore_eos = true;
+        r->sp.temp = 0.0f;
+        r->sp.use_control_vector = cvec_default_on();
+        r->sink = s.get();
+        s->id = r->id;
+        sinks.push_back(std::move(s));
+        reqs.push_back(std::move(r));
+    }
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        std::vector<std::unique_ptr<Request>> one;
+        std::vector<std::unique_ptr<server::Sink>> sk;
+        one.push_back(std::move(reqs[i]));
+        sk.push_back(std::move(sinks[i]));
+        int bad = 0;
+        if (run_docs(one, sk, true, "warmup", 60, [](size_t, double) {}, &bad) != RAD_OK || bad) {
+            RAD_WARN("warmup: request %zu did not finish; serving anyway", i);
+            return;
+        }
+    }
+    RAD_INFO("warmup: %zu synthetic request(s) in %.1f s (RADIANCE_WARMUP=0 skips this)", reqs.size(),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
 /* --calib-corpus: every document through prefill once as a plain request, nothing scored. The
