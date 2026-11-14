@@ -3,14 +3,21 @@ import json, sys
 # with every expert on one card (e.g. HIP_VISIBLE_DEVICES=1 --kernels libhalo,... --expert-stats F): in split
 # mode only the aux instance reports its histogram. PLAIN lists the bf16 experts of qwen3.8-next-flash-fp8-iq4r-moe
 # (rad-info -v); R is the split the lmswap settings pick.
-# xsperm.py OUT.txt TRAIN.json [EVAL.json ...]
+# aux_perm.py [--plain=FILE] OUT.txt TRAIN.json[,TRAIN2.json] [EVAL.json ...]
 # Per trunk layer: the 512 checkpoint experts coldest -> hottest by TRAIN's decode + prefill shares (each
 # normalised per layer), the layer's bf16 experts first (coldest: kept on the aux card, an even count).
 # Histogram rows from an iGPU-only run skip a layer's bf16 experts (row i = i-th other expert by id).
 # Reports the R9700 share (the last R slots) on TRAIN and each EVAL (iGPU-only stats files).
 R, NE = 184, 512
 PLAIN = {34: [407, 496], 44: [292, 350], 46: [290, 392], 47: [122, 143, 399, 445]}
-out, train, evals = sys.argv[1], sys.argv[2], sys.argv[3:]
+args = sys.argv[1:]
+if args and args[0].startswith('--plain='):
+    # --plain=FILE: the model's bf16 experts, one `blk.L.ffn_gate_up_exps.E` a line (rad-info -v)
+    PLAIN = {}
+    for ln in open(args.pop(0)[8:]):
+        p = ln.strip().split('.')
+        if len(p) >= 4: PLAIN.setdefault(int(p[1]), []).append(int(p[3]))
+out, train, evals = args[0], args[1], args[2:]
 def counts(path, kind):
     C = json.load(open(path))['counts'][kind][:48]; res = []
     for l, row in enumerate(C):
