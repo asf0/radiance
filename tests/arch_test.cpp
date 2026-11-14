@@ -12332,7 +12332,7 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         { "qwen4exp_fp8", 4, 0, 0xea29df78a9297c5cull, 0xfbe74f2b9d7020bfull },
         { "qwen4exp_fp8", 4, 3, 0x1e4ba87a0d9619f4ull, 0x36df57cac613c6cfull },
         { "qwen35_fp8", 1, 0, 0x0f08ba5027cba71aull, 0xa7ec3cf6252cd441ull },
-        { "qwen35_fp8", 2, 1, 0xe7780f241685a18bull, 0xdd5d65ef158c4136ull },
+        { "qwen35_fp8", 2, 1, 0xe7780f241685a18bull, 0x8418ba43067d3236ull },
         { "qwen35moe_fp8", 1, 0, 0xb1e6173bd121dc2aull, 0x2b5989b2a6dbc7dfull },
         { "qwen35moe_fp8", 2, 0, 0x46d061a0de9a8933ull, 0x4a597c66b5868eeeull },
     };
@@ -12458,7 +12458,9 @@ TEST(qwen35_a_wide_prefill_runs_in_two_pieces_with_its_boundaries_on_the_second_
                 CHECK(arn <= 1);
                 CHECK_EQ(ar_piece, 4 * (int)m.layers.size());
                 CHECK_EQ(ar_overlap, 4 * (int)m.layers.size());
-                CHECK_EQ(wide_attn, 0);
+                /* Each piece's attention is keyed at the op's top band (q and out are the whole
+                 * step's, indexed by cu), so every launch is a wide one. */
+                CHECK_EQ(wide_attn, attn);
                 CHECK_EQ(wide_taps, 0);
                 CHECK(!c.joins.empty());
             }

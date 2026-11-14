@@ -600,6 +600,11 @@ extern "C" int rad_memcpy_async(void* dst, const void* src, int64_t bytes, RadSt
             c->copies.push_back({ c->issues.size(), h });
     return RAD_OK;
 }
+/* A copy list: each segment as rad_memcpy_async records it. */
+extern "C" int rad_memcpy_list_async(const RadCopySeg* segs, int n, unsigned, RadStream s) {
+    for (int i = 0; i < n; ++i) (void)rad_memcpy_async(segs[i].dst, segs[i].src, segs[i].bytes, s);
+    return 0;
+}
 /* The pitched copy: recorded exactly as the 1-D one (its destination's first byte names the
  * buffer); the unlimitedocr tower packs patch rows and lays out its map with it. */
 extern "C" int rad_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch,

@@ -127,6 +127,16 @@ struct MlpFP8 {
         }();
         return ax && ax_out_d && th > 0 && rows >= th;
     }
+    /* A wide piece's copies go to the card's DMA engine as one list (RADIANCE_AUX_SDMA=0: copy
+     * kernels), so they hold no CU slot beside the rank's slice; a narrow one's as copy kernels. */
+    static void ax_copy(const RadCopySeg* seg, int n, bool wide, RadStream s) {
+        static const bool sdma = [] {
+            const char* e = std::getenv("RADIANCE_AUX_SDMA");
+            return !e || std::atoi(e) != 0;
+        }();
+        if (wide && sdma && rad_memcpy_list_async(seg, n, 0, s) == RAD_OK) return;
+        for (int i = 0; i < n; ++i) (void)rad_memcpy_async(seg[i].dst, seg[i].src, seg[i].bytes, s);
+    }
 };
 
 inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire,
@@ -264,10 +274,11 @@ inline void MlpFP8::ax_begin(RadCtx* c, int64_t T, int64_t r0, int64_t rows, int
     const int cl = ax_dma(rows) ? 1 : 0;
     if (cl) { rad_lane_join(c, 0, 1); rad_lane(c, 1); }
     const RadStream s0 = rad_lane_stream(c);
-    (void)rad_memcpy_async((char*)rad_buf_ptr(c, ax->w.h.q8) + r0 * g.n_embd,
-                           (char*)rad_buf_ptr(c, w.h.q8) + r0 * g.n_embd, rows * g.n_embd, s0);
-    (void)rad_memcpy_async((char*)rad_buf_ptr(c, ax->w.h.s8) + r0 * sb,
-                           (char*)rad_buf_ptr(c, w.h.s8) + r0 * sb, rows * sb, s0);
+    const RadCopySeg seg[2] = {
+        { (char*)rad_buf_ptr(c, w.h.q8) + r0 * g.n_embd, (char*)rad_buf_ptr(c, ax->w.h.q8) + r0 * g.n_embd,
+          rows * g.n_embd },
+        { (char*)rad_buf_ptr(c, w.h.s8) + r0 * sb, (char*)rad_buf_ptr(c, ax->w.h.s8) + r0 * sb, rows * sb } };
+    ax_copy(seg, 2, cl != 0, s0);
     rad_lane_join(c, cl, 2);
     rad_lane(c, 2);
     ax->gate_up.step(c, ax->w.h, ax->w.gate_up, T, r0, rows);
@@ -286,9 +297,9 @@ inline void MlpFP8::ax_end(RadCtx* c, int64_t r0, int64_t rows, int par) const {
         const int64_t eb = (int64_t)rad_dtype_bits(g.act_dtype) / 8;
         rad_lane(c, 1);
         rad_lane_wait_mark(c, par);
-        (void)rad_memcpy_async((char*)rad_buf_ptr(c, ax_out_d) + r0 * g.n_embd * eb,
-                               (char*)rad_buf_ptr(c, ax->w.h.x) + r0 * g.n_embd * eb,
-                               rows * g.n_embd * eb, rad_lane_stream(c));
+        const RadCopySeg seg = { (char*)rad_buf_ptr(c, ax->w.h.x) + r0 * g.n_embd * eb,
+                                 (char*)rad_buf_ptr(c, ax_out_d) + r0 * g.n_embd * eb, rows * g.n_embd * eb };
+        ax_copy(&seg, 1, true, rad_lane_stream(c));
         rad_lane_mark(c, par + 2);
         rad_lane(c, 0);
     }

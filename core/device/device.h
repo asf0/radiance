@@ -58,26 +58,7 @@ struct RadCopyRange {
 extern "C" int rad_memcpy_ranges_async(void* dst, const void* src, int64_t prefix,
                                        const RadCopyRange* ranges, int n, RadStream s);
 
-/* One copy of a list: `bytes` from `src` to `dst`, both absolute addresses. */
-struct RadCopySeg {
-    const void* src;
-    void*       dst;
-    int64_t     bytes;
-};
-/* Many unrelated copies, in list order on the stream, on the card's DMA engine where the backend
- * has one (otherwise segment by segment). The list itself is read at the call; the bytes it names
- * must live until the copy runs. An empty list enqueues nothing but performs the card's first-list
- * setup, so a caller can pay that cost at bring-up.
- *
- * For bulk link copies while the card computes (e.g. a layer's pooled experts in the prefill
- * stager). A copy kernel holds a CU slot for the link's duration and waits for a free one at
- * launch: beside busy kernels, 1.3 MB pinned-host copies run at 2.3 GB/s as kernels versus
- * 28.7 GB/s (link rate) on the DMA engine, at no cost to the kernels (aql.cpp, "the DMA lane").
- *
- * RAD_COPY_YIELD makes the list yield to the card's collectives: between ~1 MB pieces it waits
- * while a stream of that card holds the link (rad_link_hold). */
-#define RAD_COPY_YIELD 1u
-extern "C" int rad_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream s);
+/* RadCopySeg and rad_memcpy_list_async are declared in rad_device.h (arch code issues lists too). */
 
 /* Holds the card's link for the work `s` issues between two calls. `on` = 1 where step-critical
  * link traffic (a collective) starts, 0 where it ends, or 2 where the work in between released the
