@@ -1819,6 +1819,32 @@ const RadBatch* Scheduler::step() {
         hold_prefill = interleave_left_ > 0;
     }
 
+    /* Local: a long prefill beside decoding sequences runs alone (solo_rows_). */
+    if (solo_rows_ < 0) {
+        const char* e = std::getenv("RADIANCE_SOLO_PREFILL");
+        solo_rows_ = e ? std::max<long long>(0, std::atoll(e)) : 1024;
+    }
+    solo_slot_ = -1;
+    solo_admit_ = false;
+    if (solo_rows_ > 0 && cfg_.prefill_span > 1 && any_decoding && !hold_prefill) {
+        for (int32_t slot : running_) {
+            const SchedReq& s = *reqs_[(size_t)slot];
+            if (!s.req || !s.running || s.req->embed) continue;
+            const int64_t left = s.seq_len() - s.req->n_computed;
+            if (s.req->n_computed < (int64_t)s.req->prompt.size() && left >= solo_rows_) {
+                solo_slot_ = slot;
+                break;
+            }
+        }
+        if (solo_slot_ < 0 && !waiting_.empty() && !free_cards_.empty() &&
+            (int64_t)running_.size() < cfg_.max_seqs) {
+            const SchedReq& w = *reqs_[(size_t)waiting_[0]];
+            solo_admit_ = w.req && !w.req->embed && !w.req->media &&
+                          (int64_t)w.req->prompt.size() >= solo_rows_;
+        }
+    }
+    const bool solo = solo_slot_ >= 0 || solo_admit_;
+
     /* A span is for a prefill alone in its step (ChunkGeometry::span). A spanned step takes as
      * long as the intervals it carries, so a decode row riding along would wait that long for its
      * token. The span is taken only when the step can hold nothing but the one prefill (a single
@@ -1831,7 +1857,9 @@ const RadBatch* Scheduler::step() {
     /* Keyed on the flag, not on whether this model has intervals to span: the engine told the
      * plugin that a step wider than shared_tok is one sequence (RadBuildCtx::max_mixed_tok),
      * whatever the geometry turned out to be. */
-    if (cfg_.prefill_span > 1) {
+    if (cfg_.prefill_span > 1 && solo) {
+        span_now_ = true;
+    } else if (cfg_.prefill_span > 1) {
         bool lone = false;
         const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
                                     (int64_t)running_.size() < cfg_.max_seqs;
@@ -1861,7 +1889,7 @@ const RadBatch* Scheduler::step() {
      * to be walked needs 1 + the deepest window it can take, each prefill row a share, plus one
      * share when a request waits and a slot is free. Counted down as the loop walks, so a row's
      * reserve is what is behind it. */
-    const bool share_step = cfg_.busy_prefill_chunk != 0;
+    const bool share_step = cfg_.busy_prefill_chunk != 0 && !solo;
     const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
     /* An eighth of this step's budget, which under a span is shared_tok for a shared step. */
     const int64_t share_tok = std::max<int64_t>(Q, budget / 8 / Q * Q);
@@ -1916,6 +1944,8 @@ const RadBatch* Scheduler::step() {
         int64_t ckpt = -1;
         int64_t want;
         if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
+        /* A solo step serves only its prefill: everything else waits a step. */
+        if (solo && slot != solo_slot_) { ++i; continue; }
         if (prefill) {
             const int64_t shares = share_step ? behind_pf + (admit_waits ? 1 : 0) : 0;
             const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;

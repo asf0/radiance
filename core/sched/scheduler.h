@@ -779,6 +779,14 @@ private:
      * prefilling requests the last step() held back. step_next_locked stops issuing ahead once
      * the hold is spent, or the chunk would wait as long as the decoders keep stepping ahead. */
     int64_t interleave_left_ = 0;
+    /* Local (RADIANCE_SOLO_PREFILL): a prefill with at least this many tokens left, beside decoding
+     * sequences, takes a step of its own at the spanned budget (an aux split pipelines only a step
+     * of one prefilling sequence); the decode-only steps of --prefill-interleave still follow.
+     * 0 off. `solo_slot_` is the running request so served this step, -1 none; `solo_admit_` a
+     * step that admits the queue's front alone. */
+    int64_t solo_rows_ = -1;
+    int32_t solo_slot_ = -1;
+    bool    solo_admit_ = false;
     int64_t held_prefill_ = 0;
     /* --prefill-interleave auto: the decode-only steps after a chunk (interleave_steps), sized by
      * the running means of a step that carried a chunk and of a decode step, in seconds, fed by
