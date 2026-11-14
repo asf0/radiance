@@ -1040,6 +1040,9 @@ struct Tape {
     std::vector<TapeRec> rec;
     std::vector<unsigned char> karg_host;   /* the argument blocks, kept to compare tapes by */
     char*                karg = nullptr;    /* placed at the end of the capture */
+    /* Local (aux device): a pass that submits to a second card keeps a copy of the argument blocks
+     * in that card's own pool, and its dispatches read that copy. */
+    std::vector<char*>   karg_more;
     std::string          bad;               /* why this tape cannot be played, if it cannot */
     /* Last packet the latest play wrote on each queue; the argument block is freed only after
      * all of them are consumed. */
@@ -1951,6 +1954,7 @@ bool tape_idle(const Tape* t) {
 void tape_free(Tape* t) {
     note_free(t->karg);
     if (t->karg) hsa_amd_memory_pool_free(t->karg);
+    for (char* k : t->karg_more) { note_free(k); hsa_amd_memory_pool_free(k); }
     t->magic = 0;
     delete t;
 }
@@ -1997,39 +2001,42 @@ RadTape a_tape_end(int keep) {
         tape_free(t);
         return nullptr;
     }
-    int ord = -1;
-    for (const TapeRec& r : t->rec) {
-        if (ord < 0) ord = r.s->ord;
-        else if (r.s->ord != ord) {
-            device_set_error("the pass cannot be recorded: it submits to devices %d and %d", ord,
-                             r.s->ord);
-            tape_free(t);
-            return nullptr;
-        }
-    }
+    /* The cards the pass submits to (one, or a rank's card and the aux card): each gets the
+     * argument blocks in its own pool, the first in `karg`. */
+    std::vector<int> ords;
+    for (const TapeRec& r : t->rec)
+        if (std::find(ords.begin(), ords.end(), r.s->ord) == ords.end()) ords.push_back(r.s->ord);
     if (!t->karg_host.empty()) {
-        const Dev& d = G().dev[(size_t)ord];
-        void* ka = nullptr;
-        /* Padded by a slot: a chained kernel played from here reads its record's place
-         * (RAD_CHAIN_KARG_OFF) past its own arguments. */
-        hsa_amd_memory_pool_t pool = d.host_kargs ? G().host_fine : d.vram;
-        hsa_agent_t peer = d.host_kargs ? d.agent : G().cpu;
-        if (hsa_amd_memory_pool_allocate(pool, t->karg_host.size() + kKargSlot, 0, &ka) !=
-                HSA_STATUS_SUCCESS ||
-            hsa_amd_agents_allow_access(1, &peer, nullptr, ka) != HSA_STATUS_SUCCESS) {
-            if (ka) hsa_amd_memory_pool_free(ka);
-            device_set_error("the pass cannot be recorded: %zu bytes of kernel arguments could "
-                             "not be placed in %s", t->karg_host.size(),
-                             d.host_kargs ? "pinned host memory" : "VRAM");
-            tape_free(t);
-            return nullptr;
+        std::vector<std::pair<int, char*>> placed;
+        for (int ord : ords) {
+            const Dev& d = G().dev[(size_t)ord];
+            void* ka = nullptr;
+            /* Padded by a slot: a chained kernel played from here reads its record's place
+             * (RAD_CHAIN_KARG_OFF) past its own arguments. */
+            hsa_amd_memory_pool_t pool = d.host_kargs ? G().host_fine : d.vram;
+            hsa_agent_t peer = d.host_kargs ? d.agent : G().cpu;
+            if (hsa_amd_memory_pool_allocate(pool, t->karg_host.size() + kKargSlot, 0, &ka) !=
+                    HSA_STATUS_SUCCESS ||
+                hsa_amd_agents_allow_access(1, &peer, nullptr, ka) != HSA_STATUS_SUCCESS) {
+                if (ka) hsa_amd_memory_pool_free(ka);
+                device_set_error("the pass cannot be recorded: %zu bytes of kernel arguments could "
+                                 "not be placed in %s", t->karg_host.size(),
+                                 d.host_kargs ? "pinned host memory" : "VRAM");
+                tape_free(t);
+                return nullptr;
+            }
+            std::memcpy(ka, t->karg_host.data(), t->karg_host.size());
+            note_alloc(ka, (int64_t)t->karg_host.size(), -1);
+            if (!t->karg) t->karg = static_cast<char*>(ka);
+            else          t->karg_more.push_back(static_cast<char*>(ka));
+            placed.emplace_back(ord, static_cast<char*>(ka));
         }
-        std::memcpy(ka, t->karg_host.data(), t->karg_host.size());
         _mm_sfence();
-        t->karg = static_cast<char*>(ka);
-        note_alloc(ka, (int64_t)t->karg_host.size(), -1);
-        for (TapeRec& r : t->rec)
-            if (r.kind == kTapeDispatch) r.pkt.kernarg_address = t->karg + r.karg_off;
+        for (TapeRec& r : t->rec) {
+            if (r.kind != kTapeDispatch) continue;
+            for (const auto& pk : placed)
+                if (pk.first == r.s->ord) { r.pkt.kernarg_address = pk.second + r.karg_off; break; }
+        }
     }
     return t;
 }

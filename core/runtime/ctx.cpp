@@ -150,9 +150,14 @@ int Ctx::prepare() {
      * hold more rows than their header says and be written late. */
     const bool taps = std::any_of(program_->ops.begin(), program_->ops.end(),
                                   [](const OpInfo& o) { return o.op == "gram_accum"; });
-    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps && !has_aux();
-    if (has_aux() && record_passes_ && rank_ == 0)
-        RAD_INFO("recorded passes: off, the program runs ops on an aux device (first cut)");
+    /* Beside an aux device recorded passes play correctly (a tape keeps argument blocks per card)
+     * but measured no faster: decode waits on the cards' chain, not on the host. Opt in with
+     * RADIANCE_AUX_TAPE=1. */
+    static const bool aux_tape = [] { const char* e = std::getenv("RADIANCE_AUX_TAPE"); return e && *e == '1'; }();
+    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps &&
+               (!has_aux() || aux_tape);
+    if (has_aux() && !aux_tape && record_passes_ && rank_ == 0)
+        RAD_INFO("recorded passes: off beside the aux device (no gain measured; RADIANCE_AUX_TAPE=1 records them)");
     if (taps && record_passes_ && tape_supported() && rank_ == 0)
         RAD_INFO("recorded passes: off, the program accumulates calibration Grams (gram_accum)");
     return RAD_OK;
@@ -1130,7 +1135,8 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     mix(domain_epoch_.load(std::memory_order_relaxed));
     ptr(arena_.base());
     mix((lane1_ ? 1u : 0u) | (host_touch_pending_[0] ? 2u : 0u) | (host_touch_pending_[1] ? 4u : 0u) |
-        (scratch_open_[0] ? 8u : 0u) | (scratch_open_[1] ? 16u : 0u));
+        (scratch_open_[0] ? 8u : 0u) | (scratch_open_[1] ? 16u : 0u) |
+        (host_touch_pending_[2] ? 32u : 0u) | (aux_stream_ ? 64u : 0u));
     return h | 1;
 }
 
@@ -1186,6 +1192,7 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     out->ar_bytes = ar_bytes_.load() - y0;
     out->touch_pending[0] = host_touch_pending_[0];
     out->touch_pending[1] = host_touch_pending_[1];
+    out->touch_pending[2] = host_touch_pending_[2];
     out->scratch_open[0] = scratch_open_[0];
     out->scratch_open[1] = scratch_open_[1];
     if (haz_mark(*out) < 0) {
@@ -1413,6 +1420,7 @@ int Ctx::play_pass(PassTape& t) {
     ar_bytes_.fetch_add(t.ar_bytes, std::memory_order_relaxed);
     host_touch_pending_[0] = t.touch_pending[0];
     host_touch_pending_[1] = t.touch_pending[1];
+    host_touch_pending_[2] = t.touch_pending[2];
     scratch_open_[0] = t.scratch_open[0];
     scratch_open_[1] = t.scratch_open[1];
     ++t.plays;

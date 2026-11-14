@@ -533,8 +533,8 @@ private:
         std::vector<TapeXp> xp;
         /* What the recording added to the Ctx's counters, and the bookkeeping it ended on. */
         int64_t  issues = 0, ar_calls = 0, ar_bytes = 0, stream_waits = 0, host_syncs = 0;
-        bool     touch_pending[2] = {};
-        bool     scratch_open[2] = {};
+        bool     touch_pending[3] = {};
+        bool     scratch_open[3] = {};
         int64_t  plays = 0;
         uint64_t used = 0;
         int32_t  dispatches = 0, unordered = 0;   /* its kernels, and those haz_mark left unordered */
