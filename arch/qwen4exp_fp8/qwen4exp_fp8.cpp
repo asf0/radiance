@@ -159,6 +159,7 @@ struct Model {
     /* the routed feed-forward's */
     rad_buf b_rlogits = 0, b_eids = 0, b_ew = 0, b_sorted = 0, b_eoff = 0, b_ecnt = 0;
     rad_buf b_egu = 0, b_edn = 0, b_emoe = 0, b_sgu = 0, b_sout = 0, b_sgate = 0;
+    rad_buf b_emoe_d = 0;   /* local (aux split): VRAM copy of b_emoe (MoeFP8::Wire::moe_d) */
     rad_buf b_sorted2 = 0, b_eoff2 = 0;   /* local: the second piece's routing planes (step_auxpipe) */
     ActFP8  a_eff{}, a_sff{};
     /* The rotated codes of the block input, for the routed arm only: `q` and `s` are used and `x`
@@ -972,6 +973,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     m.b_edn     = decl_b(b, nm.f("moe_edn"),    g.act_dtype, {ER, g.n_embd}, RAD_BUF_TRANSIENT, xdom);
     m.b_emoe    = decl_b(b, nm.f("moe_out"),    g.act_dtype, {T, g.n_embd}, RAD_BUF_TRANSIENT, xdom);
+    m.b_emoe_d = 0;
+    if (m.aux_r) {
+        /* Persistent: lane 1 writes it while lane 0 runs, and the host output it copies is read
+         * on lane 1 too. */
+        m.b_emoe_d = decl_b(b, nm.f("moe_out_d"), g.act_dtype, {T, g.n_embd}, RAD_BUF_PERSIST);
+        if (!m.b_emoe_d) return RAD_E_INVAL;
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_emoe));
+    }
     /* Local (aux device): the second of two passes in flight routes into its own planes. */
     if (m.aux) {
         m.b_sorted2 = decl_b(b, nm.f("moe_sorted2"), RAD_I32, {ER}, RAD_BUF_PERSIST, RAD_DOMAIN_HOST);
@@ -1086,7 +1095,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     mw.sorted = m.b_sorted;  mw.eoff = m.b_eoff; mw.ecnt = m.b_ecnt;
     mw.sorted2 = m.b_sorted2; mw.eoff2 = m.b_eoff2;
     if (m.aux_r && m.a_hr_h.q) mw.hr = m.a_hr_h;   /* the aux instance and the MTP head read the host copy */
-    mw.egu = m.b_egu; mw.eff = m.a_eff; mw.edn = m.b_edn; mw.moe = m.b_emoe;
+    mw.egu = m.b_egu; mw.eff = m.a_eff; mw.edn = m.b_edn; mw.moe = m.b_emoe; mw.moe_d = m.b_emoe_d;
     mw.sgu = m.b_sgu; mw.sff = m.a_sff; mw.sout = m.b_sout; mw.sgate = m.b_sgate;
 
     HyperConn::Wire hw{};

@@ -1406,6 +1406,9 @@ int rad_lane_mark(RadCtx* c, int slot) {
     if (!c) return RAD_E_INVAL;
     return static_cast<rad::Ctx*>(c)->lane_mark(slot);
 }
+RadStream rad_lane_stream(RadCtx* c) {
+    return c ? static_cast<rad::Ctx*>(c)->cur_stream() : nullptr;
+}
 int rad_lane_wait_mark(RadCtx* c, int slot) {
     if (!c) return RAD_E_INVAL;
     return static_cast<rad::Ctx*>(c)->lane_wait_mark(slot);

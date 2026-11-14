@@ -917,6 +917,8 @@ int rad_lane_join(RadCtx* c, int from, int to);
 #define RAD_LANE_MARKS 4
 int rad_lane_mark(RadCtx* c, int slot);
 int rad_lane_wait_mark(RadCtx* c, int slot);
+/* Local: the current lane's stream (rad_stream is always lane 0's), for a copy issued on a lane. */
+RadStream rad_lane_stream(RadCtx* c);
 
 /* Same, with the ranged value taken from the batch. */
 #define RAD_ISSUE(c, op, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), RAD_N_BATCH)
