@@ -354,8 +354,37 @@ static int g8_decode_common(const RadArgs* a, R4DArgs* r, int head_dim, long lon
     const int rc = fill_paged_row(a, r, head_dim, row > 0 ? row : 2LL * head_dim);
     if (rc != RAD_OK) return rc;
     r->splits = sp;
-    const int64_t need = GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(r);
-    if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_SCRATCH);
+    int64_t need = GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(r);
+    /* Local: a launch whose partials would overflow the declared scratch takes fewer KV segments
+     * instead of refusing (the merge is exact for any count; a ragged launch over part of a step
+     * sizes by the whole q operand, an overestimate). Said once. */
+    if (a->scratch && a->scratch_bytes < need && need > 0) {
+        const int sp0 = r4d_decode_splits(r, G8_D_TILE);
+        const int64_t per = need / (sp0 > 0 ? sp0 : 1);
+        const int64_t fit = per > 0 ? a->scratch_bytes / per : 0;
+        if (fit >= 1) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::fprintf(stderr, "libr4d: attn decode gqa%d: %d KV segments need %lld bytes "
+                             "of scratch, %lld declared; taking %lld (total_q=%d num_seqs=%d)\n",
+                             (int)R4D_ATTN_GQA, sp0, (long long)need, (long long)a->scratch_bytes,
+                             (long long)fit, r->total_q, r->num_seqs);
+            }
+            r->splits = (int)(fit < sp0 ? fit : sp0);
+            need = GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(r);
+        }
+    }
+    if (!a->scratch || a->scratch_bytes < need) {
+        /* Local: the live operands behind a refusal (the core prints the step's batch). */
+        std::fprintf(stderr, "libr4d: attn decode gqa%d scratch refusal: total_q=%d num_seqs=%d "
+                     "q_len=%d cu=%s max_blocks=%d block_size=%d max_ctx=%d depth=%d splits=%d "
+                     "need=%lld have=%lld scratch=%p\n", (int)R4D_ATTN_GQA, r->total_q,
+                     r->num_seqs, r->q_len, r->cu_q ? "yes" : "no", r->max_blocks, r->block_size,
+                     r->max_ctx, r4d_decode_depth(r), r4d_decode_splits(r, G8_D_TILE),
+                     (long long)need, (long long)a->scratch_bytes, a->scratch);
+        return R4D_NO(RAD_E_SCRATCH);
+    }
     return RAD_OK;
 }
 
