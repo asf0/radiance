@@ -183,6 +183,42 @@ struct AttnGatedFP8 {
     int    ar_overlap = 0;
     rad_op op_ar_ov = 0;
 
+    /* Whether pre_rows may issue the first rows' projections ahead of the rest (ArPieces::pre):
+     * the block reads an external, already-normed input and runs its projections. */
+    bool takes_pre() const { return ext_in && !op_fill; }
+    /* Rows [0, R) of the q|gate, k and v projections, over input rows the caller finished while
+     * the rest are still being produced; step() then projects rows [R, T) (ArPieces::pre). */
+    void pre_rows(RadCtx* c, int64_t T, int64_t R) const {
+        qg.step(c, w.h, w.qg, T, 0, R);
+        kp.step(c, w.h, w.k,  T, 0, R);
+        vp.step(c, w.h, w.v,  T, 0, R);
+    }
+    /* Whether the step attends sparsely over the indexer's selection (step()'s choice, for a
+     * step on an unstreamed group). */
+    bool sparse_step(const RadBatch* batch) const {
+        const int64_t reach = (int64_t)batch->max_ctx_len + batch->max_q_len;
+        return qsa_sel && qsa_sequ &&
+               (batch->n_tok == batch->n_seq || qsa_exact_to <= 0 || reach > qsa_exact_to);
+    }
+    /* Whether step_piece serves the step: one prefill sequence in two pieces over the caller's
+     * normed input, the caller running each piece's indexer itself (QsaIndexer::step_piece),
+     * on the unfused prologue with one rotary component per token. Sparse, the gate rides in
+     * the attention's merge; dense, it is quantised by gate_quant_fp8 (as takes_pieces). */
+    bool takes_qsa_pieces(const RadBatch* batch, const ArPieces* pieces) const {
+        const int64_t T = batch->n_tok;
+        const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+        if (!(pieces && pieces->cu && pieces->cuts(T) && T <= 2 * pieces->rows && takes_pre() &&
+              !op_add && batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
+              !(T <= fused_rows) && batch->positions && !rope_mixed(batch) && kvb &&
+              !kvb->stream && kvb->slot_mapping && kvb->block_table && kvb->seqused))
+            return false;
+        return sparse_step(batch) ? op_attn_gq != 0 : (op_gq != 0 && !op_sig);
+    }
+    /* Piece `p` (0: rows [0, rows), 1: the rest) of a takes_qsa_pieces step, after the caller's
+     * indexer piece: the projections (unless pre_rows issued them), prologue, cache store,
+     * attention up to the piece's own end, gate and out projection; the first piece then hands
+     * its rows off. */
+    void step_piece(RadCtx* c, const RadBatch* batch, ArPieces* pieces, int p, bool proj) const;
     /* Whether step() with `own_ar` false runs the dense path a piece at a time over a caller's
      * normed pieces (ArPieces::in_ready): one prefill sequence in two pieces, each the chunk a
      * span of 1 makes, on the unfused prologue with one rotary component per token (every token's
@@ -573,6 +609,65 @@ inline void AttnGatedFP8::store_kv(RadCtx* c, const RadBatch* batch) const {
     store_cache(c, kvb, slot, T);
 }
 
+inline void AttnGatedFP8::step_piece(RadCtx* c, const RadBatch* batch, ArPieces* pieces,
+                                     int p, bool proj) const {
+    const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+    const int32_t* slot  = kvb->slot_mapping;
+    const int32_t* table = kvb->block_table;
+    const int32_t* used  = kvb->seqused;
+    const int64_t T = batch->n_tok, R = pieces->rows, hd = g.head_dim, qw = g.q_dim();
+    const int64_t qgw = g.n_head * 2 * hd, kvw = g.n_head_kv * hd;
+    const int64_t r0 = p == 0 ? 0 : R;
+    const int64_t n  = p == 0 ? R : T - R;
+    const int32_t* pos = (batch->rope_pos ? batch->rope_pos : batch->positions) + r0;
+    if (proj) {
+        qg.step(c, w.h, w.qg, T, r0, n);
+        kp.step(c, w.h, w.k,  T, r0, n);
+        vp.step(c, w.h, w.v,  T, r0, n);
+    }
+    RAD_ISSUE_N(c, op_q_norm, n * g.n_head,
+                bcol_at(w.qg, r0, qgw, 0, hd, n), RAD_W(w_q_norm),
+                brow_slice(w.q, r0, n, qw));
+    RAD_ISSUE_N(c, op_k_norm, n * g.n_head_kv,
+                brow_slice(w.k, r0, n, kvw), RAD_W(w_k_norm),
+                brow_slice(w.k, r0, n, kvw));
+    RAD_ISSUE_N(c, op_rope_q, n, brow_slice(w.q, r0, n, qw), praw(pos, RAD_I32, n));
+    RAD_ISSUE_N(c, op_rope_k, n, brow_slice(w.k, r0, n, kvw), praw(pos, RAD_I32, n));
+    RAD_ISSUE_N(c, op_kv_store, n,
+                brow_slice(w.k, r0, n, kvw), brow_slice(w.v, r0, n, kvw),
+                praw(slot + r0, RAD_I32, n), kv_cache(kv, layer));
+    if (sparse_step(batch)) {
+        const int64_t chunk = qsa_gq_rows();
+        for (int64_t off = r0; off < r0 + n; off += chunk) {
+            const int64_t rows = (r0 + n - off) < chunk ? (r0 + n - off) : chunk;
+            RAD_ISSUE_N(c, op_attn_gq, 1,
+                        brow_slice(w.q, off, rows, qw),
+                        kv_cache(kv, layer),
+                        brow_slice(qsa_sel, off, rows, qsa_topk + 1),
+                        brow_slice(qsa_sequ, off, rows, 1),
+                        RAD_NONE, RAD_NONE, RAD_NONE,
+                        brow_slice(w.attn.x, off, rows, qw),
+                        bcol_at(w.qg, off, qgw, hd, hd, rows),
+                        brow_slice(w.attn.cq(), off, rows, qw),
+                        brow_slice(w.attn.cs(), off, rows, fp8_blocks(qw)));
+        }
+    } else {
+        const int64_t tpitch = kvb->block_table_pitch;
+        RAD_ISSUE_N(c, op_attn, n,
+                    brows(w.q, T), kv_cache(kv, layer), praw2(table, RAD_I32, 1, tpitch),
+                    praw(p == 0 ? batch->positions + R : used, RAD_I32, 1),
+                    RAD_NONE, RAD_NONE, praw(pieces->cu + p, RAD_I32, 2),
+                    brows(w.attn.x, T));
+        RAD_ISSUE_N(c, op_gq, n * g.n_head,
+                    bcol_at(w.qg, r0, qgw, hd, hd, n), brow_slice(w.attn.x, r0, n, qw),
+                    brow_slice(w.attn.cq(), r0, n, qw),
+                    brow_slice(w.attn.cs(), r0, n, fp8_blocks(qw)),
+                    brow_slice(w.attn.x, r0, n, qw));
+    }
+    o.step(c, w.attn, w.h.x, T, r0, n);
+    if (p == 0) pieces->hand(r0, n);
+}
+
 inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                                ArPieces* pieces) const {
     const RadKVGroupBatch* kvb = kv_batch(batch, kv);
@@ -636,9 +731,11 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
         return;
     }
-    qg.step(c, w.h, w.qg, T);
-    kp.step(c, w.h, w.k,  T);
-    vp.step(c, w.h, w.v,  T);
+    const int64_t pre = pieces && pieces->pre > 0 && pieces->pre < T && takes_pre() ? pieces->pre
+                                                                                 : 0;
+    qg.step(c, w.h, w.qg, T, pre, T - pre);
+    kp.step(c, w.h, w.k,  T, pre, T - pre);
+    vp.step(c, w.h, w.v,  T, pre, T - pre);
 
     /* Fused or unfused prologue. The fused kernel takes the whole [q|gate] projection and splits it
      * itself, and rotates k in place like the unfused ops. It reads one rotary component per
