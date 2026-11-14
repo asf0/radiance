@@ -119,6 +119,7 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <type_traits>
 
 namespace {
@@ -1166,6 +1167,15 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
 /* One body for the fp8 and w4 launchers, which differ only in the weight dtype and its pitches, so
  * their shape checks cannot drift apart. `ncls` is 2 for the two-class op (the odd class at N_odd /
  * K_odd) or 4 for the four-class one (classes 1..3 at N_1/K_1..N_3/K_3, `y` at operand 12). */
+/* Local: the decode mat-vec form, defined below (its note there). */
+template <uint32_t R>
+__global__ __launch_bounds__(256) void moe_gemv_nl_kernel(
+    const uint8_t* __restrict__ Aq, const float* __restrict__ As, const MoeCls ce, const MoeCls co,
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
+    uint32_t T, uint32_t N, uint32_t K, uint32_t n_expert, uint32_t top_k, uint32_t a_ld,
+    uint32_t as_ld, uint32_t y_ld, uint32_t a_sorted, const MoeTab tab);
+static int g_moe_gemv = -1;   /* HALO_MOE_GEMV: -1 unread, 0 off, 1 on (default) */
+
 template <int W4>
 int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     if (ncls != 2 && ncls != 4) return HALO_NO(RAD_E_INVAL);
@@ -1348,6 +1358,22 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     /* The band: a decode step takes the (tile, run) form (the kernel's ES note) and runs of several
      * rows take the prefill forms; moeq_decode_band has the crossover. */
     const int form = g_moe_prefill_form;
+    /* Local: the decode mat-vec form (moe_gemv_nl_kernel) for the w4nl64 codebook at two classes
+     * of one shape; HALO_MOE_GEMV=0 keeps the (tile, run) form. */
+    if constexpr (W4 == 2) {
+        if (g_moe_gemv < 0) {
+            const char* ev = std::getenv("HALO_MOE_GEMV");
+            g_moe_gemv = (ev && *ev == '0') ? 0 : 1;
+        }
+        if (g_moe_gemv && form == 0 && mode_nl && moeq_decode_band(T, n_expert) && ncls == 2 &&
+            Nc[0] == Nc[1] && Kc[0] == Kc[1] && K <= 2560 && K % 128 == 0 && N % 64 == 0)
+            return HALO_EMIT(stream, moe_gemv_nl_kernel<4>, dim3((unsigned)(N / 64), (unsigned)T),
+                             dim3(256), 0, (const uint8_t*)Aq->data, (const float*)As->data, ce, co,
+                             (const int32_t*)sorted->data, (const int32_t*)off->data,
+                             (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)K,
+                             (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)a_ld, (uint32_t)as_ld,
+                             (uint32_t)y_ld, a_sorted ? 1u : 0u, tabv);
+    }
     if ((form == 0 && moeq_decode_band(T, n_expert)) || form == 2) {
         /* The sorted operand's decode kernel: one block a run tile, G column tiles of output. */
         const bool dn_dec = a_sorted && parts == 1 && n_expert <= (long long)kMaxExpert;
@@ -1460,6 +1486,125 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     if (rc != RAD_OK) return rc;
     return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
 }
+
+
+/* ==================================================================== moe_gemm_q, the decode mat-vec form
+ *
+ * Local: inside the decode band the (tile, run) WMMA form stages a 16-row tile for a run of one to
+ * a few rows and converts every weight value through LDS; at batch 1 it reads the experts at about
+ * 145 GB/s on gfx1151. This form streams them instead: a block per run leader (the first sorted row
+ * of an expert's run) and 64 output columns; the run's rows (at most R a pass) are staged once as
+ * f16 in LDS with their scales; each wave walks eight weight rows, a lane reading 16 bytes (32
+ * codes) of a row a step in coalesced order, decoding them with moeq_stage_nl's permutes to f16
+ * pairs and accumulating v_dot2_f32_f16 per row, the row's E4M3 group scale and the activation's
+ * f32 block scale applied per 32 values; a wave reduction then writes the column. W4 2 (w4nl64a8h)
+ * at two classes of one shape. Not bit-identical to the WMMA forms (another summation order). */
+template <uint32_t R>
+__global__ __launch_bounds__(256) void moe_gemv_nl_kernel(
+    const uint8_t* __restrict__ Aq, const float* __restrict__ As, const MoeCls ce, const MoeCls co,
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
+    uint32_t T, uint32_t N, uint32_t K, uint32_t n_expert, uint32_t top_k, uint32_t a_ld,
+    uint32_t as_ld, uint32_t y_ld, uint32_t a_sorted, const MoeTab tab) {
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    __shared__ uint32_t s_a[R][2560 / 2];
+    __shared__ float    s_as[R][2560 / 128];
+    const uint32_t j = blockIdx.y;
+    if (j >= T) return;
+    /* The run holding row j: the last expert whose offset is at most j. */
+    uint32_t lo = 0, hi = n_expert;
+    if ((uint32_t)off[n_expert] <= j) return;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi + 1u) >> 1;
+        if ((uint32_t)off[mid] <= j) lo = mid; else hi = mid - 1u;
+    }
+    const uint32_t e = lo;
+    if ((uint32_t)off[e] != j) return;
+    const uint32_t rows = (uint32_t)off[e + 1] - j;
+    const MoeCls& C = (e & 1u) ? co : ce;
+    const uint8_t* W = moeq_wtab_at(C.w, C.w_s0, e >> 1);
+    const uint8_t* S = moeq_wtab_at(C.s, C.s_s0, e >> 1);
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
+    const uint32_t kq = K / 4u, kb = K / 128u, nch = K / 32u;
+    const float fix = kW4G64Scale * kMoeF16Fix;
+    for (uint32_t r0 = 0; r0 < rows; r0 += R) {
+        const uint32_t nr = rows - r0 < R ? rows - r0 : R;
+        __syncthreads();
+        for (uint32_t idx = tid; idx < R * kq; idx += 256u) {
+            const uint32_t r = idx / kq, q = idx - r * kq;
+            uint32_t lo2 = 0, hi2 = 0;
+            if (r < nr) {
+                const uint32_t i = j + r0 + r;
+                const int32_t f = a_sorted ? (int32_t)i : sorted[i];
+                if (f >= 0) {
+                    const uint32_t arow = a_sorted ? i : (uint32_t)f / top_k;
+                    halo_hcf::e4m3x4(*(const uint32_t*)(Aq + (size_t)arow * a_ld + 4u * q), lo2, hi2);
+                }
+            }
+            s_a[r][2u * q] = lo2;
+            s_a[r][2u * q + 1u] = hi2;
+        }
+        for (uint32_t idx = tid; idx < R * kb; idx += 256u) {
+            const uint32_t r = idx / kb, b = idx - r * kb;
+            float v = 0.0f;
+            if (r < nr) {
+                const uint32_t i = j + r0 + r;
+                const int32_t f = a_sorted ? (int32_t)i : sorted[i];
+                if (f >= 0) v = As[(size_t)(a_sorted ? i : (uint32_t)f / top_k) * as_ld + b];
+            }
+            s_as[r][b] = v;
+        }
+        __syncthreads();
+        for (uint32_t c = 0; c < 8u; ++c) {
+            const uint32_t n = blockIdx.x * 64u + wave * 8u + c;
+            if (n >= N) break;
+            const uint8_t* wr = W + (size_t)n * C.w_ld;
+            const uint8_t* sr = S + (size_t)n * C.s_ld * 2u;
+            float acc[R];
+#pragma unroll
+            for (uint32_t r = 0; r < R; ++r) acc[r] = 0.0f;
+            for (uint32_t ch = lane; ch < nch; ch += 32u) {
+                const uint4 pv = *(const uint4*)(wr + (size_t)ch * 16u);
+                const uint32_t p[4] = { pv.x, pv.y, pv.z, pv.w };
+                uint32_t d[16];
+#pragma unroll
+                for (uint32_t i = 0; i < 4; ++i) {
+                    const uint32_t mlo = p[i] & 0x07070707u, mhi = (p[i] >> 4) & 0x07070707u;
+                    const uint32_t hlo = __builtin_amdgcn_perm(tab.v[1], tab.v[0], mlo) | ((p[i] << 4) & 0x80808080u);
+                    const uint32_t llo = __builtin_amdgcn_perm(tab.v[3], tab.v[2], mlo);
+                    const uint32_t hhi = __builtin_amdgcn_perm(tab.v[1], tab.v[0], mhi) | (p[i] & 0x80808080u);
+                    const uint32_t lhi = __builtin_amdgcn_perm(tab.v[3], tab.v[2], mhi);
+                    d[4 * i + 0] = __builtin_amdgcn_perm(hlo, llo, 0x05010400u);
+                    d[4 * i + 1] = __builtin_amdgcn_perm(hlo, llo, 0x07030602u);
+                    d[4 * i + 2] = __builtin_amdgcn_perm(hhi, lhi, 0x05010400u);
+                    d[4 * i + 3] = __builtin_amdgcn_perm(hhi, lhi, 0x07030602u);
+                }
+                const uint32_t blk = ch >> 2, grp = (ch >> 1) & 1u;
+                const float ws = halo_fp8::e4m3((uint32_t)sr[blk * 2u + grp]) * fix;
+#pragma unroll
+                for (uint32_t r = 0; r < R; ++r) {
+                    if (r >= nr) break;
+                    float dot = 0.0f;
+                    const uint32_t* ar = &s_a[r][ch * 16u];
+#pragma unroll
+                    for (uint32_t t = 0; t < 16; ++t)
+                        dot = __builtin_amdgcn_fdot2(__builtin_bit_cast(h2, d[t]),
+                                                     __builtin_bit_cast(h2, ar[t]), dot, false);
+                    acc[r] = fmaf(dot, ws * s_as[r][blk], acc[r]);
+                }
+            }
+#pragma unroll
+            for (uint32_t r = 0; r < R; ++r) {
+#pragma unroll
+                for (uint32_t m = 16; m > 0; m >>= 1) acc[r] += __shfl_xor(acc[r], m, 32);
+            }
+            if (lane == 0) {
+                for (uint32_t r = 0; r < nr; ++r)
+                    Y[(size_t)(j + r0 + r) * y_ld + n] = halo::f32_to_bf16(acc[r]);
+            }
+        }
+    }
+}
+
 
 /* ==================================================================== moe_gemm_q, the down decode form
  *
