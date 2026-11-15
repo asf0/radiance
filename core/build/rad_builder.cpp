@@ -545,8 +545,11 @@ void Builder::resolve_bands(OpInfo& oi) {
         }
         return std::string();
     };
-    oi.bands = reg_.build_bands(oi.op, oi.ranged_key, oi.range_lo, oi.range_hi, oi.base,
-                                oi.weights.empty() ? nullptr : &accept);
+    /* Local: an aux op resolves against the aux device's registry, whose device rows were checked
+     * against that card's code objects at load. */
+    Registry& R = oi.aux && aux_reg_ ? *aux_reg_ : reg_;
+    oi.bands = R.build_bands(oi.op, oi.ranged_key, oi.range_lo, oi.range_hi, oi.base,
+                             oi.weights.empty() ? nullptr : &accept);
 
     if (oi.bands.empty()) {
         /* No rows for this op at all; add one band so the miss report names it. */
@@ -586,9 +589,13 @@ void Builder::resolve_bands(OpInfo& oi) {
                 else if (s > r.scratch_bytes)
                     r.scratch_bytes = s;
             }
-            if (r.scratch_bytes > prog_.scratch_bytes) prog_.scratch_bytes = r.scratch_bytes;
+            if (oi.aux) {
+                if (r.scratch_bytes > prog_.aux_scratch_bytes) prog_.aux_scratch_bytes = r.scratch_bytes;
+            } else if (r.scratch_bytes > prog_.scratch_bytes) {
+                prog_.scratch_bytes = r.scratch_bytes;
+            }
 
-            record_tune_request(r);
+            if (!oi.aux) record_tune_request(r);
         }
     }
 }
@@ -603,7 +610,8 @@ void Builder::finish_instances() {
             for (int d = 0; d < RAD_N_DOMAINS; ++d) {
                 Resolved& r = b.dom[d];
                 if (!r) continue;
-                const int s = reg_.init_instance(r, prog_.ctx.rank, prog_.ctx.world_size);
+                Registry& R = oi.aux && aux_reg_ ? *aux_reg_ : reg_;
+                const int s = R.init_instance(r, prog_.ctx.rank, prog_.ctx.world_size);
                 if (s >= 0) continue;
 
                 err(s, "%s: kernel %s matched %s and then its init() refused the instance: %s",
@@ -715,6 +723,7 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
 
     /* ---- resolve. */
     OpInfo oi;
+    oi.aux        = aux_on_;
     oi.op         = opname;
     oi.base       = std::move(base);
     oi.schema     = sc;
@@ -875,6 +884,32 @@ int Builder::buf_concurrent(rad_buf b) {
     if (finished_) { err(RAD_E_STATE, "buf_concurrent after declare finished"); return RAD_E_STATE; }
     if (b == 0 || b >= prog_.buffers.size()) return RAD_E_INVAL;
     concurrent_bufs_.insert(b);
+    return RAD_OK;
+}
+
+/* Local: see rad_buf_aux_local. */
+int Builder::buf_aux_local(rad_buf buf) {
+    if (!aux_reg_) return err(RAD_E_STATE, "rad_buf_aux_local: no aux device");
+    if (buf == 0 || buf >= prog_.buffers.size()) return err(RAD_E_INVAL, "rad_buf_aux_local: bad handle");
+    BufferInfo& bi = prog_.buffers[buf];
+    if (bi.decl.domain != RAD_DOMAIN_HOST)
+        return err(RAD_E_INVAL, "rad_buf_aux_local('%s'): only a RAD_DOMAIN_HOST buffer", bi.name.c_str());
+    bi.aux_local = true;
+    return RAD_OK;
+}
+
+/* Local: see rad_aux_window. */
+int Builder::aux_window(bool on) {
+    if (finished_) { err(RAD_E_STATE, "rad_aux_window after declare finished"); return RAD_E_STATE; }
+    if (on && !aux_reg_) {
+        err(RAD_E_STATE, "rad_aux_window: the engine runs without an aux device (--aux-device)");
+        return RAD_E_STATE;
+    }
+    if (on == aux_on_) {
+        err(RAD_E_STATE, "rad_aux_window(%d) twice in a row: the window does not nest", on ? 1 : 0);
+        return RAD_E_STATE;
+    }
+    aux_on_ = on;
     return RAD_OK;
 }
 
@@ -2578,6 +2613,7 @@ void Builder::finish_buffer_liveness() {
     prog_.scratch_regions = concurrent_bufs_.empty() ? 1 : 2;
     if (lane1_w0_ >= 0 && lane1_w1_ < 0)
         err(RAD_E_STATE, "rad_lane1_window_begin without rad_lane1_window_end");
+    if (aux_on_) err(RAD_E_STATE, "rad_aux_window(1) without rad_aux_window(0)");
     prog_.lane1_w0 = lane1_w1_ >= 0 ? lane1_w0_ : -1;
     prog_.lane1_w1 = lane1_w1_;
 
@@ -2795,6 +2831,26 @@ int rad_lane1_window_begin(RadBuilder* b) {
 int rad_lane1_window_end(RadBuilder* b) {
     if (!b) return RAD_E_INVAL;
     return B(b)->lane1_window(true);
+}
+
+int rad_aux_device(RadBuilder* b) {
+    if (!b) return -1;
+    return B(b)->aux_device();
+}
+
+int64_t rad_aux_split(RadBuilder* b) {
+    if (!b) return 0;
+    return B(b)->aux_split();
+}
+
+int rad_aux_window(RadBuilder* b, int on) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->aux_window(on != 0);
+}
+
+int rad_buf_aux_local(RadBuilder* b, rad_buf buf) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->buf_aux_local(buf);
 }
 
 int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi) {

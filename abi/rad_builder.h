@@ -542,6 +542,21 @@ int rad_buf_concurrent(RadBuilder* b, rad_buf buf);
 int rad_lane1_window_begin(RadBuilder* b);
 int rad_lane1_window_end(RadBuilder* b);
 
+/* ---- local: the aux device (a second card of another architecture, e.g. an iGPU beside a
+ * discrete card). rad_aux_device: the aux device's index, or -1 when the engine runs without one.
+ * rad_aux_window(b, 1) ... rad_aux_window(b, 0): ops declared in between resolve against the aux
+ * device's kernel libraries (--aux-kernels) and must be issued on lane 2, the aux device's
+ * stream. Every buffer such an op touches must be RAD_DOMAIN_HOST (pinned host memory both cards
+ * address) and its weights live in the pinned host pool. */
+int rad_aux_device(RadBuilder* b);
+int rad_aux_window(RadBuilder* b, int on);
+/* Routed experts per layer the plugin keeps on the rank's card beside the aux device (the last ids
+ * of each layer), as the engine decided (--aux-split); 0 = all on the aux device. */
+int64_t rad_aux_split(RadBuilder* b);
+/* A RAD_DOMAIN_HOST buffer only aux ops touch: it lives in the aux card's own memory instead
+ * (cached there, never read by the rank's card). */
+int rad_buf_aux_local(RadBuilder* b, rad_buf buf);
+
 /* An uneven shard: this rank's slice of a RAD_SHARD_ROW or RAD_SHARD_COL weight's split dimension
  * is [lo, hi) rather than an even 1/tp. Rows of each stacked row part for ROW, columns for COL, in
  * the container's unsharded units. The declared extent must already be `hi - lo` (per row part,

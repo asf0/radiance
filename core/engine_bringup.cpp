@@ -185,8 +185,11 @@ static int usable_devices(std::vector<int>* out, std::string* inventory, std::st
 
     std::string want;              /* the first taken device's arch; all ranks must match */
     std::string use, skip;
+    /* local experiment: RADIANCE_MIXED_DEVICES=1 takes every device, integrated and mixed arch */
+    const char* mixed_env = std::getenv("RADIANCE_MIXED_DEVICES");
+    const bool mixed = mixed_env && *mixed_env && *mixed_env != '0';
     for (const D& d : all) {
-        const bool take = (!any_discrete || !d.igpu) && (want.empty() || want == d.arch);
+        const bool take = mixed || ((!any_discrete || !d.igpu) && (want.empty() || want == d.arch));
         if (take && want.empty()) want = d.arch;
         std::string& into = take ? use : skip;
         into += fmt("%s%d:%s", into.empty() ? "" : " ", d.i, d.arch.c_str());
@@ -1266,7 +1269,7 @@ int Engine::declare() {
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
         const bool always = pb.chain_pays == RAD_CHAIN_ALWAYS;
         const bool pays = always || (cfg_.n_spec > 0 && pb.chain_pays != RAD_CHAIN_NONE);
-        rad_dev_chain_infer(pays);
+        rad_dev_chain_infer(cfg_.aux_device >= 0 ? 0 : pays);   /* local: off beside an aux device */
         const bool on = rad_dev_chain_enabled() != 0;
         const char* why = on     ? (always ? "the model's plugin measured a gain with them"
                                            : "the model's plugin measured a gain with its "
@@ -1716,6 +1719,7 @@ static int declare_ring_windows(KVManager& kv, const Program& prog) {
 }
 
 int Engine::plan() {
+    const Config aux_snap = aux_auto_ ? cfg_ : Config{};
     /* The budget is resolved once, for every rank, before any rank allocates. vram_budget_resolve
      * folds the smallest capacity with the largest program so one split fits every card, and
      * writes it into Config; per-rank resolution would let rank 1 measure a card rank 0 already
@@ -2045,6 +2049,40 @@ int Engine::plan() {
                 facts[i].statics -= tower_pin_bytes(wfs[i], cfg_.embedding_resolved);
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
+        /* Local (--aux-split auto): this program has no split; the rank's card takes as many routed
+         * experts a layer as the room the cache leaves holds, less a margin for the partner's
+         * activations. Nothing is allocated yet, so bring-up declares and plans again. */
+        if (aux_auto_) {
+            const Program& P = ranks_[0]->program;
+            const int64_t L = P.meta.n_layers;
+            std::set<std::pair<int32_t, int32_t>> units;
+            int64_t bytes = 0, n_exp = 0;
+            for (const WeightInfo& w : P.weights) {
+                const RadWeightGroup& gq = w.decl.group;
+                if (gq.expert < 0 || gq.layer < 0 || gq.layer >= L) continue;
+                units.insert({ gq.layer, gq.expert });
+                bytes += align_up(weight_bytes(w), RAD_ALIGN_UNIT);
+            }
+            if (!units.empty() && L > 0) n_exp = (int64_t)units.size() / L;
+            const int64_t per = units.empty() ? 0 : bytes / (int64_t)units.size() * L;
+            const int64_t margin = (int64_t)512 << 20;
+            const int64_t room = std::max<int64_t>(vb.elastic - vb.kv - margin, 0);
+            int64_t s = per > 0 ? room / per : 0;
+            s = std::min<int64_t>(s, std::max<int64_t>(n_exp - 4, 0)) & ~3LL;
+            cfg_ = aux_snap;
+            cfg_.aux_split = s;
+            aux_auto_ = false;
+            aux_redo_ = true;
+            decide("--aux-split", std::to_string(s),
+                   fmt("auto: %s of VRAM beside the cache (%s) holds %lld of %lld routed experts a "
+                       "layer at %s each across %lld layers", humanb(room).c_str(),
+                       humanb(vb.kv).c_str(), (long long)s, (long long)n_exp,
+                       humanb(per / std::max<int64_t>(L, 1)).c_str(), (long long)L));
+            RAD_INFO("aux split: auto picks %lld routed experts a layer for the rank's card "
+                     "(%s free beside the cache); declaring again with it", (long long)s,
+                     humanb(room).c_str());
+            return RAD_OK;
+        }
         xflex_claimed_ = vb.experts;
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
         decide("vram split",
@@ -4703,6 +4741,28 @@ int Engine::start() {
     if (vocab_ex) std::rethrow_exception(vocab_ex);
     if (vocab_st < 0) return vocab_st;
     if (plugins_st < 0) return plugins_st;
+    if (cfg_.aux_device >= 0) {
+        if (cfg_.aux_kernels.empty()) {
+            RAD_ERR("--aux-device %d needs --aux-kernels (the libraries for that card)", cfg_.aux_device);
+            return RAD_E_INVAL;
+        }
+        if (cfg_.aux_device >= rad_dev_count()) {
+            RAD_ERR("--aux-device %d: only %d device(s) are visible", cfg_.aux_device, rad_dev_count());
+            return RAD_E_DEVICE;
+        }
+        for (int d : devs)
+            if (d == cfg_.aux_device) {
+                RAD_ERR("--aux-device %d is also a rank's device", d);
+                return RAD_E_INVAL;
+            }
+        const int as = rad_tools_load_aux_kernels(cfg_.radiance_home, cfg_.aux_kernels, cfg_.aux_device);
+        if (as < 0) { RAD_ERR("the aux device's kernel libraries did not load (above)"); return as; }
+        RadDeviceProps ap{};
+        (void)rad_dev_props(cfg_.aux_device, &ap);
+        RAD_INFO("aux device: %d (%s), %zu kernel librar%s", cfg_.aux_device, ap.arch,
+                 rad_aux_registry().plugins().size(),
+                 rad_aux_registry().plugins().size() == 1 ? "y" : "ies");
+    }
     {
         /* The loaded libraries in selection order: as --kernels named them, or every library in
          * the home. */
@@ -4791,6 +4851,10 @@ int Engine::start() {
         }
     }
 
+    if (cfg_.aux_device >= 0) {
+        aux_auto_ = cfg_.aux_split < 0;
+        rad_tools_set_aux_split(aux_auto_ ? 0 : cfg_.aux_split);
+    }
     RAD_TRY(declare());
 
     /* --debug-graph stops here: everything it prints is known after declare, and it must work on
@@ -4821,6 +4885,17 @@ int Engine::start() {
     }
 
     RAD_TRY(plan());
+    if (aux_redo_) {
+        /* Local (--aux-split auto): the first declare's kernels released, its programs dropped,
+         * then declare and plan again at the split plan() picked. */
+        aux_redo_ = false;
+        rad_tools_registry().fini_instances();
+        rad_aux_registry().fini_instances();
+        for (auto& r : ranks_) r->program = Program{};
+        rad_tools_set_aux_split(cfg_.aux_split);
+        RAD_TRY(declare());
+        RAD_TRY(plan());
+    }
     bringup.unlock();
     RAD_TRY(load_weights());
     RAD_TRY(configure_kv());

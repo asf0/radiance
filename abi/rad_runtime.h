@@ -911,6 +911,12 @@ int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n)
  * the second lane's window where the architecture declares one, abi/rad_builder.h). */
 int rad_lane(RadCtx* c, int lane);
 int rad_lane_join(RadCtx* c, int from, int to);
+/* Local: a mark is a point on the current lane, kept in one of RAD_LANE_MARKS slots;
+ * rad_lane_wait_mark orders the current lane behind that point (the slot's latest mark), across
+ * cards as well. Unlike rad_lane_join, later work on the marked lane is not waited for. */
+#define RAD_LANE_MARKS 4
+int rad_lane_mark(RadCtx* c, int slot);
+int rad_lane_wait_mark(RadCtx* c, int slot);
 
 /* Same, with the ranged value taken from the batch. */
 #define RAD_ISSUE(c, op, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), RAD_N_BATCH)

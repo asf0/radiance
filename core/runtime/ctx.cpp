@@ -90,11 +90,17 @@ void Ctx::shutdown() {
     arena_.release();
     host_arena_.release();
 
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         if (lane_ev_[i]) { rad_event_destroy(lane_ev_[i]); lane_ev_[i] = nullptr; }
         if (host_touch_ev_[i]) { rad_event_destroy(host_touch_ev_[i]); host_touch_ev_[i] = nullptr; }
+        if (aux_ev_[i]) { rad_event_destroy(aux_ev_[i]); aux_ev_[i] = nullptr; }
         host_touch_pending_[i] = false;
     }
+    for (RadEvent& e : mark_ev_) if (e) { rad_event_destroy(e); e = nullptr; }
+    if (aux_stream_) { rad_stream_sync(aux_stream_); rad_stream_destroy(aux_stream_); aux_stream_ = nullptr; }
+    if (aux_scratch_) { rad_dev_free(aux_scratch_, RAD_MEM_DEVICE); aux_scratch_ = nullptr; }
+    if (aux_arena_)   { rad_dev_free(aux_arena_, RAD_MEM_DEVICE);   aux_arena_ = nullptr; }
+    aux_pending_ = false;
     if (own_lane1_ && lane1_) rad_stream_destroy(lane1_);
     lane1_      = nullptr;
     own_lane1_  = false;
@@ -113,6 +119,25 @@ int Ctx::bind_thread() { return rad_dev_set(device_); }
 
 int Ctx::prepare() {
     oracle_open();
+    /* Local (aux device): its scratch, in pinned host memory both cards address, and its CU count
+     * for the plans of aux ops. Before bind_ops, which hands both to those plans. */
+    if (has_aux()) {
+        RadDeviceProps ap{};
+        if (rad_dev_props(program_->aux_device, &ap) >= 0 && ap.n_cu > 0) aux_wgp_ = ap.n_cu;
+        aux_scratch_bytes_ = program_->aux_scratch_bytes;
+        if (aux_scratch_bytes_ > 0) {
+            /* The aux card's own memory: a kernel's scratch (a run map, split-K partials) wants
+             * cached device memory, as on that card alone. */
+            RAD_TRY(rad_dev_set(program_->aux_device));
+            aux_scratch_ = rad_dev_alloc(aux_scratch_bytes_, RAD_MEM_DEVICE);
+            RAD_TRY(rad_dev_set(device_));
+            if (!aux_scratch_) {
+                RAD_ERR("aux device: %s of pinned scratch could not be allocated",
+                        humanb(aux_scratch_bytes_).c_str());
+                return RAD_E_NOMEM;
+            }
+        }
+    }
     RAD_TRY(bind_arena());
     RAD_TRY(bind_buffers());
     RAD_TRY(bind_weights());
@@ -127,7 +152,9 @@ int Ctx::prepare() {
      * hold more rows than their header says and be written late. */
     const bool taps = std::any_of(program_->ops.begin(), program_->ops.end(),
                                   [](const OpInfo& o) { return o.op == "gram_accum"; });
-    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps;
+    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps && !has_aux();
+    if (has_aux() && record_passes_ && rank_ == 0)
+        RAD_INFO("recorded passes: off, the program runs ops on an aux device (first cut)");
     if (taps && record_passes_ && tape_supported() && rank_ == 0)
         RAD_INFO("recorded passes: off, the program accumulates calibration Grams (gram_accum)");
     return RAD_OK;
@@ -195,6 +222,19 @@ int Ctx::bind_arena() {
             return RAD_E_UNSUPPORTED;
         }
         RAD_DEBUG("arena: %s host, mapped (host-site activations)", humanb(host_hw).c_str());
+        /* Local (aux device): the aux-local buffers' mirror, same offsets, in that card's memory. */
+        bool any_aux_local = false;
+        for (size_t i = 1; i < P.buffers.size() && !any_aux_local; ++i) any_aux_local = P.buffers[i].aux_local;
+        if (any_aux_local && has_aux()) {
+            RAD_TRY(rad_dev_set(program_->aux_device));
+            aux_arena_ = rad_dev_alloc(host_hw, RAD_MEM_DEVICE);
+            RAD_TRY(rad_dev_set(device_));
+            if (!aux_arena_) {
+                RAD_ERR("aux device: its %s activation arena could not be allocated", humanb(host_hw).c_str());
+                return RAD_E_NOMEM;
+            }
+            RAD_INFO("arena: %s on the aux device (its own activations)", humanb(host_hw).c_str());
+        }
     }
     return RAD_OK;
 }
@@ -212,6 +252,7 @@ int Ctx::bind_buffers() {
     buf_host_.assign(P.buffers.size(), 0);
     buf_live0_.assign(P.buffers.size(), -1);
     buf_live1_.assign(P.buffers.size(), -1);
+    buf_aux_.assign(P.buffers.size(), 0);
 
     for (size_t i = 1; i < P.buffers.size(); ++i) {
         BufferInfo& bi = P.buffers[i];
@@ -238,9 +279,11 @@ int Ctx::bind_buffers() {
 
         /* rad_buf_ptr is arena_base + BufferInfo::arena_offset. */
         t.data  = a.base() + bi.arena_offset;
+        if (bi.aux_local && aux_arena_) t.data = static_cast<char*>(aux_arena_) + bi.arena_offset;
         bi.ptr  = t.data;
         buf_bits_[i] = rad_dtype_bits(bi.decl.dtype);
-        buf_host_[i] = bi.decl.domain == RAD_DOMAIN_HOST ? 1 : 0;
+        buf_host_[i] = bi.decl.domain == RAD_DOMAIN_HOST && !bi.aux_local ? 1 : 0;
+        buf_aux_[i]  = bi.aux_local ? 1 : 0;
         buf_live0_[i] = bi.first_def;
         buf_live1_[i] = bi.last_use;
     }
@@ -388,6 +431,11 @@ int Ctx::bind_ops() {
                     ip.args.rank          = rank_;
                     ip.args.world_size    = world_size_;
                     ip.args.wgp_count     = wgp_count_;
+                    if (oi.aux) {
+                        /* Local: the aux card's scratch and CU count. */
+                        ip.args.scratch   = aux_scratch_;
+                        ip.args.wgp_count = aux_wgp_ > 0 ? aux_wgp_ : wgp_count_;
+                    }
                     /* A launch that ends its own link hold gets the hold word as an extra
                      * `link_gate` parameter after the geometry's. */
                     if (r.row->releases_link)
@@ -403,7 +451,7 @@ int Ctx::bind_ops() {
                             ip.gate_n_p = (int)v.size();
                         }
 
-                    if (r.scratch_bytes > arena_.scratch_bytes()) {
+                    if (!oi.aux && r.scratch_bytes > arena_.scratch_bytes()) {
                         RAD_ERR("op '%s' band %lld kernel %s wants %s of scratch but the plan "
                                 "reserved %s -- the arena was sized before this kernel was "
                                 "resolved",
@@ -431,7 +479,7 @@ int Ctx::bind_ops() {
                                           RAD_DOMAIN_DEVICE].launch != nullptr;
             if (!any_device) dom = RAD_DOMAIN_HOST;
         }
-        if (dom == RAD_DOMAIN_DEVICE && !oi.weights.empty()) {
+        if (dom == RAD_DOMAIN_DEVICE && !oi.weights.empty() && !oi.aux) {
             bool all_host = true;
             for (rad_weight w : oi.weights) {
                 const WeightInfo* wi = P.weight(w);
@@ -968,7 +1016,41 @@ int Ctx::lane_init() {
     return RAD_OK;
 }
 
+/* Local: the aux device's lane. Its first use is mid-step, so it starts behind everything lane 0
+ * issued, as lane_init does for lane 1. System-scope events: the waiting queue is on another card. */
+int Ctx::aux_init() {
+    if (aux_stream_) return RAD_OK;
+    if (!has_aux()) return RAD_E_STATE;
+    const int ad = program_->aux_device;
+    RAD_TRY(rad_dev_set(ad));
+    const int sc = rad_stream_create(&aux_stream_, 0);
+    RAD_TRY(rad_dev_set(device_));
+    RAD_TRY(sc);
+    for (int i = 0; i < 3; ++i)
+        if (!aux_ev_[i]) RAD_TRY(rad_event_create_as(&aux_ev_[i], 0));
+    RAD_TRY(rad_event_record(aux_ev_[0], stream_));
+    RAD_TRY(rad_event_wait(aux_stream_, aux_ev_[0]));
+    return RAD_OK;
+}
+
+int Ctx::lane_mark(int slot) {
+    if (slot < 0 || slot >= RAD_LANE_MARKS) return RAD_E_INVAL;
+    if (!mark_ev_[slot]) RAD_TRY(rad_event_create_as(&mark_ev_[slot], 0));
+    return rad_event_record(mark_ev_[slot], cur_stream());
+}
+
+int Ctx::lane_wait_mark(int slot) {
+    if (slot < 0 || slot >= RAD_LANE_MARKS) return RAD_E_INVAL;
+    if (!mark_ev_[slot]) return RAD_OK;   /* never marked */
+    return rad_event_wait(cur_stream(), mark_ev_[slot]);
+}
+
 int Ctx::set_lane(int lane) {
+    if (lane == 2) {
+        RAD_TRY(aux_init());
+        lane_ = 2;
+        return RAD_OK;
+    }
     if (lane != 0 && lane != 1) return RAD_E_INVAL;
     if (lane == 0 && !lane1_) { lane_ = 0; return RAD_OK; }   /* lane 0 needs nothing built */
     RAD_TRY(lane_init());
@@ -978,7 +1060,19 @@ int Ctx::set_lane(int lane) {
 
 int Ctx::lane_join(int from, int to) {
     if (from == to) return RAD_OK;
-    if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
+    if (from < 0 || from > 2 || to < 0 || to > 2) return RAD_E_INVAL;
+    if (from == 2 || to == 2) {
+        /* Local: a join across cards. No aux stream yet: nothing to order (it starts behind lane
+         * 0 when built); a lane 1 not built likewise. */
+        if (!aux_stream_) return RAD_OK;
+        if ((from == 1 || to == 1) && !lane1_) return RAD_OK;
+        RadStream fs = from == 0 ? stream_ : from == 1 ? lane1_ : aux_stream_;
+        RadStream ts = to == 0 ? stream_ : to == 1 ? lane1_ : aux_stream_;
+        RAD_TRY(rad_event_record(aux_ev_[from], fs));
+        RAD_TRY(rad_event_wait(ts, aux_ev_[from]));
+        if (from == 2 && to == 0) aux_pending_ = false;
+        return RAD_OK;
+    }
     /* No lane 1 yet: nothing to order, and a later lane 1 starts behind lane 0 (lane_init). Every
      * single-lane step takes this at the end of run_step; it must not build a stream. */
     if (!lane1_) return RAD_OK;
@@ -1468,6 +1562,8 @@ int Ctx::run_step(const RadBatch* b) {
     {
         const int lj = lane_join(1, 0);   /* no-op when lane 1 is unbuilt */
         if (lj < 0 && step_status_ >= 0) step_status_ = lj;
+        const int aj = lane_join(2, 0);   /* local: the aux lane likewise */
+        if (aj < 0 && step_status_ >= 0) step_status_ = aj;
     }
     /* After the join, so the compute stream is behind every reader of staged weights; regardless
      * of status, because a staged weight must never outlive its pass. */

@@ -258,6 +258,9 @@ struct BufferInfo {
     int32_t     last_use  = -1;
     int64_t     arena_offset = -1;
     void*       ptr = nullptr;
+    /* Local (aux device): a host-domain buffer only aux ops touch, bound into a mirror of the host
+     * arena in the aux card's own memory (rad_buf_aux_local). */
+    bool        aux_local = false;
 };
 
 struct OpInfo {
@@ -281,6 +284,9 @@ struct OpInfo {
      * Program::lora_sites, -1 otherwise. */
     int32_t               anchor = -1;
     int32_t               lora_site = -1;
+    /* Local (aux device): declared inside rad_aux_window, resolved against the aux device's
+     * kernel registry and issued on lane 2, the aux device's stream. */
+    bool                  aux = false;
     /* Declined at declare because runtime LoRA targets its weight (a fused GEMM no delta can
      * follow): recorded unresolved and never handed to the plugin, so it is never issued and the
      * reference-kernel gate does not count it. */
@@ -487,6 +493,8 @@ public:
     int64_t arena_stage_bytes = 0;
     int64_t host_arena_bytes = 0;    /* RAD_DOMAIN_HOST */
     int64_t scratch_bytes = 0;       /* the largest single kernel scratch requirement */
+    int64_t aux_scratch_bytes = 0;   /* the same over aux ops (their scratch is host-pinned) */
+    int     aux_device = -1;         /* local: the aux device, -1 when none */
     /* Scratch regions of that size in the arena, one per lane. Kernels on one stream share a
      * region safely through in-order launch; a second lane is a second stream and needs its own.
      * Two when the architecture declared a buffer rad_buf_concurrent. */
@@ -808,6 +816,13 @@ struct Config {
                                           empty = the repo's moving default branch */
     std::string radiance_home;
     std::vector<std::string> kernel_hierarchy;   /* ordered; first wins */
+    /* Local: a second card of another architecture that runs the plugin's aux ops (rad_aux_window)
+     * with its own kernel libraries; -1 = none. */
+    int                      aux_device = -1;
+    std::vector<std::string> aux_kernels;
+    /* Local: routed experts per layer the rank's card takes beside the aux device (the split);
+     * -1 = auto (as many as its VRAM holds after the cache), 0 = none. */
+    int64_t                  aux_split = -1;
 
     int   tp = 1;
     /* The tensor-parallel wire, a deployment choice. 1 is the exact bf16 all-reduce. 0 accepts a

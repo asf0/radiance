@@ -359,6 +359,11 @@ extern "C" int rad_lane1_window_begin(RadBuilder* b) {
     b->lane1_w0 = (int32_t)b->ops.size() + 1;
     return RAD_OK;
 }
+/* Local (aux device): the fakes run without one. */
+extern "C" int rad_aux_device(RadBuilder*) { return -1; }
+extern "C" int rad_aux_window(RadBuilder*, int) { return RAD_E_STATE; }
+extern "C" int rad_buf_aux_local(RadBuilder*, rad_buf) { return RAD_E_STATE; }
+extern "C" int64_t rad_aux_split(RadBuilder*) { return 0; }
 extern "C" int rad_lane1_window_end(RadBuilder* b) {
     if (!b || b->lane1_w0 < 0 || b->lane1_w1 >= 0 || (int32_t)b->ops.size() < b->lane1_w0)
         return RAD_E_STATE;
@@ -498,6 +503,8 @@ extern "C" int rad_lane(RadCtx* c, int lane) {
     c->lane = lane;
     return RAD_OK;
 }
+extern "C" int rad_lane_mark(RadCtx*, int) { return RAD_OK; }
+extern "C" int rad_lane_wait_mark(RadCtx*, int) { return RAD_OK; }
 extern "C" int rad_lane_join(RadCtx* c, int from, int to) {
     if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
     c->joins.push_back({ c->issues.size(), from, to });

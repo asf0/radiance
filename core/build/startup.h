@@ -180,6 +180,12 @@ int rad_reference_ops(const Program& p, std::vector<std::string>* out);
 int rad_gate_reference_kernels(const Program& p, bool allow, const char* what);
 
 Registry& rad_tools_registry();
+/* Local: the aux device's registry and its loader (kernel libraries only). */
+Registry& rad_aux_registry();
+int rad_tools_aux_device();   /* -1 until rad_tools_load_aux_kernels succeeded */
+void rad_tools_set_aux_split(int64_t n);
+int rad_tools_load_aux_kernels(const std::string& home, const std::vector<std::string>& hierarchy,
+                               int device);
 
 /* Engines in one process (docs/MULTIMODEL.md §3.3). Each holds, while it lives, a contiguous block
  * of `n_ranks` instance slots, whose first is its RadBuildCtx::slot_base, and a claim on its

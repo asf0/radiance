@@ -2813,7 +2813,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
          * Qwen3.8-Flash-Next at TP2 (two R9700, 12 GiB host pool) the span loses to one-interval
          * steps up to 12K tokens and wins from 18K, hence eight intervals. With every expert on
          * the card there is no such cost and every lone prefill spans. */
-        sched_.set_span_min(stage_rows > 0 && arena_span_rows_ > 0
+        /* Local: beside an aux device a span pays from its first spanned interval (the pieces
+         * overlap the two cards, qwen4exp step_auxpipe). */
+        sched_.set_span_min(stage_rows > 0 && arena_span_rows_ > 0 && cfg_.aux_device < 0
                                 ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
     }
 
