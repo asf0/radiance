@@ -932,6 +932,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * the aux card runs the expert GEMMs and the gather and must never read the rank's VRAM. */
     m.aux = rad_aux_device(b) >= 0 && std::getenv("RADIANCE_AUX_MOE_OFF") == nullptr;
     const int xdom = m.aux ? RAD_DOMAIN_HOST : RAD_DOMAIN_DEVICE;
+    /* Local (aux pipe): step_auxpipe may project an attention layer's first rows (pre_rows, the
+     * indexer's too) before the previous layer's second piece is finished, so those outputs are
+     * live across that piece's MoE tail, which the declared order does not show; packed with its
+     * transients they were overwritten (KLD 0.3 on a short prompt from position 0 with the
+     * per-piece attention off). About 110 MiB on Flash-Next. */
+    if (m.aux) {
+        for (rad_buf x : { m.b_qg, m.b_k, m.b_v, m.qsaw.qk })
+            if (x) RAD_ARCH_TRY(rad_buf_concurrent(b, x));
+    }
     /* Local (aux split): the last `aux_r` expert ids of every layer on the rank's card (an even
      * count, so the parity classes line up), from RADIANCE_AUX_R_EXPERTS. */
     m.aux_r = 0;
