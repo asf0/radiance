@@ -93,20 +93,20 @@ struct ActFP8 {
      * overruns the arena (core/runtime/issue.cpp refuses such an issue). */
     int declare_qs(RadBuilder* b, Names& nm, const Geom& g, const char* name, int64_t n,
                    int64_t rows = 0, bool i8 = false, bool fp8_pair = true,
-                   int64_t i8_group = RAD_FP8_BLOCK) {
+                   int64_t i8_group = RAD_FP8_BLOCK, int domain = RAD_DOMAIN_DEVICE) {
         g8 = i8_group;
         /* bf16 linears read only `x` (Geom::w_bf16), so declare no codes; an unused plane would
          * still take arena space. */
         if (g.w_bf16) { q = s = q8 = s8 = 0; return RAD_OK; }
         const int64_t m = rows > 0 ? rows : g.max_tok;
         if (fp8_pair) {
-            q = decl_b(b, nm.f("%s.q", name), RAD_F8E4M3, { m, n });
-            s = decl_b(b, nm.f("%s.s", name), RAD_F32,    { m, fp8_blocks(n) });
+            q = decl_b(b, nm.f("%s.q", name), RAD_F8E4M3, { m, n }, RAD_BUF_TRANSIENT, domain);
+            s = decl_b(b, nm.f("%s.s", name), RAD_F32,    { m, fp8_blocks(n) }, RAD_BUF_TRANSIENT, domain);
             if (!q || !s) return RAD_E_INVAL;
         }
         if (i8) {
-            q8 = decl_b(b, nm.f("%s.q8", name), RAD_I8,  { m, n });
-            s8 = decl_b(b, nm.f("%s.s8", name), RAD_F32, { m, (n + g8 - 1) / g8 });
+            q8 = decl_b(b, nm.f("%s.q8", name), RAD_I8,  { m, n }, RAD_BUF_TRANSIENT, domain);
+            s8 = decl_b(b, nm.f("%s.s8", name), RAD_F32, { m, (n + g8 - 1) / g8 }, RAD_BUF_TRANSIENT, domain);
             if (!q8 || !s8) return RAD_E_INVAL;
         }
         return (fp8_pair || i8) ? RAD_OK : RAD_E_INVAL;

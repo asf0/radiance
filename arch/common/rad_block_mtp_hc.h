@@ -150,6 +150,7 @@ struct MtpHcBlock {
      * the caller before step(); null where no pass is. */
     const int32_t* qsa_win_cu = nullptr;
     MoeFP8       mlp{};
+    bool         aux = false;   /* local: the head's routed experts on the aux device too */
 
     rad_op op_gather = 0, op_embed = 0, op_embed_ar = 0, op_enter = 0, op_carry = 0;
 
@@ -290,10 +291,12 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     RAD_ARCH_TRY(hc_mlp.declare(b, nm, g, nm.f("mtp.ffn_hc"), mcfg, mwire, src.hc_mlp));
     mlp.ar_out_take = hc_mlp.ar_take();
     mlp.hr_in = mcfg.rotate != 0;
+    mlp.aux = aux;
     RAD_ARCH_TRY(mlp.declare(b, nm, g, l, w.mlp, src.mlp, false, false, kArNone,
                              hc_mlp.op_ar_write != 0));
-    /* The following write takes the MoE gather where it can, as on the trunk. */
-    {
+    /* The following write takes the MoE gather where it can, as on the trunk (not beside an aux
+     * device, where the gather runs there). */
+    if (!aux) {
         HyperConn::GatherSrc gs{};
         gs.ye     = mlp.w.edn;
         gs.ew     = mlp.w.ew;
