@@ -54,6 +54,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 /* halo_moe_gemm_q.hip: the run map of a grouped GEMM at `fm` rows a block, built in `scratch` by
  * one launch; its entry count bound, and the bytes it takes. */
@@ -266,7 +267,12 @@ __device__ __forceinline__ void moe_iqr_body(HALO_MOEIQR_PARAMS) {
     auto red = [&](uint32_t w) { return (float*)(s_tr + w * kTrBytes); };
     const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
     const uint32_t wave = __builtin_amdgcn_readfirstlane(tid / kWave);
-    const uint32_t ycol0 = blockIdx.y * kCols;
+    /* `mode` bit 4 (run-map grid only): the axes swapped, x the weight-tile group and y the map
+     * entry, so an entry's blocks are dispatched together and share its activation rows and its
+     * expert's codes in the caches (gate_up 5% at Flash-Next's 320 aux experts). */
+    const bool swp = MAP && (mode & 16u);
+    const uint32_t bx = swp ? blockIdx.y : blockIdx.x, by = swp ? blockIdx.x : blockIdx.y;
+    const uint32_t ycol0 = by * kCols;
     /* Rows [ra, rb) of the block's columns, zeroed: dropped slots, which no run owns. */
     auto zero_rows = [&](uint32_t ra, uint32_t rb) {
         for (uint32_t x = tid; x < (rb - ra) * kCols; x += NTHR)
@@ -276,9 +282,9 @@ __device__ __forceinline__ void moe_iqr_body(HALO_MOEIQR_PARAMS) {
     /* ---- the block's run: expert e, sorted rows [rs, re). */
     uint32_t e, rs, re;
     if constexpr (MAP) {
-        if (blockIdx.x >= map[0]) return;
-        e = map[1 + 2 * blockIdx.x];
-        rs = map[2 + 2 * blockIdx.x];
+        if (bx >= map[0]) return;
+        e = map[1 + 2 * bx];
+        rs = map[2 + 2 * bx];
         if (e == kTail) {
             zero_rows(rs, rs + kRows * NT < T ? rs + kRows * NT : T);
             return;
@@ -549,7 +555,7 @@ __device__ __forceinline__ void moe_iqr_body(HALO_MOEIQR_PARAMS) {
     /* A wave whose tile is all of its K (KW 1) takes TPW tiles in turn: the run search and the
      * rows above are paid once for them, which a narrow-K projection (two or three units a tile)
      * otherwise pays as a third of its work. */
-    for (uint32_t tw = 0; tw < TPW; ++tw) tile((blockIdx.y * RTB + rtb) * TPW + tw);
+    for (uint32_t tw = 0; tw < TPW; ++tw) tile((by * RTB + rtb) * TPW + tw);
 }
 
 /* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
@@ -601,7 +607,9 @@ int launch_form(const Launch& g, RadStream stream) {
     int rc;
 #define HALO_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, ch_)                                             \
     rc = HALO_EMIT(stream, (moe_iqr_kernel<F, kw_, rtb_, map_, nt_, tpw_, ch_>),                   \
-                  dim3(g.gx, g.N / (16u * rtb_ * tpw_)), dim3(kw_ * rtb_ * kWave), 0, g.x, g.xs,  \
+                  (map_ && (g.mode & 16u)) ? dim3(g.N / (16u * rtb_ * tpw_), g.gx)              \
+                                           : dim3(g.gx, g.N / (16u * rtb_ * tpw_)),               \
+                  dim3(kw_ * rtb_ * kWave), 0, g.x, g.xs,                                         \
                   g.c[0], g.c[1], g.c[2], g.c[3], g.sorted, g.off, g.y, (const uint32_t*)g.map,   \
                   g.T, g.N / (g.mode >> 8), g.n_expert, g.inv_k, g.x_ld, g.xs_ld, g.y_ld, g.mode, \
                   g.run_tiles, g.inv_ft)
@@ -757,6 +765,9 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
                                              (uint32_t)cap, g.map);
         if (rc != RAD_OK) return rc;
         g.gx = (uint32_t)cap;
+        /* The swapped run-map grid (the body's bit 4); HALO_IQR_SWAP=0 keeps the plain one. */
+        static const bool swap = [] { const char* e = std::getenv("HALO_IQR_SWAP"); return !(e && e[0] == '0'); }();
+        if (swap) g.mode |= 16u;
     }
 
     int rc = HALO_NO(RAD_E_DTYPE);
