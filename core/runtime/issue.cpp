@@ -1390,6 +1390,15 @@ int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n,
      * and there is no fallback (spec §17). */
     RAD_ERR("%s; the step is aborted (a kernel that refuses at issue was selected wrongly)",
             step_fail_.c_str());
+    /* Local: the step's shape, for a refusal that depends on the batch. */
+    if (batch_)
+        RAD_ERR("  step batch: phase=%d n_tok=%lld n_seq=%lld max_q_len=%d (decode %d, prefill %d) "
+                "n_seq_decode=%lld n_tok_decode=%lld n_spec=%d draft_pass=%d max_ctx_len=%d lane=%d",
+                (int)batch_->phase, (long long)batch_->n_tok, (long long)batch_->n_seq,
+                (int)batch_->max_q_len, (int)batch_->max_q_len_decode,
+                (int)batch_->max_q_len_prefill, (long long)batch_->n_seq_decode,
+                (long long)batch_->n_tok_decode, (int)batch_->n_spec, (int)batch_->draft_pass,
+                (int)batch_->max_ctx_len, lane_);
 
     step_status_ = status;
     return status;

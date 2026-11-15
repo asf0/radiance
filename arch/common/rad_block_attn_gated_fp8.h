@@ -650,7 +650,11 @@ inline void AttnGatedFP8::step_piece(RadCtx* c, const RadBatch* batch, ArPieces*
         }
     } else {
         const int64_t tpitch = kvb->block_table_pitch;
-        RAD_ISSUE_N(c, op_attn, n,
+        /* At the op's top band, not the piece's rows: q and out are the whole step's, indexed by
+         * cu, and a short piece's band (5 rows or fewer at gqa 12) is the split-KV decode row's,
+         * whose partials are sized at declare for that many rows a sequence and would overflow
+         * (as the mixed step's prefill half, below). */
+        RAD_ISSUE_N(c, op_attn, g.max_tok,
                     brows(w.q, T), kv_cache(kv, layer), praw2(table, RAD_I32, 1, tpitch),
                     praw(p == 0 ? batch->positions + R : used, RAD_I32, 1),
                     RAD_NONE, RAD_NONE, praw(pieces->cu + p, RAD_I32, 2),
