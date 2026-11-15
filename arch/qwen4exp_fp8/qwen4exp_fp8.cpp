@@ -198,6 +198,11 @@ struct Model {
     ActFP8  a_hr_h{};      /* local (aux split): host copy of the routed input codes for the aux card,
                             * where they sit in VRAM (split, or the rotated trunk's own) */
     int64_t aux_r = 0;     /* local: routed experts per layer on the rank's card (split) */
+    /* Local (aux split, RADIANCE_AUX_PERM): per trunk layer, the checkpoint expert each slot holds,
+     * coldest first, so the slots on the rank's card (the last aux_r) hold the hottest experts.
+     * The router's rows are put in slot order once, before the first step (perm_router). */
+    std::vector<std::vector<int32_t>> perm;
+    bool    perm_done = false;
     rad_buf b_sorted_r = 0, b_eoff_r = 0, b_ecnt_r = 0, b_egu_r = 0, b_edn_r = 0;
     ActFP8  a_eff_r{};
 
@@ -935,6 +940,36 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (v > 0 && v < m.moecfg.n_expert && m.moecfg.n_ff_shared > 0 && m.moecfg.expert_rot)
             m.aux_r = v & ~3LL;
     }
+    m.perm.clear();
+    if (m.aux_r) {
+        /* One line per trunk layer: n_expert distinct checkpoint expert ids, slot order. */
+        const char* pf = std::getenv("RADIANCE_AUX_PERM");
+        if (pf && *pf) {
+            FILE* f = std::fopen(pf, "r");
+            bool ok = f != nullptr;
+            const int64_t ne = m.moecfg.n_expert;
+            for (int64_t l = 0; ok && l < g.n_layer; ++l) {
+                std::vector<int32_t> row((size_t)ne);
+                std::vector<char> seen((size_t)ne, 0);
+                for (int64_t e = 0; ok && e < ne; ++e) {
+                    int v2 = -1;
+                    ok = std::fscanf(f, "%d", &v2) == 1 && v2 >= 0 && v2 < ne && !seen[(size_t)v2];
+                    if (ok) { row[(size_t)e] = v2; seen[(size_t)v2] = 1; }
+                }
+                if (ok) m.perm.push_back(std::move(row));
+            }
+            if (f) std::fclose(f);
+            if (!ok) {
+                fprintf(stderr, "radiance: qwen4exp: RADIANCE_AUX_PERM %s: want %lld lines of a "
+                                "permutation of 0..%lld; ignored\n", pf, (long long)g.n_layer,
+                        (long long)ne - 1);
+                m.perm.clear();
+            } else if (g.rank == 0) {
+                fprintf(stderr, "radiance: qwen4exp: aux split -- expert placement by %s (hottest "
+                                "on the rank's card)\n", pf);
+            }
+        }
+    }
     m.b_rlogits = decl_b(b, nm.f("moe_logits"), g.act_dtype, {T, m.moecfg.n_expert_all});
     m.b_eids    = decl_b(b, nm.f("moe_ids"),    RAD_I32,     {T, m.moecfg.top_k});
     m.b_ew      = decl_b(b, nm.f("moe_ew"),     g.act_dtype, {T, m.moecfg.top_k}, RAD_BUF_TRANSIENT, xdom);
@@ -1329,8 +1364,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             {
                 auto plain = [&](int64_t e) {
                     RadEncoding en{};
+                    const long long ge = m.perm.empty() ? (long long)e
+                                                        : (long long)m.perm[(size_t)l][(size_t)e];
                     return weight_enc(b, nm.f("blk.%lld.ffn_gate_up_exps.%lld.weight",
-                                              (long long)l, (long long)e), &en) &&
+                                              (long long)l, ge), &en) &&
                            en.n_planes == 1 && en.plane[0].dtype == RAD_BF16;
                 };
                 /* The nearest even boundary leaving each side an even count of plain experts:
@@ -1357,6 +1394,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             mi.cfg.n_expert = nb;
             mi.shared = nullptr; mi.shared_gate = nullptr;
             lay.mlp.rpart = &lay.mlp_r;
+            if (!m.perm.empty()) lay.mlp.perm = lay.mlp_r.perm = m.perm[(size_t)l].data();
             RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, mi, false, false, kArNone,
                                          lay.hc_ffn.op_ar_write != 0));
             MoeFP8::Src mr = ms;
@@ -2012,10 +2050,36 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
     m.calib.after_step(c, T);
 }
 
+/* RADIANCE_AUX_PERM: each trunk router's rows in slot order (row s = the checkpoint expert slot s
+ * holds), once, before anything reads them: the router then ranks slots. */
+static void perm_router(RadCtx* c, Model& m) {
+    m.perm_done = true;
+    const int64_t ne = m.moecfg.n_expert, ncol = m.g.n_embd;
+    std::vector<uint16_t> a((size_t)(ne * ncol)), o((size_t)(ne * ncol));
+    const RadStream s = rad_stream(c);
+    for (size_t l = 0; l < m.layers.size() && l < m.perm.size(); ++l) {
+        void* p = rad_weight_ptr(c, m.layers[l].mlp.w_router);
+        const size_t bytes = a.size() * sizeof(uint16_t);
+        if (!p || rad_stream_sync(s) != RAD_OK || rad_memcpy_async(a.data(), p, bytes, s) != RAD_OK ||
+            rad_stream_sync(s) != RAD_OK) {
+            rad_step_fail(c, "qwen4exp: RADIANCE_AUX_PERM: cannot read a router to reorder it");
+            return;
+        }
+        for (int64_t e = 0; e < ne; ++e)
+            std::memcpy(&o[(size_t)(e * ncol)], &a[(size_t)m.perm[l][(size_t)e] * ncol],
+                        (size_t)ncol * sizeof(uint16_t));
+        if (rad_memcpy_async(p, o.data(), bytes, s) != RAD_OK || rad_stream_sync(s) != RAD_OK) {
+            rad_step_fail(c, "qwen4exp: RADIANCE_AUX_PERM: cannot write a reordered router");
+            return;
+        }
+    }
+}
+
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_slot(c)];
     const Geom& g = m.g;
     const int64_t T = batch->n_tok;
+    if (!m.perm.empty() && !m.perm_done) perm_router(c, m);
 
     /* An encoder pass runs only the vision tower (RadBatch::enc). */
     if (batch->enc) {

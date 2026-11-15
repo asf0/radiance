@@ -554,6 +554,14 @@ struct MoeFP8 {
      * run on lane 0 beside the aux card's experts; its gather writes `h.x` and `op_aux_add` adds
      * the aux card's `moe`. Declare the partner after this instance, then declare_split_combine. */
     bool   ext_route = false;
+    /* Local (aux split): the checkpoint expert each slot holds, [n_expert_all], or null for slot
+     * e = expert e. Set before declare, on both instances of a split layer, with the router's rows
+     * put in the same order (qwen4exp's hot-first placement). */
+    const int32_t* perm = nullptr;
+    long long ck(int64_t e) const {
+        const int64_t s = c.expert_base + e;
+        return (long long)(perm ? perm[s] : s);
+    }
     const MoeFP8* rpart = nullptr;
     rad_op op_aux_add = 0;
     int    declare_split_combine(RadBuilder* b);
@@ -798,7 +806,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * own bf16 GEMM pair, so they must be known before the sort is declared. */
     const int64_t ne = c.n_expert;
     for (int64_t e = 0; e < ne; ++e) {
-        const long long ge = (long long)(c.expert_base + e);   /* the checkpoint's numbering */
+        const long long ge = ck(e);   /* the checkpoint's numbering */
         const bool probed = c.probed_layer == l && ge >= (long long)c.probed_expert &&
                             ge < (long long)(c.probed_expert + c.probed_count);
         RAD_ARCH_TRY(moe_map_expert(b, nm, src, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, ge),
@@ -813,7 +821,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                        : c.expert_g64 ? 5 : c.expert_nl ? 4
                        : c.expert_w4 ? (c.expert_rot ? 2 : 1) : 0;
         auto fmt_of = [&](int64_t e, RadEncoding (&enc)[2], int (&fe)[2], const char* (&nmv)[2]) {
-            const long long ge = (long long)(c.expert_base + e);
+            const long long ge = ck(e);
             nmv[0] = nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, ge);
             nmv[1] = nm.f("blk.%d.ffn_down_exps.%lld.weight", l, ge);
             for (int i = 0; i < 2; ++i) {
@@ -1159,14 +1167,14 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         for (int64_t e = 0; e < ne; ++e) {
             const int64_t parts[2] = { c.n_ff_exp, c.n_ff_exp };   /* gate, up (up alone: one) */
             w_gu[(size_t)e] = decl_w_n(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l,
-                                               (long long)(c.expert_base + e)),
+                                               ck(e)),
                                        RAD_BF16, {gu * c.n_ff_exp, g.n_embd}, RAD_ACCESS_CONDITIONAL,
                                        sh_row, grp_expert_slot(l, (int)(e + gbase), 0), 0, parts, n_parts);
             if (!w_gu[(size_t)e]) return RAD_E_INVAL;
         }
         for (int64_t e = 0; e < ne; ++e) {
             w_dn[(size_t)e] = decl_w(b, nm.f("blk.%d.ffn_down_exps.%lld.weight", l,
-                                             (long long)(c.expert_base + e)),
+                                             ck(e)),
                                      RAD_BF16, {g.n_embd, c.n_ff_exp}, RAD_ACCESS_CONDITIONAL,
                                      sh_col, grp_expert_slot(l, (int)(e + gbase), 1));
             if (!w_dn[(size_t)e]) return RAD_E_INVAL;
@@ -1202,7 +1210,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             const int64_t parts[2] = { wq[q], wq[q] };
             rad_weight& h = w_gu[(size_t)s];
             h = decl_view(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l,
-                                  (long long)(c.expert_base + e)),
+                                  ck(e)),
                           nullptr, ef[0].cplanes, ef[0].cdt, {gu * wq[q], g.n_embd},
                           RAD_ACCESS_CONDITIONAL, sh_row, grp_expert_slot(l, (int)(s + gbase), 0),
                           parts, n_parts);
@@ -1215,9 +1223,9 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             const int64_t parts[2] = { wq[q] / sdiv, wq[q] / sdiv };
             rad_weight& h = w_gus[(size_t)s];
             h = decl_view(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.scale", l,
-                                  (long long)(c.expert_base + e)),
+                                  ck(e)),
                           nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l,
-                               (long long)(c.expert_base + e)),
+                               ck(e)),
                           ef[0].splanes, ef[0].sdt,
                           {rowscale ? gu * wq[q] : fp8_blocks(gu * wq[q]),
                            rowscale ? g.n_embd / ef[0].sgk : fp8_blocks(g.n_embd)},
@@ -1231,7 +1239,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             const int64_t e = reg[(size_t)s];
             rad_weight& h = w_dn[(size_t)s];
             h = decl_view(b, nm.f("blk.%d.ffn_down_exps.%lld.weight", l,
-                                  (long long)(c.expert_base + e)),
+                                  ck(e)),
                           nullptr, ef[1].cplanes, ef[1].cdt, {g.n_embd, wq[q]},
                           RAD_ACCESS_CONDITIONAL, sh_col, grp_expert_slot(l, (int)(s + gbase), 1));
             if (!h) return RAD_E_INVAL;
@@ -1242,9 +1250,9 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             const int64_t e = reg[(size_t)s];
             rad_weight& h = w_dns[(size_t)s];
             h = decl_view(b, nm.f("blk.%d.ffn_down_exps.%lld.scale", l,
-                                  (long long)(c.expert_base + e)),
+                                  ck(e)),
                           nm.f("blk.%d.ffn_down_exps.%lld.weight", l,
-                               (long long)(c.expert_base + e)),
+                               ck(e)),
                           ef[1].splanes, ef[1].sdt,
                           {rowscale ? g.n_embd : fp8_blocks(g.n_embd), wq[q] / ef[1].sgk},
                           RAD_ACCESS_CONDITIONAL, sh_col, grp_expert_slot(l, (int)(s + gbase), 1));
@@ -1429,7 +1437,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         for (int64_t j = 0; j < np; ++j) {
             const int64_t parts[2] = { wp, wp };
             w_pgu[(size_t)j] = decl_w_n(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l,
-                                                (long long)(c.expert_base + prot[(size_t)j])),
+                                                ck(prot[(size_t)j])),
                                         RAD_BF16, {gu * wp, g.n_embd}, RAD_ACCESS_PER_TOKEN,
                                         psh_row,
                                         aux ? grp_expert_slot(l, (int)(c.n_expert_all + gbase + j), 0)
@@ -1439,7 +1447,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         }
         for (int64_t j = 0; j < np; ++j) {
             w_pdn[(size_t)j] = decl_w(b, nm.f("blk.%d.ffn_down_exps.%lld.weight", l,
-                                              (long long)(c.expert_base + prot[(size_t)j])),
+                                              ck(prot[(size_t)j])),
                                       RAD_BF16, {g.n_embd, wp}, RAD_ACCESS_PER_TOKEN, psh_col,
                                       aux ? grp_expert_slot(l, (int)(c.n_expert_all + gbase + j), 1)
                                           : grp_layer(l));
