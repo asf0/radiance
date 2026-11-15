@@ -239,6 +239,7 @@ struct Model {
     bool      pipe_on = false;
     bool      aux = false;      /* local: routed experts on the aux device */
     bool      auxpipe_noted = false;
+    int64_t   pass_rows = 0;   /* local: the MoE pass the real declare chose (sizing declares reuse it) */
     int32_t*  auxpipe_tbl = nullptr;   /* pinned {0, j} pairs, j = 0..rows: piece bounds */
     /* {0, pass, T} for a step wider than a pass (pipe_bounds): the windows of the indexer's score
      * plane and the delta net's pieces. A transient (declare), uploaded by every step that reads
@@ -499,7 +500,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* Tokens per pass. 2048 is the linear-state checkpoint interval the scheduler clamps the
          * prefill chunk to, so the shipped configuration is one pass. It also sizes four buffers at
          * `rows * top_k`, so a smaller max_tok lowers it. */
-        mc.rows        = g.max_tok < 2048 ? g.max_tok : 2048;
+        /* Local (aux device): half the widest step, so the aux pipe's two pieces are passes. Each
+         * piece reads every aux-card expert's codes once, so 8192-token steps (checkpoint-interval
+         * 4096) read them half as often a token as 4096-token ones: Flash-Next IQR-V4 prefill
+         * +8-12% on R9700 + 8060S. RADIANCE_MOE_PASS_ROWS overrides it. */
+        /* A sizing declare (shape_probe, a smaller max_tok) takes the real declare's pass, as it
+         * takes span_on below: its buffers size each arena level for the step the real state
+         * runs, and a pass from its own max_tok would size them for half of it (a 4034-token mixed
+         * step overran moe_sorted_r). */
+        int64_t pass_rows = 2048;
+        if (ctx->shape_probe) {
+            const int64_t pr = g_model[rad_build_slot(ctx)].pass_rows;
+            if (pr > 0) pass_rows = pr;
+        } else {
+            if (rad_aux_device(b) >= 0 && (g.max_tok / 2) / 64 * 64 > pass_rows)
+                pass_rows = (g.max_tok / 2) / 64 * 64;
+            if (const char* e = std::getenv("RADIANCE_MOE_PASS_ROWS")) {
+                const long long v = std::atoll(e);
+                if (v >= 64 && v % 64 == 0) pass_rows = v;
+            }
+        }
+        m.pass_rows    = pass_rows;
+        mc.rows        = g.max_tok < pass_rows ? g.max_tok : pass_rows;
         if (mc.n_expert <= 0 || mc.top_k <= 0 || mc.top_k > mc.n_expert) {
             fprintf(stderr, "radiance: qwen4exp: the container describes %lld expert(s) with "
                             "top_k %lld\n", (long long)mc.n_expert, (long long)mc.top_k);
