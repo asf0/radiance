@@ -123,7 +123,26 @@ struct QsaIndexer {
     /* `win_cu`, device: {0, plane_rows}, the one sequence of a window of a step wider than the
      * score plane (Config::plane_rows); null where no step is. */
     void step(RadCtx* c, const ActFP8& in, const RadBatch* batch,
-              const int32_t* win_cu = nullptr) const;
+              const int32_t* win_cu = nullptr, int64_t pre = 0) const;
+    /* Rows [0, R) of the index projection ahead of the rest; step() with `pre` R then projects
+     * rows [R, T) (ArPieces::pre). */
+    void pre_rows(RadCtx* c_, const ActFP8& in, int64_t T, int64_t R) const {
+        if (on()) proj.step(c_, in, w.qk, T, 0, R);
+    }
+    /* One piece of a one-sequence prefill step, rows [r0, r0 + n), as the chunk a span of 1 makes:
+     * its query prep, its block keys and tail, then its score and selection over the history up
+     * to its own end. `cu` is {0, n} on the device; the piece's operands start at its first row.
+     * The first piece's keys and tail are stored before the second's, so the second reads the
+     * first's unfinished block from the tail as a later chunk would. `proj` false where pre_rows
+     * already projected the rows. False where the piece cannot run this way (the caller runs the
+     * whole step instead, before anything was issued). */
+    bool takes_piece(const RadBatch* batch, int64_t n) const {
+        if (!on()) return true;
+        const int64_t PR = c.plane_rows > 0 ? c.plane_rows : batch->n_tok;
+        return batch->n_seq == 1 && n <= PR && !rope_mixed(batch) && batch->positions;
+    }
+    void step_piece(RadCtx* c, const ActFP8& in, const RadBatch* batch, int64_t r0, int64_t n,
+                    const int32_t* cu, bool do_proj) const;
     /* Stores the pass's block keys and tail exactly as step() does, with no query, score or
      * selection (see AttnGatedFP8::store_kv). */
     void store(RadCtx* c, const ActFP8& in, const RadBatch* batch) const;
@@ -312,6 +331,66 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch) const {
     return true;
 }
 
+inline void QsaIndexer::step_piece(RadCtx* c_, const ActFP8& in, const RadBatch* batch,
+                                   int64_t r0, int64_t n, const int32_t* cu, bool do_proj) const {
+    if (!on()) return;
+    const int64_t T = batch->n_tok, S = 1;
+    const int64_t qw = c.heads * c.head_dim;
+    const int64_t nw = (c.heads + 1) * c.head_dim;
+    const int64_t koff = c.heads * c.head_dim;
+    const int32_t* pos = batch->positions + r0;
+    if (do_proj) proj.step(c_, in, w.qk, T, r0, n);
+    /* Unfused, one rotary component per token (takes_piece: every token's components agree). */
+    for (int64_t h = 0; h < c.heads; ++h)
+        RAD_ISSUE_N(c_, op_norm, n,
+                    bcol_at(w.qk, r0, nw, h * c.head_dim, c.head_dim, n), RAD_W(w_qn),
+                    bcol_at(w.q,  r0, qw, h * c.head_dim, c.head_dim, n));
+    RAD_ISSUE_N(c_, op_rope, n, brow_slice(w.q, r0, n, qw), praw(pos, RAD_I32, n));
+
+    const RadKVGroupBatch* bkb = kv_batch(batch, kv_bk);
+    const RadKVGroupBatch* tlb = kv_batch(batch, c.kv_tail);
+    const RadKVGroupBatch* atb = kv_batch(batch, c.kv_attn);
+    if (!bkb || !tlb || !atb) return;
+    const int64_t tw = tlb->state_index_pitch > 0 ? tlb->state_index_pitch : 1;
+    const int64_t work = (n + c.ratio - 1) / c.ratio + S;
+    RadOperand bpos = g.rope_mc ? RAD_B_COL(w.bpos, 0, 1) : brows(w.bpos, work);
+    if (g.rope_mc) bpos.rows = work;
+    RAD_ISSUE_N(c_, op_work, n,
+                bcol_at(w.qk, r0, nw, koff, c.head_dim, n),
+                praw(pos, RAD_I32, n), praw(cu, RAD_I32, S + 1),
+                kv_cache(c.kv_tail, layer),
+                praw2(tlb->state_index, RAD_I32, S, tw),
+                praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
+                RAD_NONE,
+                brows(w.stage, work * c.ratio), brows(w.page, work), bpos,
+                brows(w.nc, S));
+    RAD_ISSUE_N(c_, op_bkey, work,
+                brows(w.stage, work * c.ratio), RAD_W(w_kn),
+                brows(w.page, work), bpos,
+                kv_cache(kv_bk, layer));
+    RAD_ISSUE_N(c_, op_tail, n,
+                bcol_at(w.qk, r0, nw, koff, c.head_dim, n),
+                praw(pos, RAD_I32, n), praw(cu, RAD_I32, S + 1),
+                kv_cache(c.kv_tail, layer),
+                praw2(tlb->state_index, RAD_I32, S, tw));
+    if (!c.emit_sel) return;
+    const int64_t reach = (int64_t)batch->max_ctx_len + batch->n_tok + batch->n_spec + c.ratio;
+    int64_t live = reach / c.ratio + 1;
+    if (live > c.max_blocks) live = c.max_blocks;
+    if (live < 1) live = 1;
+    RAD_ISSUE_N(c_, op_score, n,
+                brow_slice(w.q, r0, n, qw), kv_cache(kv_bk, layer),
+                praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
+                praw(cu, RAD_I32, 2), brows(w.nc, S),
+                bcol_at(w.score, 0, c.max_blocks, 0, live, n));
+    RAD_ISSUE_N(c_, op_select, n,
+                bcol_at(w.score, 0, c.max_blocks, 0, live, n),
+                praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
+                brows(w.nc, S), praw(pos, RAD_I32, n), praw(cu, RAD_I32, 2),
+                brow_slice(w.sel, r0, n, c.topk + 1), brow_slice(w.nsel, r0, n, 1),
+                brow_slice(w.sequ, r0, n, 1));
+}
+
 inline void QsaIndexer::store(RadCtx* c_, const ActFP8& in, const RadBatch* batch) const {
     if (!on()) return;
     proj.step(c_, in, w.qk, batch->n_tok);
@@ -319,13 +398,14 @@ inline void QsaIndexer::store(RadCtx* c_, const ActFP8& in, const RadBatch* batc
 }
 
 inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch,
-                             const int32_t* win_cu) const {
+                             const int32_t* win_cu, int64_t pre) const {
     if (!on()) return;
     const int64_t T = batch->n_tok, S = batch->n_seq;
     const int64_t qw = c.heads * c.head_dim;
     const int64_t nw = (c.heads + 1) * c.head_dim;
 
-    proj.step(c_, in, w.qk, T);
+    if (pre < 0 || pre >= T) pre = 0;
+    proj.step(c_, in, w.qk, T, pre, T - pre);
     /* One fused launch or `heads` + 1 unfused. The fused form takes the whole projection at its
      * row pitch and writes the query heads contiguous and rotated. `n_head` 0 is the k-only form:
      * no q_gate, q_w or q_out, and `gate_out` absent. `T <= qprep_rows` is a correctness bound

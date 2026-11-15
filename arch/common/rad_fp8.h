@@ -328,6 +328,9 @@ struct ArPieces {
      * lane behind the previous block's piece), so a block with its own norm takes the piece path
      * as one with an external input does and skips that norm. */
     bool in_ready = false;
+    /* Rows [0, pre) of the block's input projections the caller already issued (pre_rows), ahead
+     * of the second piece's input: the block projects only rows [pre, T). 0 for none. */
+    int64_t pre = 0;
     bool cuts(int64_t T) const { return done && rows > 0 && T > rows; }
     void hand(int64_t r0, int64_t n) { done(u, r0, n); ++handed; }
 };

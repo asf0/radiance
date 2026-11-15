@@ -239,7 +239,7 @@ struct Model {
     bool      pipe_on = false;
     bool      aux = false;      /* local: routed experts on the aux device */
     bool      auxpipe_noted = false;
-    int32_t*  auxpipe_tbl = nullptr;   /* pinned {0, 64 j} pairs, j = 0..rows/64: piece bounds */
+    int32_t*  auxpipe_tbl = nullptr;   /* pinned {0, j} pairs, j = 0..rows: piece bounds */
     /* {0, pass, T} for a step wider than a pass (pipe_bounds): the windows of the indexer's score
      * plane and the delta net's pieces. A transient (declare), uploaded by every step that reads
      * it -- the first two from the pinned host copy `pipe_cu_h`, made once. */
@@ -813,7 +813,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * activation by 256 bytes, which on Flash-Next at four ranks slows the MoE gather by 73 % and
      * a prefill by 3 %. Every step that reads it rewrites it (pipe_bounds). */
     if (m.span_on)
-        m.b_pipe_cu = decl_b(b, nm.f("pipe_cu"), RAD_I32, {4});
+        m.b_pipe_cu = decl_b(b, nm.f("pipe_cu"), RAD_I32, {6});
     /* Under a span every connection reads a step wider than a pass a pass at a time
      * (HyperConn::read_pieces, and the pipelined step's own reads), so the reads are declared no
      * wider than a pass and their scratch is sized for that band. */
@@ -1940,20 +1940,26 @@ static int64_t auxpipe_rows(const Model& m, int64_t T) {
 }
 /* The step's piece bounds {0, R, T} on the card for a first piece of R rows: the pass case is
  * pipe_bounds'; otherwise {0, R} from the pinned table (never rewritten, so a copy the card runs
- * late reads the same bytes) and T from the step's cu_seqlens. */
+ * late reads the same bytes) and T from the step's cu_seqlens. Either way {0, T - R} follows at
+ * element 4, from the same table. */
 static const int32_t* auxpipe_bounds(RadCtx* c, const RadBatch* batch, Model& m, int64_t R,
                                      const int32_t* pcu) {
-    if (R == m.moecfg.rows) return pcu;
     if (!m.b_pipe_cu) return nullptr;
-    const int64_t n = m.moecfg.rows / 64 + 1;
+    const int64_t n = m.moecfg.rows + 1;
     if (!m.auxpipe_tbl) {
         m.auxpipe_tbl = (int32_t*)rad_dev_alloc(n * 2 * sizeof(int32_t), RAD_MEM_HOST_PINNED);
         if (!m.auxpipe_tbl) return nullptr;
-        for (int64_t j = 0; j < n; ++j) { m.auxpipe_tbl[2 * j] = 0; m.auxpipe_tbl[2 * j + 1] = (int32_t)(64 * j); }
+        for (int64_t j = 0; j < n; ++j) { m.auxpipe_tbl[2 * j] = 0; m.auxpipe_tbl[2 * j + 1] = (int32_t)j; }
     }
+    const int64_t T = batch->n_tok;
+    if (T - R < 0 || T - R >= n) return nullptr;
     int32_t* d = (int32_t*)rad_buf_ptr(c, m.b_pipe_cu);
     const RadStream s = rad_stream(c);
-    if (rad_memcpy_async(d, m.auxpipe_tbl + 2 * (R / 64), 2 * sizeof(int32_t), s) != RAD_OK ||
+    /* {0, T - R} at d + 4: the second piece's bounds from its own first row. */
+    if (rad_memcpy_async(d + 4, m.auxpipe_tbl + 2 * (T - R), 2 * sizeof(int32_t), s) != RAD_OK)
+        return nullptr;
+    if (R == m.moecfg.rows) return pcu;
+    if (rad_memcpy_async(d, m.auxpipe_tbl + 2 * R, 2 * sizeof(int32_t), s) != RAD_OK ||
         rad_memcpy_async(d + 2, batch->cu_seqlens + 1, sizeof(int32_t), s) != RAD_OK)
         return nullptr;
     return d;
@@ -1991,10 +1997,30 @@ static void step_auxpipe(RadCtx* c, const RadBatch* batch, Model& m, const int32
         a.prepped0 = false;
         ArPieces pc{};
         pc.rows = R; pc.done = auxpipe_hand; pc.u = &a; pc.cu = pcu; pc.in_ready = true;
-        const bool pieces = !l.full && l.gdn.takes_pieces(batch, &pc);
+        /* An attention layer runs its indexer and attention a piece at a time where it can: the
+         * first piece's whole chain needs only the previous layer's first piece, so it runs while
+         * the aux card is still on that layer's second piece's experts. */
+        static const bool noqp = std::getenv("RADIANCE_AUXPIPE_NOQP") != nullptr;
+        const bool qpieces = l.full && !noqp && l.attn.takes_qsa_pieces(batch, &pc) &&
+                             l.qsa.takes_piece(batch, R) && l.qsa.takes_piece(batch, T - R);
+        const bool pieces = qpieces || (!l.full && l.gdn.takes_pieces(batch, &pc));
+        /* Otherwise an attention layer projects its first piece's rows before the previous layer's second
+         * piece is finished: those rows' input is final, and the card works through them while
+         * the aux card is still on that piece's experts. */
+        static const bool nopre = std::getenv("RADIANCE_AUXPIPE_NOPRE") != nullptr;
+        if (l.full && !qpieces && !nopre && a.pending && l.attn.takes_pre()) {
+            l.attn.pre_rows(c, T, R);
+            l.qsa.pre_rows(c, l.attn.w.h, T, R);
+            pc.pre = R;
+        }
         /* A mixer that reads every row first needs the previous layer's second piece now. */
         if (!pieces && a.pending) { auxpipe_fin(a, li - 1, 1, true); a.pending = false; }
-        if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu_pass); l.attn.step(c, batch, false, &pc); }
+        if (qpieces) {
+            for (int p = 0; p < 2; ++p) {
+                l.qsa.step_piece(c, l.attn.w.h, batch, a.r0(p), a.rn(p), p == 0 ? pcu : pcu + 4, true);
+                l.attn.step_piece(c, batch, &pc, p, true);
+            }
+        } else if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu_pass, pc.pre); l.attn.step(c, batch, false, &pc); }
         else        l.gdn.step(c, batch, false, &pc);
         if (!a.prepped0) { auxpipe_prep(a, li, 0); a.prepped0 = true; }
         if (a.pending) { auxpipe_fin(a, li - 1, 1, true); a.pending = false; }
