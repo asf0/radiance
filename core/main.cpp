@@ -58,11 +58,11 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    /* An offline mode (KL scoring, calibration) or the graph dump runs one engine to its end and
-     * serves nothing; every other configuration is served by the fleet. */
+    /* An offline mode (KL scoring, calibration, the diagnose workload) or the graph dump runs one
+     * engine to its end and serves nothing; every other configuration is served by the fleet. */
     bool offline = false;
     for (const rad::fleet::ModelEntry& m : fleet.models)
-        offline |= m.cfg.kld() || m.cfg.calib() || m.cfg.debug_graph;
+        offline |= m.cfg.kld() || m.cfg.calib() || m.cfg.diagnose_mode() || m.cfg.debug_graph;
     if (!offline) return rad::fleet::run(fleet);
     if (fleet.models.size() != 1) {
         RAD_ERR("%s: an offline mode or the graph dump runs one model; the file names %zu",

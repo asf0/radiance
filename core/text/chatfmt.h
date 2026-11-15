@@ -100,6 +100,9 @@ struct ChatFormat {
      * reasoning there; a close with no block open is dropped. Gemma 4 sometimes writes an empty
      * block after its answer, or a lone close. Needs `reasoning_open`. */
     bool        reasoning_anywhere = false;
+    /* A header the model writes first when it answers without reasoning; dropped when the reply
+     * starts with it. Empty: none. */
+    std::string content_open;
 
     /* ------------------------------------------------------------------ tool calls
      * `name_prefix` is what opens a call (after `call_open`, when there is one). Empty means the

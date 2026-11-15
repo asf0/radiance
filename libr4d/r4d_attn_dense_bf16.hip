@@ -358,6 +358,12 @@ extern "C" int r4d_attn_dense_bf16(const void* q, const void* k, const void* v, 
         return r4d_attn_dense_launch<80, 1, 8, 1, 64>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen,
                                                       n_head_kv, scale, window, wright, block,
                                                       cdiv, causal, q_ld, k_ld, v_ld, o_ld, s);
+    /* h96 gqa1: Muse Glimmer's vision tower, 16 heads of 96, bidirectional over segments. The
+     * h80 shape (8 query blocks of 16, K/V tiles of 64) with six 16-wide k-tiles a head. */
+    if (head_dim == 96 && gqa == 1)
+        return r4d_attn_dense_launch<96, 1, 8, 1, 64>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen,
+                                                      n_head_kv, scale, window, wright, block,
+                                                      cdiv, causal, q_ld, k_ld, v_ld, o_ld, s);
 #define R4D_DENSE(HD, G, NQB, DS, T)                                                              \
     return r4d_attn_dense_launch<HD, G, NQB, DS, T>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen, \
                                                     n_head_kv, scale, window, wright, block,      \

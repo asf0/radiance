@@ -796,12 +796,13 @@ int64_t PrefixCache::trim_sparing(int64_t n_entries,
     return done;
 }
 
-int64_t PrefixCache::drop_clean() {
+int64_t PrefixCache::drop_clean(int64_t loan_goal) {
     if (!tiers_ || !kv_) return 0;
     drop_scratch_.clear();
     tiers_->take_clean(&drop_scratch_);
     const uint64_t frees = kv_->seq_frees();
-    if (frees != frees_seen_ || released_) {
+    const bool recheck = frees != frees_seen_ || released_;
+    if (recheck) {
         frees_seen_ = frees;
         released_ = false;
         for (const BlockHash& h : drop_wait_) {
@@ -828,6 +829,53 @@ int64_t PrefixCache::drop_clean() {
         e.in_lru = false;
         ++stats_.drops;
         tiers_->drop_commit(h);
+        ++n;
+    }
+    return n + drop_stragglers(loan_goal, recheck);
+}
+
+/* drop_clean's second half: resident entries with no host copy coming that are stragglers inside
+ * a loan of `loan_goal` tokens. One walk of the resident list, taken only while something is held
+ * above a group's mark, and then when a sequence has freed blocks (`recheck`) or the marks have
+ * moved since the last walk, a second or more ago. */
+int64_t PrefixCache::drop_stragglers(int64_t loan_goal, bool recheck) {
+    if (loan_goal <= 0 || !tiers_->host_on()) return 0;
+    const size_t ng = entry_groups_.size();
+    strag_mark_.assign(2 * ng, 0);
+    bool any = false;
+    for (size_t k = 0; k < ng; ++k) {
+        const int32_t g = entry_groups_[k];
+        const int64_t top = kv_->held_top_blocks(g);
+        const int64_t mark = !kv_->lendable(g) ? INT64_MAX
+                           : std::max(kv_->straggler_mark(g), kv_->live_blocks_at(g, loan_goal));
+        strag_mark_[k] = mark;
+        strag_mark_[ng + k] = top;
+        any = any || top > mark;
+    }
+    if (!any) return 0;
+    const uint64_t now = rad_mono_ns();
+    if (!recheck && (strag_mark_ == strag_seen_ || now - strag_ns_ < 1000000000ull)) return 0;
+    strag_seen_ = strag_mark_;
+    strag_ns_ = now;
+
+    int64_t n = 0;
+    for (auto it = lru_.begin(); it != lru_.end();) {
+        const BlockHash h = *it;
+        auto m = map_.find(h);
+        if (m == map_.end()) { ++it; continue; }
+        Entry& e = m->second;
+        bool above = false;
+        for (size_t k = 0; k < ng && k < e.blocks.size(); ++k)
+            above = above || e.blocks[k] >= strag_mark_[k];
+        if (!above || held_.count(h) > 0 || shared_with_live(e) || !tiers_->no_copy_coming(h)) {
+            ++it;
+            continue;
+        }
+        release_blocks(e);
+        it = lru_.erase(it);
+        tiers_->forget(h);
+        map_.erase(m);
+        ++stats_.evictions;
         ++n;
     }
     return n;

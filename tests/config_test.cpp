@@ -203,6 +203,42 @@ TEST(the_kl_mode_records_or_scores_and_says_which_input_it_lacks) {
     CHECK_EQ(parse({ "--kld-record", "/r", "--kld-corpus", "/c", "--kld-top", "-1" }, &f), RAD_E_INVAL);
 }
 
+/* The diagnose mode: one mode a run, and its corpus and baseline belong to its workload. A run
+ * that took one of them without a DIR would measure nothing while looking configured. */
+TEST(the_diagnose_mode_takes_its_own_flags_and_nothing_else) {
+    Config c;
+    CHECK_EQ(parse({ "--diagnose", "/d", "--diagnose-tokens", "64", "--diagnose-runs", "1",
+                     "--diagnose-concurrency", "1,2", "--diagnose-prefill", "1024,4096",
+                     "--diagnose-corpus", "/c.jsonl", "--diagnose-baseline", "/b.json" }, &c), RAD_OK);
+    CHECK(c.diagnose_mode());
+    CHECK_EQ(c.diagnose, std::string("/d"));
+    CHECK_EQ(c.diagnose_tokens, 64);
+    CHECK_EQ(c.diagnose_runs, 1);
+    CHECK_EQ(c.diagnose_concurrency.size(), (size_t)2);
+    CHECK_EQ(c.diagnose_prefill.size(), (size_t)2);
+    CHECK_EQ(c.diagnose_corpus, std::string("/c.jsonl"));
+    CHECK_EQ(c.diagnose_baseline, std::string("/b.json"));
+
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.diagnose_mode());
+    CHECK_EQ(d.diagnose_tokens, 256);              /* the defaults the report states */
+    CHECK_EQ(d.diagnose_runs, 3);
+    CHECK_EQ(d.diagnose_concurrency.size(), (size_t)4);
+    CHECK_EQ(d.diagnose_prefill.size(), (size_t)4);
+
+    Config f;
+    CHECK_EQ(parse({ "--diagnose-corpus", "/c.jsonl" }, &f), RAD_E_INVAL);   /* no workload */
+    CHECK_EQ(parse({ "--diagnose-baseline", "/b.json" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/d", "--kld-ref", "/r" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/d", "--debug-graph" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/d", "--calib-corpus", "/c.jsonl", "--calib-dir", "/s" }, &f),
+             RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/d", "--diagnose-concurrency", "1,,2" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/d", "--diagnose-prefill", "8" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/d", "--diagnose-runs", "0" }, &f), RAD_E_INVAL);
+}
+
 /* Runtime LoRA: the adapters reach their fields in order, the targets as sorted leaf names, and a
  * combination that would size slots no adapter uses, or name an adapter that is not served, is
  * refused by name. A text model's slot count against its adapters, and its targets, are checked
@@ -478,6 +514,17 @@ TEST(prefill_interleave_takes_a_step_count_up_to_64) {
     CHECK_EQ(parse({ "--prefill-interleave", "auto:x" }, &c), RAD_E_INVAL);
 }
 
+TEST(mixed_step_target_is_an_opt_in_soft_millisecond_target) {
+    Config d;
+    REQUIRE_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.mixed_step_target_ms, 0);
+    Config c;
+    CHECK_EQ(parse({ "--mixed-step-target-ms", "150" }, &c), RAD_OK);
+    CHECK_EQ(c.mixed_step_target_ms, 150);
+    CHECK_EQ(parse({ "--mixed-step-target-ms", "60001" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--mixed-step-target-ms", "-1" }, &c), RAD_E_INVAL);
+}
+
 /* ================================================================== the table, the parser and the help agree
  *
  * One table (g_flags) drives the help text and the startup report, and a separate chain of ifs
@@ -520,6 +567,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
+        { "--mixed-step-target-ms", { "150" } },
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
@@ -589,6 +637,13 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--kld-lora", { "a", "--lora", "a=/adapters/a", "--kld-ref", "/r" } },
         { "--kld-lora-sources", { "doc/", "--kld-lora", "a", "--lora", "a=/adapters/a",
                                   "--kld-ref", "/r" } },
+        { "--diagnose", { "/d" } },
+        { "--diagnose-tokens", { "64", "--diagnose", "/d" } },
+        { "--diagnose-runs", { "1", "--diagnose", "/d" } },
+        { "--diagnose-concurrency", { "1,2", "--diagnose", "/d" } },
+        { "--diagnose-prefill", { "1024,4096", "--diagnose", "/d" } },
+        { "--diagnose-corpus", { "/c.jsonl", "--diagnose", "/d" } },
+        { "--diagnose-baseline", { "/b.json", "--diagnose", "/d" } },
     };
     return v;
 }

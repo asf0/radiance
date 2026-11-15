@@ -104,6 +104,8 @@ set(R4D_UNITS
   # Vision tower ops: layer norm, the learned-grid position embedding, and the biased GEMM with
   # activation and residual fused into its store.
   "r4d_vit_bf16|"
+  # Muse Glimmer's vision-tower coordinate ops: grid_embed_pad, window_order.
+  "r4d_vit_muse|"
   # The same biased GEMM over f32 operands (a diffusion transformer's patch projections and heads,
   # a video decoder's 1x1 projections), on the f32 FMA tile r4d_audio's f32 convolutions share.
   "r4d_gemm_f32_nt_bias|"

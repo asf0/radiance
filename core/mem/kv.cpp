@@ -822,6 +822,22 @@ int64_t KVManager::total_blocks(int32_t g) const {
 int64_t KVManager::live_blocks(int32_t g) const {
     return (g >= 0 && g < (int32_t)live_.size()) ? live_[(size_t)g] : 0;
 }
+int64_t KVManager::live_blocks_at(int32_t g, int64_t tokens) const {
+    if (g < 0 || g >= (int32_t)plans_.size()) return 0;
+    return plans_[(size_t)g].n_blocks - lent_blocks((size_t)g, tokens);
+}
+int64_t KVManager::straggler_mark(int32_t g) const {
+    if (g < 0 || g >= (int32_t)plans_.size()) return 0;
+    const int64_t top = held_top((size_t)g), per = bucket_blocks_[(size_t)g];
+    const auto& h = held_hist_[(size_t)g];
+    int64_t mark = top, best = 0, held = 0;
+    for (int64_t b = (top + per - 1) / per; b-- > 0;) {
+        held += h[(size_t)b];
+        const int64_t gain = top - b * per - kStragglerCost * held;
+        if (gain > best) { best = gain; mark = b * per; }
+    }
+    return mark;
+}
 int64_t KVManager::held_top_blocks(int32_t g) const {
     return (g >= 0 && g < (int32_t)plans_.size()) ? held_top((size_t)g) : 0;
 }

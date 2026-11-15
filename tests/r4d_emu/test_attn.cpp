@@ -306,15 +306,16 @@ int main(int argc, char** argv) {
         {"wmma h256 gqa2 i8 ahead w20 picture 90 of 300", 256, 2, 2, true, false, false, false, 20, {90}, {300}, -1, 0, 0, 0, 1, true},
         /* LiLiCorr's drafter (attn_paged_sink): 32 query heads over 2 KV heads at h128 (16 over 1 at
          * TP 2), a block of 8 non-causal rows past the context, a 1024-token window; one sequence
-         * and a batch, unsplit and split, a bf16 and an int8 cache */
+         * and a batch, unsplit and split, a bf16 and an int8 cache, and a prefill-shaped launch
+         * that takes the WMMA kernel (with and without int8 descales) */
         {"sink h128 gqa16 kvh2 block8 w1024", 128, 16, 2, false, false, false, false, 1024, {8}, {1500},
          -1, 0, 0, 0, -1, false, true},
         {"sink h128 gqa16 kvh1 block8 x3 split", 128, 16, 1, false, false, true, false, 1024, {8, 8, 8},
          {900, 40, 2100}, -1, 262144, s128, 0, -1, false, true},
         {"sink h128 gqa16 kvh2 i8+descale split", 128, 16, 2, true, false, false, true, 1024, {8}, {1300},
          -1, 262144, s128, 0, -1, false, true},
-        {"sink h128 gqa16 prefill-shaped stays scalar", 128, 16, 1, false, false, false, false, 1024, {96},
-         {400}, -1, 0, 0, 0, 0, false, true},
+        {"sink h128 gqa16 prefill-shaped takes WMMA", 128, 16, 1, false, false, false, false, 1024, {96},
+         {400}, -1, 0, 0, 0, 1, false, true},
         {"sink h128 gqa16 missing-block", 128, 16, 1, false, false, false, false, 1024, {8}, {70}, 1,
          0, 0, 0, -1, false, true},
         /* and at TP 4, 8 query heads over the rank's replicated KV head */
@@ -324,8 +325,30 @@ int main(int argc, char** argv) {
          {900, 40, 2100}, -1, 262144, s128, 0, -1, false, true},
         {"sink h128 gqa8 kvh1 i8+descale split", 128, 8, 1, true, false, false, true, 1024, {8}, {1300},
          -1, 262144, s128, 0, -1, false, true},
-        {"sink h128 gqa8 prefill-shaped stays scalar", 128, 8, 1, false, false, false, false, 1024, {96},
-         {400}, -1, 0, 0, 0, 0, false, true},
+        {"sink h128 gqa8 prefill-shaped takes WMMA", 128, 8, 1, false, false, false, false, 1024, {96},
+         {400}, -1, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa8 prefill-shaped WMMA i8+descale", 128, 8, 1, true, false, false, true, 1024,
+         {96}, {400}, -1, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa16 prefill-shaped WMMA i8+descale", 128, 16, 1, true, false, false, true, 1024,
+         {96}, {400}, -1, 0, 0, 0, 1, false, true},
+        /* Recursive Flint (arch/flint): 32 query heads over 4 KV heads at h128 (gqa 8 at TP 1 and
+         * 2), causal, a sink on every layer; the sliding layers' 513-token window and the full
+         * layers' none. Prefill on the WMMA kernel, ragged with decode rows beside it and with a
+         * missing block, and decode on the scalar kernel's split, at both caches. */
+        {"sink h128 gqa8 kvh4 causal w513 prefill 300 of 1200", 128, 8, 4, false, true, false, false,
+         513, {300}, {1200}, -1, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa8 kvh4 causal w513 prefill 300 of 1200 i8", 128, 8, 4, true, true, false, false,
+         513, {300}, {1200}, -1, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa8 kvh2 causal full prefill 200 of 900 i8", 128, 8, 2, true, true, false, false,
+         0, {200}, {900}, -1, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa8 kvh2 causal full ragged + decode rows", 128, 8, 2, false, true, true, false,
+         0, {150, 1, 70}, {300, 50, 70}, -1, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa8 kvh2 causal w513 ragged missing-block i8", 128, 8, 2, true, true, true, false,
+         513, {130, 70}, {700, 70}, 3, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa8 kvh4 causal w513 decode split i8", 128, 8, 4, true, true, true, false, 513,
+         {1, 1}, {1300, 40}, -1, 262144, s128, 0, -1, false, true},
+        {"sink h128 gqa8 kvh4 causal full decode split", 128, 8, 4, false, true, true, false, 0,
+         {1, 1}, {1300, 40}, -1, 262144, s128, 0, -1, false, true},
         /* and what must stay scalar: a verify batch, many sequences, a few rows each */
         {"scalar: 8 x verify16, ragged", 512, 4, 1, false, true, true, false, 0, {16, 16, 16, 16, 16, 16, 16, 16},
          {40, 50, 60, 70, 80, 90, 100, 110}, -1, 262144, s512, 0, 0},

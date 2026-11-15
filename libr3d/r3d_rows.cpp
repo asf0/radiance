@@ -184,6 +184,8 @@ static const RadOperandSpec oRouterSigmoid[] = { { "logits", RAD_OPD_IN, 0 },
                                                  { "weights", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
                                                P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
+static const RadParamSpec pRouterSigmoidGroup[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
+    P_INT("n_group"), P_INT("topk_group"), P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
 static const RadOperandSpec oGatedQuant[] = { { "gate_up", RAD_OPD_IN, 0 },
                                               { "q", RAD_OPD_OUT, 0 },
                                               { "scale", RAD_OPD_OUT, 0 },
@@ -227,6 +229,9 @@ static const RadOperandSpec oDequant[] = { { "q", RAD_OPD_IN, 0 }, { "scale", RA
 
 /* --- gemm --- */
 static const RadParamSpec pGemm[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype") };
+
+/* pGemmNt/oGemmNt (gemm_nt_f32) reuse pGemm/oGemm above: the pair is byte-identical to
+ * libr4d's, and the loader compares positionally. */
 static const RadOperandSpec oGemm[] = { { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
                                         { "y", RAD_OPD_OUT, 0 } };
 
@@ -313,6 +318,22 @@ static const RadOperandSpec oGdnConvUpdate[] = { { "x", RAD_OPD_IN, 0 },
                                                 { "k", RAD_OPD_OUT, 0 },
                                                 { "v", RAD_OPD_OUT, 0 } };
 
+static const RadParamSpec pPleConv[] = { P_INT("M"), P_INT("n"), P_INT("width"),
+                                         P_INT("dilation"), P_STR("dtype") };
+/* The optionals unite gdn_conv_prep's and gdn_conv_update's contracts: `has_init` serves
+ * prefill, `num_accepted` decode. */
+static const RadOperandSpec oPleConv[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "w",            RAD_OPD_WEIGHT, 0 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "resid",        RAD_OPD_IN,     1 },
+    { "cache_idx",    RAD_OPD_IN,     1 },
+    { "has_init",     RAD_OPD_IN,     1 },
+    { "num_accepted", RAD_OPD_IN,     1 },
+    { "y",            RAD_OPD_OUT,    0 },
+};
+
 static const RadParamSpec pExpertScale[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
                                              P_STR("dtype") };
 static const RadOperandSpec oExpertScale[] = { { "ids", RAD_OPD_IN, 0 },
@@ -394,6 +415,18 @@ static const RadOperandSpec oGdnRecurrent[] = { { "q", RAD_OPD_IN, 0 },
                                                { "o", RAD_OPD_OUT, 0 },
                                                { "o_q", RAD_OPD_OUT, 1 },
                                                { "o_scale", RAD_OPD_OUT, 1 } };
+static const RadParamSpec pKdaUpdate[] = {
+    P_INT("M"), P_INT("heads"), P_INT("head_k"), P_INT("head_v"), P_F64("lower_bound"),
+    P_F64("scale"), P_F64("l2_eps"), P_STR("mode"), P_STR("dtype"),
+    P_STRO("state_form"),
+};
+static const RadOperandSpec oKdaUpdate[] = {
+    {"q", RAD_OPD_IN, 0}, {"k", RAD_OPD_IN, 0}, {"v", RAD_OPD_IN, 0},
+    {"a", RAD_OPD_IN, 0}, {"b", RAD_OPD_IN, 0}, {"A_log", RAD_OPD_WEIGHT, 0},
+    {"dt_bias", RAD_OPD_WEIGHT, 0}, {"state", RAD_OPD_INOUT, 0}, {"state_idx", RAD_OPD_IN, 0},
+    {"cu", RAD_OPD_IN, 0}, {"num_accepted", RAD_OPD_IN, 1}, {"has_init", RAD_OPD_IN, 1},
+    {"o", RAD_OPD_OUT, 0},
+};
 
 /* gdn_conv_recurrent_update: the decode conv and the recurrent update as one kernel, the
  * convolution's operands then the recurrence's minus q, k and v (never materialised). */
@@ -486,6 +519,21 @@ static const RadOperandSpec oAttnPaged[] = {
     { "seqused", RAD_OPD_IN, 0 }, { "k_descale", RAD_OPD_IN, 1 }, { "v_descale", RAD_OPD_IN, 1 },
     { "cu_seqlens", RAD_OPD_IN, 1 }, { "out", RAD_OPD_OUT, 0 }
 };
+
+static const RadParamSpec pMlaProject[] = { P_INT("M"),          P_INT("heads"), P_INT("head_dim"),
+                                             P_INT("latent_dim"), P_STR("mode"),  P_STR("dtype") };
+
+static const RadParamSpec pMlaAttnPaged[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
+                                              P_INT("rope_dim"), P_INT("block_size"), P_F64("scale"),
+                                              P_STR("dtype") };
+static const RadOperandSpec oMlaAttnPaged[] = { { "q", RAD_OPD_IN, 0 },
+                                                { "q_rope", RAD_OPD_IN, 1 },
+                                                { "kv", RAD_OPD_IN, 0 },
+                                                { "block_table", RAD_OPD_IN, 0 },
+                                                { "seqused", RAD_OPD_IN, 0 },
+                                                { "cu_seqlens", RAD_OPD_IN, 0 },
+                                                { "gate", RAD_OPD_IN, 1 },
+                                                { "out", RAD_OPD_OUT, 0 } };
 
 /* The row's top-R over a vocabulary slice, and the sampler's stages. The history stages write this
  * rank's columns and read global ids, so they carry `vocab_off`; the narrowing stages work on the
@@ -693,6 +741,9 @@ static const RadOpSchema kSchemas[] = {
            "y = code * scale, the read of a container's own quantised weight: `group`-wide f32 "
            "scales against E4M3, E5M2 or int8 codes."),
     SCHEMA("gemm_nt", pGemm, oGemm, "y[M,N] = a[M,K] @ b[N,K]^T, f32 accumulate."),
+    SCHEMA("gemm_nt_f32", pGemm, oGemm,
+           "BF16 activations times F32 weights, F32 accumulation and output; preserves routing "
+           "and index gate precision."),
     SCHEMA("gemm_nt_q", pGemmQ, oGemmQ,
            "The same product against a quantised weight. `dtype` names the scheme: fp8a16 a bf16 "
            "activation against E4M3 codes, fp8a8 quant_act_fp8's codes and scales, i8a8 int8 on "
@@ -728,6 +779,22 @@ static const RadOpSchema kSchemas[] = {
             "conv-state buffer, read at the slot the last accepted token left and rewritten "
             "shifted by one; writes q, k and v in their own layouts."),
 
+    SCHEMA("ple_conv", pPleConv, oPleConv,
+           "y[t] = resid[t] + silu(sum_j w[c][j] * x[t - (width-1-j)*dilation]), a DEPTHWISE "
+           "CAUSAL convolution whose taps are `dilation` apart -- at width 4 and dilation 3 they "
+           "are 9, 6, 3 and 0 timesteps back, so the history a sequence carries is "
+           "(width-1)*dilation and not width-1. The state is [n_slots, n, state_len] with slot i "
+           "holding the value at relative position i - (width-1)*dilation, and `has_init` 0 means "
+           "that window is ZEROS rather than whatever the slot last held. `num_accepted` shifts "
+           "the READ offset within a deeper window and marks a decode step: the window is then "
+           "rewritten as gdn_conv_update rewrites its own -- the history read shifted down by one, "
+           "then every input of the step -- so a next step that kept k tokens reads at k - 1. "
+           "Absent, every token commits: the read is at offset zero and the last "
+           "(width-1)*dilation inputs land at offset zero, which is the prefill chunk. "
+           "`resid` absent drops the add and leaves the plain convolution."),
+    SCHEMA("kda_update", pKdaUpdate, oKdaUpdate,
+           "Bounded per-channel KDA recurrence. verify stores candidate states; prefill commits final state. "
+           "Absolute cu offsets, accepted-prefix read slot, optional cold initialization, no output norm."),
     SCHEMA("gdn_recurrent_update", pGdnRecurrent, oGdnRecurrent,
             "The gated-delta-net recurrent state update at decode: g = -exp(A_log) softplus(a + "
             "dt_bias), beta = sigmoid(b), q/k l2-normalised, S *= e^g, u = beta (v - S k), S += u "
@@ -760,6 +827,10 @@ static const RadOpSchema kSchemas[] = {
             "n_expert logits, then the sort over this rank's n_local slice. expert_w is the "
             "selection output the sort reads."),
 
+    SCHEMA("router_sigmoid_group_topk", pRouterSigmoidGroup, oRouterSigmoid,
+           "Group-limited sigmoid routing: groups rank by the sum of their two best p + bias, "
+           "selection runs over the topk_group best groups; correction bias selects, original "
+           "scores weight."),
     SCHEMA("router_sigmoid_topk", pRouterSigmoid, oRouterSigmoid,
             "The GLM-style router: scores = sigmoid(logits), the selection on scores + bias, the "
             "kept weights the scores scaled by route_scale (renormalised if `norm`). Ties to the "
@@ -793,6 +864,12 @@ static const RadOpSchema kSchemas[] = {
            "`seqused` its length. `gqa` is the head ratio; `causal` and `window` are the mask; "
            "`scale` is 1/sqrt(head_dim) unless the graph says otherwise. k_descale and v_descale "
            "come with an fp8 cache, cu_seqlens with a packed prefill."),
+    SCHEMA("mla_attn_paged", pMlaAttnPaged, oMlaAttnPaged,
+           "Dense causal latent attention over a paged cache whose token row is the latent then the "
+           "rotated key part: score = scale * (q . latent + q_rope . rope), value = the latent; "
+           "sequences as in attn_paged. With `gate`, out = bf16(bf16(out) * bf16(sigmoid(gate[head])))."),
+    SCHEMA("mla_project", pMlaProject, oGemm,
+           "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix."),
     SCHEMA("row_topk", pRowTopk, oRowTopk,
            "Exact per-row top-R, descending, ties to the lower column. `vocab_off` shifts every "
            "column reported, so a rank's slice reports global ids; `pairs` is the [M, R, 2] plane an "
@@ -1194,11 +1271,13 @@ static const RadConstraint cActSigmoid[] = { C_IN("act", "sigmoid"), C_IN("dtype
 static const RadConstraint cFillBf16[] = { C_IN("dtype", "bf16") };
 static const RadConstraint cFillF32[]  = { C_IN("dtype", "f32") };
 static const RadConstraint cDequantW4[] = { C_DIV("N", 16), C_DIV("K", 64) };
-static const RadConstraint cRowTopkMerge[] = { C_GE("R", 1), C_LE("R", 32) };
+static const RadConstraint cRowTopkMerge[] = { C_GE("R", 1), C_LE("R", 32), C_IN("dtype", "f32") };
 static const RadConstraint cNgramIds[] = { C_GE("ngram", 2), C_LE("ngram", 8) };
+
 static const RadConstraint cGemmQBias[] = { C_IN("dtype", "fp8a8"), C_GE("M", 1), C_LE("M", 16) };
 static const RadConstraint cGemmQShort[] = { C_IN("dtype", "fp8a8"), C_GE("M", 1), C_LE("M", 64) };
 static const RadConstraint cMoeGemmQMod4[] = { C_GE("n_expert", 4) };
+
 static const RadConstraint cFillI32[]  = { C_IN("dtype", "i32") };
 static const RadConstraint cFillI64[]  = { C_IN("dtype", "i64") };
 
@@ -1219,6 +1298,22 @@ static const RadConstraint cKvFp8[]  = { C_IN("kv_dtype", "fp8_e4m3"), C_DIV("he
                                          C_DIV("block_size", 16) };
 static const RadConstraint cKvF16[]  = { C_IN("kv_dtype", "f16"), C_DIV("head_dim", 2),
                                          C_DIV("block_size", 16) };
+/* head_dim is 128 or 256 (the launcher refuses anything else); the constraint system has no
+ * int-set form, so the row states the range and the kernel enforces the set. */
+static const RadConstraint cMlaProject[] = { C_GE("M", 1),
+                                             C_LE("M", 65535),
+                                             C_GE("heads", 1),
+                                             C_LE("heads", 64),
+                                             C_GE("head_dim", 128),
+                                             C_LE("head_dim", 256),
+                                             C_EQ("latent_dim", 512),
+                                             C_IN("mode", "absorb expand"),
+                                             C_IN("dtype", "bf16") };
+static const RadConstraint cMlaAttnPaged[] = {
+    C_GE("M", 1),       C_LE("M", 65535),     C_EQ("latent_dim", 512), C_EQ("rope_dim", 64),
+    C_GE("heads", 1),   C_LE("heads", 64),    C_GE("block_size", 1),   C_LE("block_size", 256),
+    C_IN("dtype", "bf16")
+};
 
 static const RadConstraint cEmbed[] = { C_IN("dtype", "bf16"), C_DIV("n_embd", 2) };
 
@@ -1275,6 +1370,10 @@ static const RadConstraint cDequantI8[]  = { C_IN("dtype", "i8"), C_EQ("group", 
  * through LDS pays. K even because the inner loop consumes pairs. N has no bound: a wave covering N
  * handles the tail, and feed-forward and vocabulary widths (11008, 14336, 128256, a checkpoint's
  * `intermediate_size`) vary. */
+static const RadConstraint cGemmNtF32[] = { C_GE("M", 1),         C_LE("M", 65535),
+                                            C_GE("N", 1),         C_LE("N", 512),
+                                            C_GE("K", 1),         C_LE("K", 16384),
+                                            C_IN("dtype", "bf16") };
 static const RadConstraint cGemmM16[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 16),
                                           C_DIV("K", 2), C_GE("N", 1) };
 static const RadConstraint cGemmM16F16[] = { C_IN("dtype", "f16"), C_GE("M", 1), C_LE("M", 16),
@@ -1300,8 +1399,20 @@ static const RadConstraint cGdnConvW4[] = { C_GE("M", 1), C_EQ("head_k", 128), C
                                            C_EQ("conv_width", 4) };
 static const RadConstraint cGdnConvUpdW4[] = { C_GE("q_len", 1), C_EQ("head_k", 128),
                                               C_EQ("head_v", 128), C_EQ("conv_width", 4) };
+/* PLE's convolution. The kernel bounds (width-1)*dilation, the state write-back's register
+ * window, at 16; a constraint cannot express a product, so these are the tightest separate caps
+ * admitting every combination under it. */
+static const RadConstraint cPleConv[]   = { C_IN("dtype", "bf16"), C_GE("width", 1),
+                                            C_LE("width", 5), C_GE("dilation", 1),
+                                            C_LE("dilation", 4) };
 static const RadConstraint cGdnRecurrent[] = { C_GE("q_len", 1), C_EQ("head_k", 128),
                                               C_EQ("head_v", 128) };
+static const RadConstraint cKdaUpdate[] = {
+    C_GE("M", 1),          C_GE("heads", 1),    C_LE("heads", 65535),
+    C_EQ("head_k", 128),   C_EQ("head_v", 128), C_IN("mode", "prefill verify"),
+    C_IN("dtype", "bf16"),
+};
+
 static const RadConstraint cGdnConvRecurrent[] = { C_GE("q_len", 1), C_EQ("head_k", 128),
                                                    C_EQ("head_v", 128), C_EQ("conv_width", 4) };
 static const RadConstraint cExpertScaleBf16[] = { C_IN("dtype", "bf16"), C_GE("top_k", 1),
@@ -1332,6 +1443,11 @@ static const RadConstraint cRouterTopkScatter[] = { C_GE("M", 1), C_GE("n_expert
 static const RadConstraint cRouterSigmoid[] = { C_GE("M", 1), C_GE("n_expert", 1),
                                                 C_GE("top_k", 1), C_LE("n_expert", 512),
                                                 C_IN("dtype", "bf16") };
+static const RadConstraint cRouterSigmoidGroup[] = { C_GE("M", 1),        C_LE("M", 65535),
+                                                     C_GE("n_expert", 1), C_LE("n_expert", 512),
+                                                     C_GE("top_k", 1),    C_LE("top_k", 32),
+                                                     C_GE("n_group", 1),  C_LE("n_group", 32),
+                                                     C_IN("dtype", "f32") };
 static const RadConstraint cMoeGemmBf16[] = { C_IN("dtype", "bf16"), C_GE("n_expert", 1),
                                               C_GE("top_k", 1) };
 /* The vocabulary projection has no `dtype` constraint because its band carries no `dtype` key: the
@@ -1976,6 +2092,21 @@ static const RadKernelInfo kKernels[] = {
   [](const RadArgs* a) -> int64_t { return gemm_scratch(a->p, a->n_p); },
   nullptr, nullptr, r3d_shape_gemm_nt },
 
+/* ------------------------------------------------------------------ r3d_gemm_nt_f32.hip
+ *
+ * The router's F32 projection: a bf16 activation against an f32 weight, f32 out, no narrowing.
+ * One wave R rows by C columns, lane l folding k = l, l+32, ... with fmaf and the xor butterfly;
+ * the tile form its rule picks for M, every form byte-identical.
+ */
+{ "gemm_nt_f32_bf16", "gemm_nt_f32", "gemm",
+  "F32 routing and index gate projection",
+  "N<=512, K<=16384; pitched rows",
+  "bf16 input, f32 weights and output",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cGemmNtF32), NOTUNE,
+  nullptr, nullptr, r3d_rad_gemm_nt_f32, nullptr, nullptr, nullptr,
+  r3d_shape_gemm_nt_f32 },
+
 /* ------------------------------------------------------------------ r3d_gemm_w4a16_nt_m64.hip
  *
  * The 4-bit weight against an f16 activation, at the verify and small-prefill heights: the
@@ -2122,6 +2253,14 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, nullptr,
   nullptr, nullptr },
 
+{ "ple_conv_bf16", "ple_conv", "norm",
+  "PLE's dilated depthwise conv, silu and residual add; one thread a channel",
+  "width up to 5 and dilation up to 4 -- (width-1)*dilation is a register window",
+  "bf16 activations, weights and conv state; i32 cu, slots, has_init and num_accepted",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cPleConv), NOTUNE,
+  nullptr, nullptr, r3d_rad_ple_conv, nullptr, nullptr, nullptr, nullptr },
+
 { "expert_scale_bf16", "expert_scale", "moe",
   "Each routing weight times its expert's own per-expert scale, in place",
   "the router's renormalised top-k weight scaled by the [n_expert] table, an out-of-table id "
@@ -2168,6 +2307,14 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r3d_rad_router_sigmoid_topk,
   nullptr, nullptr, nullptr,
   nullptr, nullptr },
+{ "moe_router_sigmoid_group_topk_f32", "router_sigmoid_group_topk", "moe",
+  "group-limited sigmoid correction-bias routing, one wave a row",
+  "experts <=512, groups <=32, top_k<=32",
+  "f32 logits, bias and weights; i32 ids",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cRouterSigmoidGroup), NOTUNE,
+  nullptr, nullptr, r3d_rad_router_sigmoid_group_topk, nullptr, nullptr, nullptr,
+  r3d_shape_router_sigmoid_group_topk },
 
 { "moe_scatter_small", "moe_scatter", "moe",
   "The routed slots' stable counting sort",
@@ -2328,19 +2475,6 @@ static const RadKernelInfo kKernels[] = {
    nullptr, nullptr, nullptr,
    nullptr, nullptr, nullptr },
 
-  { "ngram_ids_i32", "ngram_ids", "vocab",
-   "The hashed row ids of the Per-Layer Embedding: mixed(k) = XOR of t_s * mult[s], "
-   "ids[h] = mixed % vocab_sizes[h] + offsets[h]",
-   "One thread a token, looping its heads; n-gram shifts with EOS walk; 64-bit wrapping "
-   "multiply and floor-mod; ngram <= 8, heads divisible by (ngram-1)",
-   "i32 tok, i32 state, i32 cu, i64 mult, i64 vsz, i64 off, i32 ids; "
-   "optional i32 cidx, hini, nacc, ahead",
-   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
-   ROW(cNgramIds), NOTUNE,
-   nullptr, nullptr, r3d_rad_ngram_ids,
-   nullptr, nullptr, nullptr,
-   nullptr, nullptr, nullptr },
-
   { "gemm_nt_q_bias_fp8a8_m16", "gemm_nt_q_bias", "gemm",
    "The narrow fp8 GEMM with a per-column bias epilogue: y = a @ b^T + bias",
    "M <= 16, K a multiple of the block; fp8a8 codes and scales, bf16 bias and output; "
@@ -2376,7 +2510,23 @@ static const RadKernelInfo kKernels[] = {
    nullptr, nullptr, nullptr,
    nullptr, nullptr, nullptr },
 
-   /* ------------------------------------------------------------------ r3d_gdn_recurrent_update_k128_v128.hip
+   /* ------------------------------------------------------------------ r3d_kda_update.hip
+ *
+ * GLM's per-channel KDA recurrence over a paged f32 state cache: the decay from the softplus-
+ * limited gate, the l2-normalised q and k, the delta-rule step and o = S q per token, with the
+ * speculative candidate snapshots. The state never touches LDS: a wave owns four value rows and
+ * keeps each row's 128 state elements in four registers a lane, so the RDNA3 64 KiB stage is not
+ * in play.
+ */
+{ "kda_update_k128_v128_bf16", "kda_update", "gdn",
+  "per-channel KDA recurrence and candidate rollback",
+  "heads 1..65535, K=V=128, prefill and verify",
+  "bf16 activations, f32 gates and state",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cKdaUpdate), NOTUNE,
+  nullptr, nullptr, r3d_rad_kda_update, nullptr, nullptr, nullptr, r3d_shape_kda_update },
+
+/* ------------------------------------------------------------------ r3d_gdn_recurrent_update_k128_v128.hip
   *
   * The gated-delta-net recurrent state update at decode: the per-token state step against a paged
   * fp32 state cache, the state in registers (one thread per v row and half its k range), the
@@ -2639,6 +2789,20 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r3d_rad_attn_prefill_h128, nullptr, nullptr, nullptr,   /* no split: no scratch */
   r3d_shape_attn_paged },
 
+
+{ "mla_project_bf16", "mla_project", "attn", "per-head absorbed MLA projections",
+  "head_dim 128 or 256, latent_dim=512; pitched tensors", "bf16 input, weights and output; fp32 arithmetic",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY, ROW(cMlaProject), NOTUNE,
+  nullptr, nullptr, r3d_rad_mla_project, nullptr, nullptr, nullptr,
+  r3d_shape_mla_project },
+
+{ "mla_attn_paged_bf16", "mla_attn_paged", "attn",
+  "dense causal latent attention with a rotary part, a wave a (row, head), split history",
+  "latent_dim=512, rope_dim=64, heads<=64, block_size<=256; one page table a sequence",
+  "bf16 Q/rotary/cache/gate/output, f32 softmax and partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY, ROW(cMlaAttnPaged), NOTUNE,
+  nullptr, nullptr, r3d_rad_mla_attn_paged, r3d_rad_mla_attn_paged_scratch, nullptr, nullptr,
+  r3d_shape_mla_attn_paged },
 
 /* ------------------------------------------------------------------ r3d_sample_f32.hip
  *

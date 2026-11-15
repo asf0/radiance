@@ -301,6 +301,58 @@ TEST(the_cards_tree_acceptance_is_accept_tree_and_the_end_of_generation_cut) {
     CHECK(cut_cases > 100);
 }
 
+/* ================================================================== ADV_COMPACT */
+
+/* An accepted path's rows move to their committed positions whole, in every layer and head, and
+ * nothing else in the cache changes: at 512 bytes a row (bf16 and fp8 at head_dim 256 and 128)
+ * and at 516 and 260 (the int8 cache's K, V and two f16 scales, which is never whole 16-byte
+ * chunks). Run as the host backend does (one caller, every chunk) and as the kernel's 64 threads
+ * split a row; the path crosses a block boundary. A row that sampled nothing keeps its cache. */
+TEST(a_trees_accepted_rows_move_whole_at_every_row_size) {
+    for (int row_bytes : { 512, 516, 260, 1028 }) {
+        for (int cstep : { 1, 64 }) {
+            Slab s(ADV_ACCEPT);
+            const int layers = 2, heads = 3, bs = 16, blocks = Slab::kPitch;
+            const int64_t stride = (int64_t)blocks * heads * bs * row_bytes + 64;
+            std::vector<uint32_t> cache((size_t)(layers * stride / 4));
+            uint32_t rng = 0xc0a9ac7u + (uint32_t)row_bytes;
+            for (uint32_t& v : cache) v = lcg(rng);
+            std::vector<uint32_t> want = cache;
+
+            s.row(0, true, 0, 8, 0, /*card=*/3, 0, /*rout=*/0, 7);
+            s.row(1, true, 8, 8, 0, /*card=*/5, 8, /*rout=*/-1, 7);
+            const int32_t path[3] = { 2, 5, 7 }, base = 28;
+            for (int card : { 3, 5 }) {
+                StepSlot& S = s.st[card];
+                S.acc = 3; S.npath = 3; S.head = base + 3;
+                std::memcpy(S.path, path, sizeof path);
+            }
+            s.a.n_pool = 1;
+            s.a.pool[0] = { reinterpret_cast<char*>(cache.data()), stride, layers, heads,
+                            row_bytes, 0 };
+
+            auto at = [&](std::vector<uint32_t>& c, int l, int h, int pos) {
+                return reinterpret_cast<char*>(c.data()) + l * stride +
+                       (((int64_t)(pos / bs) * heads + h) * bs + pos % bs) * row_bytes;
+            };
+            for (int l = 0; l < layers; ++l)
+                for (int h = 0; h < heads; ++h)
+                    for (int t = 0; t < 3; ++t)
+                        std::memcpy(at(want, l, h, base + t + 1), at(want, l, h, base + path[t]),
+                                    (size_t)row_bytes);
+
+            CHECK_EQ(adv_compact_items(s.a), layers * heads);
+            for (int i = 0; i < s.a.n_seq; ++i)
+                for (int w = 0; w < adv_compact_items(s.a); ++w) {
+                    int p = 0, l = 0, h = 0;
+                    CHECK(adv_compact_item(s.a, w, &p, &l, &h));
+                    for (int c0 = 0; c0 < cstep; ++c0) adv_compact(s.a, i, p, l, h, c0, cstep);
+                }
+            CHECK(cache == want);
+        }
+    }
+}
+
 /* ================================================================== ADV_TRUNK */
 
 /* A verify step issued ahead takes its rows from the StepSlots: the bonus token and the head's

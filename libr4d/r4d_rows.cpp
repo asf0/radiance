@@ -2185,6 +2185,15 @@ static const RadOperandSpec oGridEmbed[] = {
     { "table", RAD_OPD_WEIGHT, 0 },
     { "coord", RAD_OPD_IN,     0 },
 };
+static const RadParamSpec pWindowOrder[] = { P_INT("M"), P_INT("window") };
+static const RadOperandSpec oWindowOrder[] = {
+    { "crd", RAD_OPD_IN,  0 },
+    { "cu",  RAD_OPD_IN,  1 },
+    { "idx", RAD_OPD_OUT, 0 },
+    { "inv", RAD_OPD_OUT, 0 },
+    { "pos", RAD_OPD_OUT, 0 },
+    { "cuw", RAD_OPD_OUT, 0 },
+};
 static const RadParamSpec pGridEmbedCpe[] = {
     P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
     { "n_prefix", RAD_P_INT, RAD_OPTIONAL },
@@ -2846,7 +2855,11 @@ static const RadOperandSpec oVqEncode[] = {
     { "codes", RAD_OPD_OUT, 0 },
 };
 static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
-                                          P_INTO("rep"), P_STR("dtype") };
+                                           P_INTO("rep"), P_STR("dtype") };
+static const RadParamSpec pVqEuclidean[] = { P_INT("M"), P_INT("n"), P_INT("bins"), P_STR("dtype") };
+static const RadOperandSpec oVqEuclidean[] = {
+    { "x", RAD_OPD_INOUT, 0 }, { "cb", RAD_OPD_WEIGHT, 0 }, { "codes", RAD_OPD_OUT, 0 },
+};
 static const RadOperandSpec oFrameMix[] = {
     { "hid", RAD_OPD_IN, 0 }, { "logits", RAD_OPD_WEIGHT, 0 }, { "scale", RAD_OPD_WEIGHT, 0 },
     { "lane", RAD_OPD_IN, 0 }, { "frame", RAD_OPD_IN, 0 }, { "status", RAD_OPD_IN, 0 },
@@ -3294,6 +3307,25 @@ static const RadOpSchema kSchemas[] = {
            "x += a side x side table resampled bilinearly (corners aligned, taps clamped) to each "
            "row's grid; coord is [4, M] row, column, height, width. The taps are summed in f32 "
            "and rounded before the add."),
+    SCHEMA("grid_embed_pad", pGridEmbed, oGridEmbed,
+           "x += the side x side table resampled at each row's grid in the half-pixel-centre form "
+           "(align_corners=False) with grid_sample's padding_mode=\"zeros\": per axis taps at "
+           "floor(src) and floor(src) + 1 of src = (i + 0.5) * side / size - 0.5, each carrying "
+           "the hat weight (1 - |src - tap|)+, and a tap whose UNCLAMPED index falls outside the "
+           "table contributes zero rather than reading an edge. Same operands and tap order as "
+           "`grid_embed`; equal to it whenever the grid fits the table, different only when a "
+           "grid upsamples past it (Muse's case)."),
+    SCHEMA("window_order", pWindowOrder, oWindowOrder,
+           "The window-attention permutation of one encoder pass (HF's get_vision_window_index) "
+           "computed from the coordinates alone: `crd` [4, P] i32 is row, column, segment height, "
+           "segment width per patch and `cu` [S+1] i32 the per-frame segment boundaries. Windows "
+           "of `window` patches partition each segment, window-row-major, ragged at the segment's "
+           "right and bottom edges, patches raster within a window and windows never across "
+           "segments. Outputs i32: `idx` [P], slot -> source patch (the gather index); `inv` [P], "
+           "the inverse; `pos` [2, P], each slot's rope positions (col + 1, row + 1), "
+           "component-major like the planes; `cuw` [P+1], the cumulative window boundaries in the "
+           "permuted order, n_windows + 1 entries used. `M` bands the pass; slots past M are the "
+           "identity. `window` <= 0 is the identity permutation, cuw = cu."),
     SCHEMA("grid_embed_aa", pGridEmbed, oGridEmbed,
            "x += the side x side table resampled as torch's F.interpolate(bilinear, "
            "align_corners=False, antialias=True) resamples it to the row's grid -- SigLIP2's "
@@ -4033,6 +4065,9 @@ static const RadOpSchema kSchemas[] = {
            "(the lower index on a tie), then x -= out_w cb[code] + out_b."),
     SCHEMA("frame_mix_store", pFrameMix, oFrameMix,
            "a frame's conditioning row (softmax-weighted planes times scale) into its lane."),
+    SCHEMA("vq_euclidean", pVqEuclidean, oVqEuclidean,
+           "nearest Euclidean centroid, codes written and centroid subtracted from x."),
+    SCHEMA("elu", pGenMn, oGenUnary, "y = x >= 0 ? x : expm1(x), alpha 1."),
     SCHEMA("end_status", pEndStatus, oEndStatus,
            "status[lane[i]] = ids[rep i] == end ? -1 : ids[rep i]."),
     SCHEMA("ras_pick", pRasPick, oRasPick,
@@ -4616,6 +4651,10 @@ static const RadConstraint cAttnDenseH64[] = {
 /* head_dim 80 without GQA: C-RADIO's ViT heads (Nemotron-3.5-Bolt's vision tower), bidirectional. */
 static const RadConstraint cAttnDenseH80[] = {
     C_EQ("head_dim", 80), C_EQ("gqa", 1), C_IN("dtype", "bf16"),
+};
+/* head_dim 96 without GQA: Muse Glimmer's vision tower heads (16 of 96). */
+static const RadConstraint cAttnDenseH96[] = {
+    C_EQ("head_dim", 96), C_EQ("gqa", 1), C_IN("dtype", "bf16"),
 };
 /* head_dim 256 without GQA, sequences past the small kernel's. */
 static const RadConstraint cAttnDenseH256G1[] = {
@@ -5847,6 +5886,9 @@ static const RadTunable tRmsQ8[] = {
  * power-of-two padding. */
 static const RadConstraint cBf16Row[]   = { C_IN("dtype", "bf16") };
 static const RadConstraint cF32Row[]    = { C_IN("dtype", "f32") };
+static const RadConstraint cEncoderNorm[] = { C_IN("dtype", "f32"), C_GE("n", 1), C_LE("n", 4096) };
+static const RadConstraint cEncoderAttn[] = { C_IN("dtype", "f32"), C_EQ("head_dim", 64),
+    C_EQ("gqa", 1), C_EQ("causal", 1), C_GE("M", 1), C_LE("M", 512) };
 /* bf16 rows over the byte copy, which moves four bytes a thread: an even width. */
 static const RadConstraint cBf16Row2[]  = { C_IN("dtype", "bf16"), C_DIV("n", 2) };
 /* Opaque byte rows, four at a time: the vectorised copy's alignment, stated so the selector
@@ -5891,6 +5933,8 @@ static const RadConstraint cRopeRow[]   = { C_GE("head_dim", 1),
  * the position embedding take any width. */
 static const RadConstraint cLayernorm[] = { C_GE("n", 1), C_IN("dtype", "bf16") };
 static const RadConstraint cGridEmbed[] = { C_GE("n", 1), C_GE("side", 1), C_IN("dtype", "bf16") };
+/* window_order has no dtype of its own: its operands are i32 by schema, `M` the only band. */
+static const RadConstraint cWindowOrder[] = { C_GE("M", 1) };
 static const RadConstraint cGemmBias[]  = { C_GE("M", 1), C_DIV("K", 8), C_IN("dtype", "bf16") };
 /* The f32 GEMM reads its rows a float at a time: any K. */
 static const RadConstraint cGemmBiasF32[] = { C_GE("M", 1), C_IN("dtype", "f32") };
@@ -6456,6 +6500,26 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_grid_embed_cpe, nullptr, nullptr, nullptr,
   r4d_shape_grid_embed_cpe },
 
+{ "grid_embed_pad_bf16", "grid_embed_pad", "elem",
+  "the position grid resampled half-pixel bilinear with zero-padded off-table taps and added in "
+  "(Muse's)",
+  "any n and side; coord [4, M] dense; one workgroup a row",
+  "bf16 x, bf16 or f32 table, i32 coord, f32 taps",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGridEmbed), NOTUNE,
+  nullptr, nullptr, r4d_rad_grid_embed_pad, nullptr, nullptr, nullptr,
+  r4d_shape_grid_embed_pad },
+
+{ "window_order_i32", "window_order", "elem",
+  "the window-attention permutation of one pass from its coordinate planes: idx, its inverse, "
+  "the swapped one-offset rope positions and the cumulative window boundaries",
+  "M in [1, P); one workgroup the pass",
+  "i32 coord [4, P] and cu [S+1]; i32 idx, inv, pos [2, P] and cuw [P+1]",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cWindowOrder), NOTUNE,
+  nullptr, nullptr, r4d_rad_window_order, nullptr, nullptr, nullptr,
+  r4d_shape_window_order },
+
 { "gemm_bf16_nt_bias_tiled", "gemm_nt_bias", "gemm",
   "biased GEMM C = res + act(A @ W^T + bias) over 64-deep K tiles, the K tail staged as zeros, "
   "the activation and residual in the store: from 32 blocks of 128x128 the weight read straight "
@@ -6476,7 +6540,27 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGemmBiasF32), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_f32_nt_bias, nullptr, nullptr, nullptr,
-  r4d_shape_gemm_nt_bias },
+   r4d_shape_gemm_nt_bias },
+{ "gemm_f32_nt", "gemm_nt", "gemm",
+  "unbiased f32 GEMM on the shared FMA tile", "pitched A and Y, contiguous W", "f32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_f32_nt, nullptr, nullptr, nullptr, r4d_shape_gemm_nt },
+{ "layernorm_f32", "layernorm", "norm",
+  "two-pass f32 layer norm", "n <= 4096, pitched rows", "f32 rows, gain and bias",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cEncoderNorm), NOTUNE,
+  nullptr, nullptr, r4d_rad_encoder_layernorm, nullptr, nullptr, nullptr, r4d_shape_layernorm },
+{ "gelu_f32", "gelu", "elem",
+  "exact erf GELU", "pitched rows", "f32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_encoder_gelu, nullptr, nullptr, nullptr, r4d_shape_unary },
+{ "attn_dense_h64_f32", "attn_dense", "attn",
+  "f32 causal encoder attention without a global score plane", "M <= 512, head_dim 64, gqa 1", "f32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cEncoderAttn), NOTUNE,
+  nullptr, nullptr, r4d_rad_encoder_attn },
 
 { "add_bf16", "add", "elem",
   "elementwise sum, with the one row-broadcast form; `div` divides the rounded sum",
@@ -7349,7 +7433,7 @@ static const RadKernelInfo kKernels[] = {
 #define R4D_WIN_PAIR(HD, GQ)                                                                       \
     R4D_WIN_ROW(HD, GQ, bf16kv, bf16, cWinH##HD##G##GQ##Bf16, "bf16")                              \
     R4D_WIN_ROW(HD, GQ, i8kv, i8, cWinH##HD##G##GQ##I8, "int8 (an f16 scale of K and of V per token and head)")
-R4D_WIN_PAIR(128, 1)
+R4D_WIN_PAIR(128, 1) R4D_WIN_PAIR(128, 16)   /* Muse Glimmer's 32/2-head sliding layers */
 R4D_WIN_PAIR(256, 1) R4D_WIN_PAIR(256, 2) R4D_WIN_PAIR(256, 4) R4D_WIN_PAIR(256, 8)
 R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512, 8)
 R4D_WIN_PAIR(512, 16)
@@ -7865,6 +7949,16 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "bf16 query / key / value / out, f16 operands, fp32 accumulate",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cAttnDenseH80), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense },
+
+{ "attn_dense_h96_bf16", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window or "
+  "blocks, or causal with an optional window behind",
+  "head_dim 96, multi-head (no GQA), q/k/v/o at their own token pitches (column slices of a "
+  "fused projection allowed)",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH96), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_dense },
 
 { "attn_dense_h256_bf16", "attn_dense", "attn",
@@ -10296,7 +10390,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "bf16 or f32 rows and weights, f32 arithmetic, the row rounded once",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cVqEncode), NOTUNE,
-  nullptr, nullptr, r4d_rad_vq_encode },
+   nullptr, nullptr, r4d_rad_vq_encode },
+{ "vq_euclidean_f32", "vq_euclidean", "elem",
+  "nearest Euclidean centroid", "one workgroup a row", "f32 rows and centroids, i32 codes",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_vq_euclidean, nullptr, nullptr, nullptr, r4d_shape_vq_euclidean },
+{ "elu_f32", "elu", "elem",
+  "ELU, alpha 1", "row pitches honoured", "f32 rows",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_elu, nullptr, nullptr, nullptr, r4d_shape_unary },
 
 { "frame_mix_store_bf16", "frame_mix_store", "elem",
   "a frame's conditioning row into its lane", "a workgroup a lane, L <= 16",

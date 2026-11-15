@@ -95,6 +95,25 @@ TEST(structured_values_are_spelled_for_their_flag) {
     CHECK(c.sample_temp > 0.69f && c.sample_temp < 0.71f);
 }
 
+/* The diagnose mode is a model key like the KL mode's: the entry's Config is what main() tests to
+ * run it offline, and a sequence spells the sweeps' lists. */
+TEST(the_diagnose_keys_are_model_keys) {
+    fleet::FleetConfig fc;
+    CHECK_EQ(yload("models:\n  qwen:\n    model: /m/q.rad\n    diagnose: /out\n    diagnose-runs: 5\n"
+                  "    diagnose-concurrency: [1, 2]\n    diagnose-prefill: [1024, 4096]\n", &fc), RAD_OK);
+    REQUIRE_EQ(fc.models.size(), 1u);
+    const Config& c = fc.models[0].cfg;
+    CHECK(c.diagnose_mode());
+    CHECK_EQ(c.diagnose, "/out");
+    CHECK_EQ(c.diagnose_runs, 5);
+    CHECK_EQ(c.diagnose_concurrency.size(), 2u);
+    CHECK_EQ(c.diagnose_prefill.size(), 2u);
+    CHECK_EQ(c.given.at("--diagnose"), "models.qwen.diagnose");
+    CHECK(refused("models:\n  qwen:\n    model: /m/q.rad\n    diagnose-runs: 5\n    diagnose: /out\n"
+                  "    kld-ref: /r\n"));
+    CHECK(refused("models:\n  qwen:\n    model: /m/q.rad\n    diagnose-baseline: /b.json\n"));
+}
+
 TEST(model_ids_may_hold_dots) {
     fleet::FleetConfig fc;
     CHECK_EQ(yload("models:\n  qwen3.8-27b:\n    model: /m/q.rad\n    tp: 2\n", &fc), RAD_OK);
@@ -253,9 +272,16 @@ TEST(scheduler_cards_and_groups) {
     CHECK_EQ(fc.load_timeout_ms, 90000);
     CHECK_EQ(fc.drain_timeout_ms, 500);
     CHECK_EQ(fc.keepalive_ms, 5000);
+    CHECK_EQ(fc.stuck_exit_ms, 60000);   /* a minute unless the file says otherwise */
     CHECK(fc.warm_up);   /* on unless the file turns it off */
     CHECK_EQ(fc.groups.size(), 2u);
     CHECK(fc.groups[1].kind == fleet::Group::Kind::Exclusive);
+    fleet::FleetConfig off;
+    CHECK_EQ(yload("scheduler: {stuck-exit: 0}\nmodels:\n  a: {model: /m/a.rad}\n", &off), RAD_OK);
+    CHECK_EQ(off.stuck_exit_ms, 0);
+    fleet::FleetConfig slow;
+    CHECK_EQ(yload("scheduler: {stuck-exit: 5m}\nmodels:\n  a: {model: /m/a.rad}\n", &slow), RAD_OK);
+    CHECK_EQ(slow.stuck_exit_ms, 300000);
     CHECK_EQ(yload("cards: all\nmodels:\n  a: {model: /m/a.rad}\n", &fc), RAD_OK);
     CHECK(fc.cards.empty());
     CHECK_EQ(yload("scheduler: {warm-up: false}\nmodels:\n  a: {model: /m/a.rad}\n", &fc), RAD_OK);

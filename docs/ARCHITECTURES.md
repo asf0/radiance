@@ -14,6 +14,7 @@ plugin claims.
 | `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4 or W8A8 weights by recipe; TP1/2, BF16 KV |
 | `arch/hyv3_fp8` | `hyv3` | `fp8` | Tencent Hy-Memory-30B-A3B-FP8's descriptor: the same graph, one dense layer then sigmoid-routed MoE; its per-tensor E4M3 linears are a form this build does not serve; TP1/2, bf16 or int8 KV |
 | `arch/hyv3_gguf` | `hyv3` | `gguf_ftype_15` | llama.cpp Hy-Memory Q4_K_M GGUF, dequantized and recipe-converted to native Radiance weights; TP1/2 |
+| `arch/flint` | `flint` | *(empty)* | Recursive Flint (39.8B-A2.5B): 2 dense layers then 47 sigmoid-routed MoE layers (256 experts top-6, ungated 1024-wide shared expert), GQA 32/4 at head_dim 128 with QK RMSNorm, a learned per-head sink on every layer, RoPE on the 35 sliding layers (window 513) and NoPE on the 14 full layers; two KV groups (full and window), TP1/2 (expert parallel); BF16 or int8 KV. Weights by recipe: an IQ8R trunk with rotated int8 experts (`data/recipes/flint-iq8r.recipe`), or u4 attention, int4 experts and plain int8 dense/shared/head (`data/recipes/flint-bf16-q4.recipe`); `docs/FLINT.md` |
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation: IQ8R and IQR-V4 (`data/recipes/q38-27b-iq8r.recipe`, `q38-27b-iq4r-s-v4.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen35moe_w8a8` | `qwen35moe` | `w8a8_fwht128` | `qwen35moe_fp8` with `qwen35_w8a8`'s int8 trunk and rotated int8 experts, the routed arm reading the trunk's own int8 codes (`data/recipes/q36-35b-a3b-iq8r.recipe`) |
@@ -21,7 +22,12 @@ plugin claims.
 | `arch/clef_fp8` | `clef` | `fp8_e4m3` | the same over `qwen35_fp8`'s trunk |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert (`data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe`) or an AutoRound int4 release (`qwen4exp-autoround-i8-hc8m.recipe`) |
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 experts at top-8 under sigmoid routing, attention and dense layers as the container stores them; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
-| `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; bf16 KV |
+| `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; Ling-3.0-tiny from its bf16 checkpoint with an IQ8R trunk and rotated int8 experts (`data/recipes/ling-3.0-tiny-iq8r.recipe`, TP1/2; flash's clamped SwiGLU layers have no int8 form); bf16 KV |
+| `arch/bailing_hybrid_gguf` | `bailinghybrid` | `gguf_ftype_25` | Ling-3.0-tiny (24 layers, MLA every fourth with a 256-wide query LoRA, 128 experts of 512 at top-8) as the IQ4_NL GGUF release, its experts re-quantised by `data/recipes/ling-3.0-tiny-iq4.recipe`; no MTP; bf16 KV |
+| `arch/bailing_hybrid_gguf_q80` | `bailinghybrid` | `gguf_ftype_7` | the same tiny family, Q8_0 GGUF release, served whole |
+| `arch/bailing_hybrid_gguf_q4km` | `bailinghybrid` | `gguf_ftype_15` | the same tiny family, Q4_K_M GGUF release, served whole |
+| `arch/bailing_hybrid_gguf_q5km` | `bailinghybrid` | `gguf_ftype_17` | the same tiny family, Q5_K_M GGUF release, served whole |
+| `arch/bailing_hybrid_gguf_q6k` | `bailinghybrid` | `gguf_ftype_18` | the same tiny family, Q6_K GGUF release, served whole |
 | `arch/nemotronh` | `nemotronh` | *(empty)* | Nemotron-3.5-Bolt-74B-A9B (`nemotron_h_omni` around `nemotron_h_puzzle`), its language model from the bf16 checkpoint: 40 Mamba-2, 40 latent-MoE and 8 NoPE attention blocks in the order `layers_block_type` gives, 240 to 496 ungated relu^2 experts a layer in a 1024-wide latent with a relu^2 shared expert; linears and experts as the recipe stores them; pictures and video through its C-RADIO tower (`arch/nemotronh/radio.h`); bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16 or IQ8R, one rank |
 | `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, TP1 or TP with exact collectives ([geometry](#spark25-spark-x26)). Optional DSpark drafter when the container already holds `draft.*` tensors, TP1 only. |
@@ -1031,10 +1037,12 @@ the four depths above.
 
 ---
 
-# `bailing_hybrid`: Ling-3.0-flash
+# `bailing_hybrid`: Ling-3.0-flash and Ling-3.0-tiny
 
-`arch/bailing_hybrid` serves Ling-3.0-flash (`model_type: bailing_hybrid`, BailingMoeV3ForCausalLM)
-and its fine-tunes from the bf16 checkpoint. The reference is vLLM's `bailing_moe_v3.py` and
+`arch/bailing_hybrid` serves Ling-3.0-flash and Ling-3.0-tiny (`model_type: bailing_hybrid`,
+BailingMoeV3ForCausalLM) and their fine-tunes from the bf16 checkpoint, tiny additionally as its
+GGUF releases through thin-include wrappers (`arch/bailing_hybrid_gguf` and kin). The reference is
+vLLM's `bailing_moe_v3.py` and
 SGLang's; the HF `modeling_bailing_moe_v3.py` agrees except for the SwiGLU clamp (below). The plugin
 reuses GLM-5.3's KDA core (`KdaState`), sigmoid router (`GlmRouter`, with groups) and draft head
 (`GlmMtp`), and `MoeFP8`; its KDA and MLA blocks are in the plugin file.
@@ -1059,6 +1067,34 @@ feed-forward: layers 0-1 dense SwiGLU 2 x 6144; layers 2-41 MoE
     routed experts at 4 in layers 35-41, the shared one at 5 (34-39) and 7 (40-41)
 MTP: checkpoint layer 42 -- enorm, hnorm, eh_proj 5120 -> 2560, one MLA layer with the full MoE,
   final_layernorm; the trunk's embedding and lm_head
+
+tiny: 24 layers, hidden 1536, rope_theta 6e6, groups of four -- MLA at 3, 7, ..., 23; 16 heads
+  of 128 through the whole model
+  the MLA takes its query through a LoRA: q_a 1536 -> 256, RMS-normed, then q_b 256 ->
+    16 x (128 + 64), whose rows serve the two parts; kv_a 1536 -> 512 + 64, kv_b 512 ->
+    16 x (128 + 128); the gate 1536 -> 16; o 2048 -> 1536 (`dense`)
+  KDA, 16 heads of 128: q, k, v 1536 -> 3 x 2048, convs, forget and output gates as flash
+  feed-forward: layer 0 dense SwiGLU 2 x 4608; layers 1-23 MoE, 128 routed experts of 512 at
+    top-8, 8 groups of 16 ranked the same way, 4 kept; one shared expert of 512; no clamp lists
+  no MTP layer (`num_nextn_predict_layers: 0`)
+
+IQ8R (tiny, `data/recipes/ling-3.0-tiny-iq8r.recipe`): the KDA q|k|v, forget, gate and out, the
+  MLA out, the dense pair and the shared gate/up as IQ8R (`gemm_nt_q` at `i8a8h`, group 256); the
+  routed experts and the shared down rotated int8 at a bf16 scale a (row, 128) (`moe_gemm_q` and
+  `gemm_nt_q` at `i8a8h`, group 128). The block norms write `rmsnorm_had_quant_i8g`'s codes (256),
+  read by every KDA projection, the shared gate/up and the routed gate/up; `had_quant_act_i8g`
+  (256) quantises the KDA core's gated norm and the MLA's values for their out projections;
+  `gated_had_quant_i8g` writes the dense product's codes at 256, the shared and routed products'
+  at 128. The KDA beta, the MLA's q_a, q_b parts, kv_a, kv_b and head gate, the taps, the router,
+  the embedding and the head stay bf16. TP1 and TP2 (at TP4 the dense 1152-column slice cuts a
+  256-column group and is refused).
+
+GGUF releases (tiny): IQ4_NL, Q8_0, Q4_K_M, Q5_K_M, Q6_K -- the file's `general.file_type` is
+  the claim (`gguf_ftype_25`, `_7`, `_15`, `_17`, `_18`); the release files carry their
+  producer's renumbered ftable (IQ4_NL 25, Q4_K_M 15, Q5_K_M 17, Q6_K 18, Q8_0 7), not the
+  pinned ggml enum. Q8_0, Q4_K and Q6_K import as planes and are served whole; Q5_K and
+  IQ4_NL decode in checkpoint.cpp, the IQ4_NL experts re-quantise to the engine's i4 planes
+  through `data/recipes/ling-3.0-tiny-iq4.recipe`.
 ```
 
 Traps:
@@ -1077,6 +1113,10 @@ Traps:
   for `rope` and `[T, 32 * 128]` for the absorption. A single `[T, 32, 192]` plane with column
   views turns the wrong rows on libavx, whose `rope` reads a rank-3 operand's head stride as its
   row stride.
+- **tiny's query runs a LoRA first.** q_a 1536 -> 256 and its norm precede q_b; the same two-plane
+  row maps run over `q_b_proj` against the normed latent, so the parts' GEMMs take K = 256 and read
+  the LoRA's ActFP8 wire (the producer quantises it when the container stores fp8). The `need[]`
+  gate admits `q_lora_rank` 256 and nothing else.
 - **The cache row is [latent | rotary key].** One KV head of 288, the row's first half in the K
   slot and the second in the V slot, so `kv_store` writes the 576-wide row contiguously and
   `mla_attn_paged` reads it as `[pages, 1, block, 576]`. Scores are taken in the latent; the head
@@ -1103,7 +1143,16 @@ and the latent are replicated. The dense feed-forward splits its 6144 columns. A
 768 columns are six 128-column blocks: halves at two ranks, and at four 2, 2, 1, 1 blocks rotated
 by the expert's number mod 4 (`moe_gemm_q_mod4`), so every rank carries six blocks per four
 experts. The shared expert splits the same way, unrotated. A calibration run
-(`RADIANCE_CALIB_DIR`) and bf16 experts give every rank whole experts instead.
+(`RADIANCE_CALIB_DIR`) and bf16 experts give every rank whole experts instead. The IQ8R trunk
+shards the same way; its norms take no collective (each block's all-reduce stays a standalone
+`all_reduce` before the residual add), so no `ar_` norm is declared at two ranks.
+
+**The trunk's form** is read from layer 0's fused q|k|v. A rotated int8 trunk needs rotated
+experts (int8 or a rotated four-bit form) and no SwiGLU clamp: the int8 gated products have no
+clamped form, so flash's clamped layers (routed 35-41, shared 34-41) are refused on it by name.
+Rotated int8 experts under an unrotated trunk are refused too. Where no loaded library serves
+`rmsnorm_had_quant_i8g` (a CPU-only engine), each int8 linear quantises the norm's bf16 output
+itself and the routed experts read a rotated int8 copy written once a layer.
 
 ---
 
@@ -1812,6 +1861,198 @@ is one 800-token translation run four times).
 
 ---
 
+# `museglimmer`: Meta Muse Glimmer 30B
+
+`arch/museglimmer` serves the text trunk and the vision tower of a
+`MuseGlimmerForConditionalGeneration` checkpoint (`model_type: muse_glimmer`, HF
+`meta-models/Muse-Glimmer-30B`), `arch/museglimmer_ct` the same container converted to an int4
+or IQ8R trunk (`--set quantization_config.quant_method=compressed-tensors`). The trunk block lives
+in the plugin, the tower in `arch/common/rad_block_museglimmer_vision.h`; the reference is
+transformers' `modeling_muse_glimmer`.
+
+```
+Muse Glimmer 30B
+  52 layers, hidden 6656, ff 19968, vocab 202048 (head not tied), rms_norm_eps 1e-5
+  layer_types: sliding_attention except every 4th layer full (3, 7, ..., 51)
+    sliding  32 heads / 2 kv x 128, rope theta 500000 over all 128 dims, window 2048
+    full     NoPE: no rotary at all (the config's layer_rope_theta is 0 there)
+  q_proj and gate_proj are separate tensors, each [4096, 6656]: two GEMMs, not a fused q|gate
+  q and k are RMS-normed per head with NO gain (MuseGlimmerRMSNorm with_scale=False); the query
+    is then multiplied by qk_scale_factor 3.87, the key is not; scores scaled 1/sqrt(128)
+  every layer norm is centered, x_hat * (1 + w): the attention's and feed-forward's inputs at
+    rms_norm_eps 1e-5, their OUTPUTS at post_norm_eps 1e-8, and the residual adds the normed
+    branch (Gemma-2 sandwich); the final norm is a plain gain, wadd 0
+  the embedding is RMS-normed after the lookup (weightless, 1e-5); not folded into the table,
+    because a drafter embeds without it
+  logits are pre-scaled by output_multiplier 1/sqrt(26) (carried on the final norm's mult) and
+    soft-capped: 20 * tanh(logits * mult / 20)
+```
+
+Traps:
+
+- **The q/k norm is weightless and the query alone carries qk_scale_factor.** Serving it as a
+  plain 1/sqrt(head_dim) with no norm, or scaling both q and k, is a different model.
+- **The full-attention layers have no rotary.** A theta of 500000 there (the family default
+  rope_parameters value) is wrong; the per-layer `layer_rope_theta` array is the authority, and
+  where a container omits it the plugin derives it: theta on the sliding layers, 0 on the full
+  ones.
+- **The output branch is normed, not the raw projection**: `x += post_norm(y)` at both junctions,
+  the post norm at 1e-8.
+- **The head sees scaled inputs.** The final norm's `mult` carries output_multiplier, so logits
+  are already pre-scaled when `logit_softcap` applies cap * tanh(x / cap). Scaling the head's
+  weights instead would break a bf16 head against a quantised one under the same container.
+
+**KV groups.** `kv_sliding` (`RAD_KV_WINDOW`, 2048) bound to the sliding layers, `kv_full`
+(`RAD_KV_FULL`) to the full ones, 2 heads of 128. The window group holds 2048 tokens a sequence
+per sliding layer, so long contexts cost a fraction of what a full pool would.
+
+**Vision.** A 50-block windowed ViT (hidden 1536, 16 heads x 96, ff 8960, patch 14, temporal 2,
+merge 2) declared only when the deployment asked for media (`--mm-max-patches`). The preprocessor
+resizes to a multiple of 28 px under a 4096-token budget (closest aspect, no minimum size), emits
+patch rows as (temporal, channel, y, x) in the reference's raster order, and expands
+`<|image_start|> 200080`, `(grid/4) x <|patch|> 200092`, `<|image_end|> 200081`; video is
+`<|vid_start|>`, then per frame group `Time: {t:.1f}s` (tokenised text), the group's `<|video|>
+200091` tokens and a `<|vid_frame_separator|> 200087`, and `<|vid_end|> 200083` last, fps 2.0 at
+96 frames with a 144-token per-group budget.
+
+The tower differs from Qwen-VL's (`rad_block_vit.h`) in five ways, each visible in
+`rad_block_museglimmer_vision.h`:
+
+- **Window attention is a permutation, not a banded mask.** `window_order` computes the
+  InternVL-style reorder (windows of `pos_emb_height` = 32 patches a side, partitioned per frame,
+  ragged edges kept as smaller windows) from the coordinate planes, plus its inverse, the rope
+  positions and the per-window cu. Full-attention layers pass the frame `cu` unchanged: the
+  permutation moves rows within a frame, so frame boundaries survive it. Blocks run in window
+  order; the inverse gather restores it before `ln_post`.
+- **The rope positions are (col + 1, row + 1)**, not (row, col): the reference flips the two
+  components and offsets by one (`position_ids.flip(-1) + 1`). `window_order` emits them ready.
+- **The position table is resampled with zero-padding bilinear** (`grid_embed_pad`): at
+  half-pixel centres, align_corners=False, taps beyond the 32x32 table weighted zero. `grid_embed`
+  (Qwen-VL's) clamps to the border instead; they agree only at grids at or below the table.
+- **The merge is the reference's `pixel_shuffle`.** `pixtral_merge` folds each 2x2 block's four
+  patch rows into one row of 4 x width with the channels interleaved
+  (`[block, 4, width].permute(0, 2, 1)`); four consecutive rows concatenated instead would be a
+  different tensor, and the adapter's first linear (whose weights are trained on the interleaved
+  form) would read a permuted image.
+- **The DFlash drafter is declared from the same container** (`rad_block_muse_dflash.h`), when the
+  conversion merged `meta-models/Muse-Glimmer-30B-assistant` under `draft.` (`rad-convert
+  --draft-model`). Five plain layers over the residuals of trunk layers 1/13/25/37/49, SwiGLU,
+  per-head q/k gains, no attention gate, no Markov head and no candidate selector: the head is the
+  trunk's own `output.weight` and the proposal is its plain argmax over the last `block_size - 1`
+  rows (the anchor row predicts nothing, so `steps()` is 15 of a 16-row block). It shards with the
+  trunk at tp (q/k/v/gate_up by rows, o/down by columns, an all_reduce after each; the block's rows
+  embed from the trunk's vocab-sharded table, so the partial lookup gets an exact all_reduce of its
+  own, like the trunk's embedding) and its argmax
+  is distributed over the vocab-sharded head (`row_topk` with `vocab_off` → `all_gather` →
+  `pair_argmax`); buffers are sized by `max_seqs * steps` and the head reads the predicting rows
+  through `out_ids`, so batches draft side by side.
+  Its seven matrices are block fp8 / MXFP4 like the trunk's (the recipe's `dspark.*` rules;
+  `DenseFP8`, an E4M3 activation per row and 128 of K), which is what the 53-tensor assistant
+  release is not: converted without them it stayed bf16 and 4.76 GiB of the 26.5 GiB container,
+  read in full every draft step. It also declares a **short block** of 4 rows / 3 drafts
+  (`rad_drafter_short_block`; `--draft-short-from 2`), since the same graph is ranged by rows.
+  Measured on one 30B trunk card (`museglimmer-30b-nvfp4.rad` and the drafter container, 300-token
+  prompts, spec against the trunk's own no-speculation numbers):
+
+  | | tp 1 b1 | tp 1 b4 (aggregate) | tp 2 b1 | tp 2 b2 | tp 2 b4 |
+  |---|---|---|---|---|---|
+  | no drafter | 51.7 | 51.5 (206) | 52.1 | 51.4 (103) | 51.4 (206) |
+  | bf16 drafter | 57.2 | 51.5 (202) | 57.2 | 32.7 (130) | 32.7 (130) |
+  | block fp8 / MXFP4 drafter | **89.9** | **57.0 (228)** | **65.5** | **55.0 (110)** | 41.7 (167) |
+
+  The tp 2 b2/b4 rows of the quantised drafter measured the batched drafts while they were broken
+  (the shifted read below scored each sequence's neighbour's anchor as its first draft, so batched
+  acceptance sat near single digits and the drafter paid pure overhead). With the head reading
+  `out_ids`, batched acceptance returns to single-stream levels: measured on the NVFP4 +
+  quantised-drafter container at tp 2, 500-token answers, four streams, **18.0-19.9%** acceptance
+  and **196-208 tok/s wall** against **52.3 tok/s a stream** on the drafter-less container; single
+  stream runs **121-205 tok/s, 2.3-3.9x** the drafter-less container's 52.3.
+
+  The bf16 drafter paid 4.76 GiB of read a draft step, which dominated the step and is why tp 2's
+  batches lost; quantising it takes that to 1.42 GiB and the container from 26.51 to 23.17 GiB.
+  The two remaining losses at tp 2/b4 (~38 ms a speculative step against 19.8 ms plain, with the
+  short block at either 4 or 2 rows) are the drafter's per-step work, not its read.
+  **The workload sets the win.** Fresh prose is the drafter's floor and a rewrite/transcription task
+  its ceiling: tp 2, one stream, per stream 52.1 -> 60.7 tok/s on prose, 52.1 -> 76.3 on a Python
+  script written from scratch, 51.9 -> 86.4 on a script reproduced and re-documented, with the
+  draft-acceptance metric reading 3.7% / ~6% / 8.5% on those three. At two sequences the same
+  order holds (+8% / +1% / +36%), and at four the drafter loses in all three (~40-42 against
+  ~49-50), which is the step's fixed cost, not the text.
+  **The head reads the scheduler's `out_ids`**, gathered out of the staged block (`w.hg`): one
+  query-pass entry per drafting sequence, `block` rows, and `out_ids` its last `depth` rows (the
+  scheduler's block_query fills them from each entry's own `hidden_row`). "The last `depth` rows
+  of the staged block" -- an earlier read, kept when a chunked prefill handed `out_ids` that were
+  not block-local -- coincides with `out_ids` only while every staged sequence drafts; at two or
+  more it drops each sequence's first mask row and scores its neighbour's anchor row, whose
+  logits pose as that sequence's first draft. Measured, one card on the rewrite task single
+  stream: **108.5 tok/s** (2.09x the 51.9 the same prompt gets with no drafter), position-0
+  acceptance 79.8%; at four streams the shifted read's acceptance collapses to a few percent
+  while the text stays clean, because every rejected draft changes no token.
+  **Fusions.** `gate_up|silu|quantise` is one launch (`gemm_nt_q_gated_mx` over the MXFP4 weight,
+  `gemm_nt_q_gated` over block fp8), verified and measured: tp 2 b1/b2/b4 64.9/55.6/42.5 tok/s
+  against 65.5/55.0/41.7 unfused -- equal within noise, so ten fewer launches a step is not what
+  the speculative step spends its ~38 ms on. `rmsnorm_quant_fp8` (norm + quantise in one launch)
+  is *not* usable here: declaring it makes the engine lay the drafter's fp8 attention weights out
+  in `r4d.fp8.w.frag64`, and a weight in that form cannot be read where it lies, so a weight the
+  planner puts on the mapped tier refuses to start ('...was placed on the mapped tier ... its
+  stored form is not the container's'). Reproduced with and without the `rad_op_declared` probe,
+  with the gated fold on and off; not with it undeclared.
+- **The adapter activates twice**: `gelu(fc2(gelu(fc1(x))))`, then a bias-less projection to the
+  text width, then a weightless RMS norm (`perception_emb_norm`, the text model's eps) before the
+  rows scatter into the embedding.
+- **The vision layer rule counts from the first block and always makes the last full** (the
+  reference config's derivation); the shipped array is checked against that rule and a
+  disagreement is refused.
+
+**Linears.** Each trunk weight is served as its encoding stores it:
+
+| recipe rule | served | activation |
+|---|---|---|
+| none (bf16) | `gemm_nt` | bf16 |
+| `codes=u4\\|u5 zero=u8 group=128 scale=f16` (CT-INT4) | `gemm_nt_q` w4a8i8_asym, decode band at w4a16_asym | int8, a scale per (row, 128) (`quant_act_i8g`) |
+| `codes=i8 group=128 scale=bf16` | `gemm_nt_q` i8a8 | int8, an f32 scale per (row, 128) (`quant_act_i8g`) |
+| `codes=i4\\|i8 group=128 scale=f16` (`museglimmer-30b-w4a8.recipe`) | `gemm_nt_q` w4a8 / w8a8 | int8, one scale a row (`quant_act_i8`; the grouped producer paired with these GEMMs makes NaN logits, as in gemma4_bf16) |
+| `codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128` (IQ8R, `museglimmer-30b-iq8r.recipe`) | `gemm_nt_q` i8a8h, group 256 | int8 rotated 128 wide, an f32 scale per (row, 256): written by the pre-norms (`rmsnorm_had_quant_i8g`) for q, gate, k, v and gate/up, by the gated product (`gated_had_quant_i8g`) for down, by o_proj's own `had_quant_act_i8g` for o |
+
+IQ8R is a whole-trunk form: layer 0's q projection decides it before any activation is declared,
+and every trunk linear of such a container must be IQ8R (one that is not, or an IQ8R linear in a
+trunk whose layer 0 q is not, is refused by name). A layer quantises four times, once per
+distinct linear input: the centered pre-norms write the pair q, gate, k and v share and the one
+gate/up reads; the gated product writes down's and not its bf16 plane (written only when
+`--calib-dir` records the layer). The gated attention output keeps `sigmoid` + `mul` and o_proj
+quantises the product itself, since the fused gate quantiser runs per head and a head (128) is
+narrower than the 256-column scale group. No norm absorbs a collective at tp 2 (the all-reduce
+sits before the post norm), so the all-reduce form of the rotating norm is not declared; the
+linears shard as the other forms do (q, gate, k, v, gate/up by rows, o and down by columns, whole
+256-column groups a rank). Where no loaded library declares a rotating producer (the CPU
+kernels), its plain op runs instead (`rmsnorm`, `silu_mul`) and the first linear reading that input
+quantises it with `had_quant_act_i8g`: q for the four, gate/up, down. The head is plain int8
+(`codes=i8 group=128 scale=bf16`, `logits_gemm_i8`), which the drafter reads as its own head.
+
+The tower's weights are never quantised: a container that quantises them is refused by name.
+
+**Context extension.** The architecture takes it by mechanical means, and takes it well: 13 of
+the 52 layers are full-attention **NoPE** (`layer_rope_theta` 0 -- no positions at all) and the 39
+sliding layers carry rotary over a 2048-wide window, so the rotary is only ever read as in-window
+relative offsets. Serving past the trained 131072 positions is `--max-model-len` alone; the
+engine's warning that nothing scales the rotary is expected and harmless here. Measured at tp 2
+(NVFP4 trunk, quantised drafter, fp8 KV): a **495,145-token** prompt -- three administration
+needles at 20/50/80% of a repetitive hay -- prefills in 272 s (1822 tok/s; the tail chunks slow
+quadratically) and retrieves **all three codes in order**; decode at that depth runs 16 tok/s
+(62 ms/token: attention over 495K keys, the drafter, prompt lookup), and draft acceptance is
+*higher* than at short context (31.8-37.8% -- the repetitive hay suits the drafter and prompt
+lookup alike). For a stronger stretch, `--rope-scaling yarn:FACTOR[:ORIG]` writes YaRN into the
+container's rotary keys at load (llama.cpp's 1M recipe is factor 8 over 131072); the blend lands
+on the sliding layers' rope ops only (`yarn_from` reads the keys into the rope Geom -- the NoPE
+layers have nothing to scale) and the drafter reads its own `draft.rope_parameters`
+(`drafter_geom` already calls `yarn_from` for it). Measured under `yarn:8` at tp 2: a
+**913,130-token** prompt -- the same three needles at 20/50/80% -- prefills in 717 s (1273 tok/s)
+and retrieves **all three codes in order**; decode runs 6.6 tok/s (151 ms/token) with 21.6%
+acceptance. The windows fit the two 32 GB cards beside the weights with fp8 KV: the full pool is
+~1.6 GiB a rank at 495K and ~3.3 at 1M.
+
+---
+
 # `qwenimage21`: Qwen-Image 2.1 and 2.1-Turbo, an image generator
 
 `arch/qwenimage21` declares a generator (`rad_declare_generator`), which makes the program a
@@ -2315,6 +2556,65 @@ FRAME samples one frame of every speech in flight and runs the backbone over its
 plays a lane's newest frames, four at most, as soon as they are made. It is served on
 `/v1/audio/speech` and `/v1/audio/speech/stream` ([GUIDE §5.15](GUIDE.md)), bf16 on one card. The
 checkpoint is the release directory; its codec, in `audio_tokenizer/`, is read with it.
+
+Voice cloning uses the same `/v1/audio/speech` `references` array as drama-3, limited to one
+recording of at most ten seconds, with its exact transcript. Plain cloning uses guidance 1;
+reference-plus-direction also supplies `instructions` (start with guidance 4).
+`arch/breeze/reference.h` declares the tokenizer's encoder in f32: SEANet's causal convolutions
+(ELU, residual bottlenecks, strides 4/5/6/8), eight Mimi transformer layers at 25 Hz (LayerNorm,
+8 heads of 64, causal window 250, GELU feed-forward, learned residual scales), a replicate-padded
+stride-2 convolution, then independent semantic/acoustic input projections and 1+15 Euclidean
+residual quantisation steps. Centroids are EMA sums divided by usage; ties choose the lower code.
+These are the encoder's codebooks, not the decoder's dequantisation tables, and not drama-3's
+cosine quantiser. The encoder weights are included by the updated conversion recipe.
+Its f32 GEMM, LayerNorm, GELU, causal attention and full-head 64-dimensional NeoX rotary have
+device paths too; reference encoding does not depend on host-reference fallbacks. The f32 causal
+strided convolution uses the same FMA tile as the vocoder's f32 convolution.
+
+The clone prompt is `<bos>[S0]transcript`, the reference frames, an audio EOS frame (sixteen
+codebook EOS indices, all zero), then `<bos>[S0]input`. Each text segment is independently encoded
+bidirectionally at position zero. Audio rows are the f32 sum of sixteen backbone codebook
+embeddings rounded once to bf16; they never pass through the text encoder. The backbone attends
+causally over the assembled prompt. At guidance 1 both branches repeat the conditional prompt,
+including its reference-frame map; no reference context is carried into another request.
+Reference direction uses `ref_edit_tata`: the final text segment is
+`<bos>[S0]<ins_bos>instructions<ins_eos>input`; its negative branch is the plain clone prompt
+with the same reference. ABI 38 appends opt-in conditional/negative direction templates to
+`RadAudioGenDecl` and host prompt boundaries to `RadAudioGenBatch`. The driver stages each
+branch's own frame map and the architecture splits text segments at the actual branch boundary,
+not half the pass length. The reference encoder still runs once. This is two-branch CFG, not
+the upstream three-branch dual-guidance scheme. Engine and plugins must be rebuilt together;
+the already-updated cloning weights do not need another conversion for direction.
+`rvq_embed` reads codebook zero from its first table and codebooks 1..15 from its second:
+the latter is a view starting at row 2051 of the shared table, just as for generated-frame
+feedback. This applies to both reference frames and their audio EOS; passing the full table
+twice shifts fifteen codebooks and corrupts the conditioning even when encoder codes are right.
+
+Native cloning verification (2026-11-10, one R9700): all 688 codec indices of a synthetic
+3.44-second reference agreed with the upstream Mimi encoder. With an eight-second recording,
+the assembled reference-audio and EOS embeddings matched an independent PyTorch calculation
+exactly after correcting the residual-table view. Independently encoded text segments differed
+by about 1.1% relative L2 (cosine >0.9999); both prompt branches were byte-identical. The
+architecture recording test checks the table view for both reference frames and EOS.
+Fourteen device checks cover the encoder primitives, including Euclidean/tie behaviour,
+pitched guards, f32 causal strided convolutions and attention against a double softmax oracle.
+These checks do not constitute a speaker-similarity benchmark; listening evaluation is separate.
+The corrected eight-second-reference clone was subsequently approved by the local listener as
+matching the supplied voice. This is one subjective evaluation, not broad speaker/language
+coverage. Through the local manager on a warm R9700, 2.80 seconds of cloned speech completed in
+1.85 seconds (1.80 seconds on repeat), about 1.5 times real-time playback speed. Live PCM and
+SSE completed in 1.80 seconds each. These are whole-response times, including reference encoding
+and transfer, not measurements of time to first audio. The same seed reproduced the WAV bytes.
+Reference direction was also verified locally with the same eight-second reference and text:
+plain cloning made 9.92 seconds of speech in 6.15 seconds (RTF 0.620); soft/slow direction made
+11.44 seconds in 7.01 seconds (0.612); bright/energetic made 8.40 seconds in 5.19 seconds (0.618).
+First PCM/SSE audio arrived in about 0.27 seconds through the manager. A subsequent angry
+direction made 9.76 seconds in 6.03 seconds (0.618). The local listener approved soft, bright
+and angry delivery with the cloned voice. These are single-reference subjective checks, not
+general speaker/language validation. Plain cloning remained byte-identical to its previously
+approved native sample, and fixed-seed directed WAVs reproduced byte for byte. Host ABI,
+builder, speech, driver and architecture suites, fourteen reference GPU checks, live PCM/SSE,
+and real browser direction/reset-to-plain-clone tests passed. Lower RTF is faster.
 
 ```
 text      T5Gemma 2's text encoder in Gemma 3 1B's shape: 26 layers of 1152, 4 query heads over one

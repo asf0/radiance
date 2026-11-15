@@ -206,6 +206,8 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `hc_project` | `M`(range) `n` `hc` `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
 | `layernorm` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `w`w, `b`w? → `y` |
 | `grid_embed` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
+| `grid_embed_pad` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
+| `window_order` | `M`(range) `window` | `coord`, `cu` → `idx`, `inv`, `pos`, `cuw` |
 | `grid_embed_aa` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
 | `grid_embed_cpe` | `M`(range) `n` `side` `dtype` `n_prefix`/opt | `x`:inout, `table`w, `coord`, `prefix`w? |
 | `add` | `M`(range) `n` `dtype` `div`:f64/opt | `a`, `b` → `y` |
@@ -338,6 +340,29 @@ layers cannot be zeroed once a step, and a memset knows neither the row pitch no
 is `[4, M]` (row, column, grid height, grid width); sampling is bilinear with the grid's corners on
 the table's (align_corners), edge taps clamped, the four taps summed in f32 and rounded to `x`'s
 dtype before the add.
+
+**`grid_embed_pad`** adds the same table with the same operands in the half-pixel-centre form
+(align_corners=False) under grid_sample's `padding_mode="zeros"`: per axis taps at `floor(src)` and
+`floor(src) + 1` of `src = (i + 0.5) * side / size - 0.5`, each carrying the hat weight
+`(1 - |src - tap|)+`, and a tap whose UNCLAMPED index falls outside `[0, side)` contributes zero
+rather than reading a clamped edge. The taps are summed in f32 in `grid_embed`'s order and rounded
+the same way. For a grid no larger than the table no tap is ever out of range and the op is
+`grid_embed`'s function at the different sample positions; it differs from it materially only when
+a grid upsamples past the table, which is the common case for Muse (448 px and larger images).
+
+**`window_order`** computes the window-attention permutation of one encoder pass, entirely from
+on-device coordinates: HF's `get_vision_window_index` as a gather-index computation over the packed
+pass. `coord` is `[4, P]` i32 (row, column, segment height, segment width per patch) and `cu` is
+`[S+1]` i32, the per-frame segment boundaries. Windows of `window` patches partition each segment
+(one segment == one frame), scanned window-row-major, ragged at the segment's right and bottom
+edges; patches keep raster order within a window and windows never span segments. The outputs are
+i32: `idx` `[P]`, slot -> source patch (the gather index: `permuted[slot] = x[src[idx[slot]]]`);
+`inv` `[P]`, its inverse, used to undo at the tower's end; `pos` `[2, P]`, each slot's rope
+positions `(col + 1, row + 1)`, laid out component-major like the coordinate planes (Muse's rotary
+wants the axes swapped and offset by one relative to them, HF's `position_ids.flip(-1) + 1`); and
+`cuw` `[P+1]`, the cumulative window boundaries in the permuted order, `n_windows + 1` entries
+used. `M` is the patches this pass covers; slots past `M` are the identity. `window` <= 0 makes the
+permutation the identity and `cuw = cu`.
 
 **`grid_embed_aa`** is the same addition with SigLIP2's resample, torch's
 `F.interpolate(mode="bilinear", align_corners=False, antialias=True)`: per axis a triangle filter on
@@ -1448,6 +1473,8 @@ libref function says which (`libref/ref_audio.cpp`).
 | `cfg_topk_sample` | `M`(range) `n_vocab` `k` `rep` `cond_k`/opt `cfg`:f64 `temp`:f64/opt `stream` `dtype` `sup_lo`/opt `sup_hi`/opt `penalty`:f64/opt `top_p`:f64/opt | `logits`, `seed`, `frame` → `ids`; `cfg`?, `lane`?, `hist`:inout? |
 | `rvq_embed` | `M`(range) `n_embd` `n_codes` `vocab` `off0` `scale`:f64 `dtype` `round`/opt `clamp`/opt | `codes`, `t0`w, `t1`w → `y` |
 | `vq_encode` | `M`(range) `n` `dim` `bins` `dtype` | `x`:inout, `in_w`w, `in_b`w, `cb`w, `out_w`w, `out_b`w → `codes` |
+| `vq_euclidean` | `M`(range) `n` `bins` `dtype` | `x`:inout, `cb`w → `codes` |
+| `elu` | `M`(range) `n` `dtype` | `x` → `y` |
 | `frame_mix_store` | `M`(range) `n_embd` `L` `stride` `rep`/opt `dtype` | `hid`, `logits`w, `scale`w, `lane`, `frame`, `status`, `dst`:inout |
 | `end_status` | `M`(range) `end` `rep` | `ids`, `lane`, `status`:inout |
 | `ras_pick` | `M`(range) `win` `lo` `hi` `rep`/opt `clear`/opt | `first`, `alt`, `lane`, `hist`:inout → `ids` |
@@ -1503,6 +1530,20 @@ conditional first, then the unconditional) are consecutive rows, `rep` of them a
   `x -= out_w cb[code] + out_b` (`out_w` `[n, dim]`, the raw codebook row), rounded once into `x`.
   f32 arithmetic. A chain of these over a codec's codebooks, each quantising what the last left, is
   its residual quantiser.
+- `vq_euclidean`: Mimi's RVQ step (Breeze's reference encoder), after the enclosing split
+  quantiser's input projection. For each row of `x` `[rows, n]`, choose the nearest row of `cb`
+  `[bins, n]` by squared Euclidean distance in f32, ties to the lower index; write that index to
+  `codes` i32 at its own stride, and subtract the chosen centroid from `x`. No normalisation and
+  no per-codebook projections; the semantic and acoustic residual chains are independent. The
+  device kernel supports f32, one workgroup a row, `n <= 4096`, `bins <= 65536`.
+- `elu`: `y = x >= 0 ? x : expm1(x)`, alpha 1, at each operand's row pitch. In-place use is valid.
+  The device kernel supports f32 (Breeze's reference encoder).
+
+The reference encoder also uses f32 device forms of ordinary `gemm_nt`, `layernorm` (up to 4096
+channels), exact-erf `gelu` and `attn_dense` (causal, head dimension 64, GQA 1, at most 512 rows).
+The existing `rope` entry dispatches f32 inputs to the full-head 64-dimensional NeoX form with
+one-component positions and no YaRN or Llama-3 scaling. Causal strided `conv1d` supports f32 as
+well as bf16; the explicit symmetric `pad` form remains bf16-only.
 - `frame_store`: `dst[(lane n_codes + k) stride + frame - skip] = codes[k, rep i]` for every `k`,
   when `frame >= skip` and `status[lane] >= 0`: a frame's codes into its lane's history, each
   codebook a row over the lane's frames, so a run of a lane's frames is a block of `n_codes`

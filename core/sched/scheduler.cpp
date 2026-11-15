@@ -57,6 +57,15 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     cfg_ = cfg;
     kv_ = kv;
     pc_ = pc;
+    /* THE STEP RECORD EXISTS ONLY FOR --diagnose. Sized here, once, and never on the serving
+     * path: 64 Ki steps is minutes of decode at any step rate this engine reaches and 2.5 MiB, and
+     * a record a step is work a serving process has no reader for. A reader that falls further
+     * behind is told how many it lost, not handed the wrong ones. The recorder is chosen here so
+     * the step path calls one instead of testing the mode on every step. */
+    if (cfg_.diagnose_mode()) {
+        step_ring_.reset(1u << 16);
+        record_step_ = &Scheduler::record_step;
+    }
 
     /* The engine resolves the geometry once, because the prefix cache needs its checkpoint
      * interval first; a caller without one (tests) resolves its own from prog and cfg. Both
@@ -143,10 +152,48 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                  "prompt unfinished while other sequences decode, decode-only steps follow for up "
                  "to %.2f of the chunk step's measured time (at most %lld steps)",
                  cfg.prefill_interleave_share, (long long)kInterleaveAutoMax);
+    mixed_target_.reset();
+    m_.mixed_step_target_prefill_cap = 0;
+    if (cfg.mixed_step_target_ms > 0) {
+        const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
+        /* A mixed step never receives a span's wide lone-prefill budget. Validate the same
+         * shared budget step() will use, or a spanned deployment can start even though no legal
+         * prefill quantum fits beside a decoder. */
+        const int64_t mixed_budget = geo_.shared_tok;
+        const int64_t draft_rows = 1 + std::max<int64_t>(cfg.n_spec, 0);
+        const int64_t mixed_floor = cfg.max_seqs > 1 ? Q + draft_rows : 0;
+        if ((cfg.busy_prefill_chunk > 0 && cfg.busy_prefill_chunk < Q) ||
+            (mixed_floor > 0 && mixed_budget < mixed_floor)) {
+            RAD_ERR("--mixed-step-target-ms needs room for one legal prefill quantum and "
+                    "the active decode rows: quantum=%lld, max_seqs=%lld, draft_rows=%lld, "
+                    "mixed_step_budget=%lld, max_num_batched_tokens=%lld, busy_prefill_chunk=%lld",
+                    (long long)Q, (long long)cfg.max_seqs, (long long)draft_rows,
+                    (long long)mixed_budget,
+                    (long long)cfg.max_tok, (long long)cfg.busy_prefill_chunk);
+            return RAD_E_INVAL;
+        }
+        const int64_t max_prefill_quanta = mixed_budget > draft_rows
+            ? (mixed_budget - draft_rows) / Q : 0;
+        if (cfg.max_seqs > 1 && cfg.max_seqs - 1 > max_prefill_quanta)
+            RAD_WARN("--mixed-step-target-ms: this batch budget can carry at most %lld legal "
+                     "prefill quantum(s) beside a speculative decode row; with more simultaneous "
+                     "prefills, priority and arrival order continue across later steps",
+                     (long long)max_prefill_quanta);
+        mixed_target_.seed(std::max<int64_t>(Q, geo_.shared_tok / 4), Q, geo_.shared_tok);
+        m_.mixed_step_target_prefill_cap = mixed_target_.cap();
+        RAD_INFO("scheduler: --mixed-step-target-ms %lld: completed mixed steps teach an adaptive "
+                 "aggregate prefill-row cap; while another sequence decodes the cap starts at "
+                 "%lld rows and aims for a full mixed-step duration near %lld ms (a soft target)",
+                 (long long)cfg.mixed_step_target_ms, (long long)mixed_target_.cap(),
+                 (long long)cfg.mixed_step_target_ms);
+    }
     interleave_left_ = 0;
     ema_chunk_s_ = 0.0;
     ema_decode_s_ = 0.0;
     held_prefill_ = 0;
+    mixed_target_active_ = false;
+    mixed_target_prefill_planned_ = 0;
+    mixed_target_prefill_continues_ = false;
     draft_refill_ = 0;
     if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
         hit_holes_draft_) {
@@ -1298,23 +1345,24 @@ void Scheduler::set_stage_rows(int64_t rows) {
  * about the size of the reserve, as the next step's whole chunk. When that would be under the
  * floor, the interval is split into two chunks at or above the floor instead. */
 int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget,
-                            int64_t reserve, bool shared, bool rows_only) const {
+                            int64_t reserve, bool shared, bool rows_only,
+                            int64_t mixed_target_shares, int64_t mixed_target_decode_reserve) const {
     const int64_t mode = cfg_.busy_prefill_chunk;
-    if (mode == 0 || budget <= 0) return budget;
+    if (budget <= 0 || (mode == 0 && !mixed_target_active_)) return budget;
     /* Auto holds a chunk back only for work that would otherwise get nothing this step: rows
      * behind it, or a request waiting to start. Rows planned ahead of it are in the step anyway.
      * An explicit N trades prefill speed for every other row's latency, so it applies whenever
      * the chunk shares the step. */
-    if (reserve <= 0 && !(mode > 0 && shared)) return budget;
+    if (reserve <= 0 && !(mode > 0 && shared) && !(mixed_target_active_ && shared)) return budget;
     reserve = std::max<int64_t>(reserve, 0);
     const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
 
-    int64_t cap = budget - reserve;
+    int64_t cap = mode == 0 ? budget : budget - reserve;
     if (mode > 0) {
         /* The operator's number, with no floor; set_stage_rows warns when it is under the
          * stager's step. */
         cap = std::min(cap, mode);
-    } else {
+    } else if (mode < 0) {
         const int64_t floor = std::max(Q, stage_rows_ / Q * Q);
         cap = std::max(cap, floor);
         const int64_t remaining = n_target - n_computed;
@@ -1330,6 +1378,25 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
          * for a share (a waiting request, another prefill), which lasts a step or two. */
         if (!rows_only && cap < span && span - cap < floor && span - floor >= floor)
             cap = span - floor;
+    }
+    /* Apply the decoder reservation after the auto staging floor. Otherwise the floor can raise
+     * a reduced cap back to the whole budget, exclude the decoder, and prevent feedback. */
+    if (mixed_target_active_ && mixed_target_decode_reserve > 0)
+        cap = std::min(cap, budget - mixed_target_decode_reserve);
+    if (mixed_target_active_ && mixed_target_.cap() > 0) {
+        mixed_target_shares = std::max<int64_t>(0, mixed_target_shares);
+        /* Share the aggregate allowance evenly among this prefill and those expected later in
+         * the step. Stable queue order must not let the first request consume the cap while the
+         * others receive only a minimum quantum on every step. If the learned cap cannot hold
+         * one quantum apiece, the effective allowance grows just enough to make progress; this
+         * may miss an impossible target, but it cannot silently starve a queued prompt. */
+        const int64_t floor = mixed_target_prefill_planned_ + (mixed_target_shares + 1) * Q;
+        const int64_t allowance = std::max(mixed_target_.cap(), floor);
+        const int64_t left = std::max<int64_t>(0, allowance - mixed_target_prefill_planned_);
+        const int64_t participants = mixed_target_shares + 1;
+        const int64_t fair = left / participants / Q * Q;
+        if (fair < Q || cap < Q) return 0;
+        cap = std::min(cap, fair);
     }
     return std::min(std::max(cap, Q), budget);
 }
@@ -1397,7 +1464,8 @@ bool Scheduler::preempt_back() {
 /* ------------------------------------------------------------------ admission */
 /* Admission checks the KV budget before a request enters running; a request admitted without the
  * blocks to run would be preempted on its first step, a full recompute for nothing. */
-int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
+int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
+                         int64_t mixed_target_shares) {
     Request& r = *s.req;
 
     /* A REQUEST THAT WAS PREEMPTED WAITS FOR ROOM FOR THE WHOLE RECOMPUTE, plus one block of
@@ -1622,11 +1690,13 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         /* An admission shares the step the same way: otherwise a cold prompt with requests
          * queued behind it takes every token left. The hit is known by now, so the cap applies
          * to what really has to run. */
-        const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty());
+        const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty(),
+                                     false, mixed_target_shares, 0);
         const int64_t end = chunk_end(r, target);
         want = plan_chunk(r.n_computed, end, cap, &ckpt, r.checkpoint_at, &r);
         /* A run read both ways (bidi_fit) the share cannot hold takes the step instead. */
-        if (want <= 0 && cap < budget && prog_->encoder.bidirectional)
+        if (want <= 0 && cap < budget && prog_->encoder.bidirectional &&
+            (!mixed_target_active_ || r.media))
             want = plan_chunk(r.n_computed, end, budget, &ckpt, r.checkpoint_at, &r);
         else if (cap < budget && want > 0)
             admit_full_ = plan_chunk(r.n_computed, end, budget, nullptr, r.checkpoint_at, &r);
@@ -1775,6 +1845,8 @@ const RadBatch* Scheduler::step() {
     plan_.spec_is_tree = tree_;
     step_prefill_tok_ = 0;
     step_decode_tok_ = 0;
+    mixed_target_prefill_planned_ = 0;
+    mixed_target_prefill_continues_ = false;
 
     /* A preempted prefill waits for the whole-recompute gate so it cannot loop. That wait is
      * bounded here, for every overdue preempted request, not only the queue head: a head that
@@ -1865,7 +1937,7 @@ const RadBatch* Scheduler::step() {
     bool any_decoding = false;
     bool hold_prefill = false;
     held_prefill_ = 0;
-    if (cfg_.prefill_interleave != 0) {
+    if (cfg_.prefill_interleave != 0 || cfg_.mixed_step_target_ms > 0) {
         for (int32_t slot : running_) {
             const SchedReq& s = *reqs_[(size_t)slot];
             if (!s.req || !s.running) continue;
@@ -1875,8 +1947,9 @@ const RadBatch* Scheduler::step() {
             break;
         }
         if (!any_decoding) interleave_left_ = 0;
-        hold_prefill = interleave_left_ > 0;
+        hold_prefill = cfg_.prefill_interleave != 0 && interleave_left_ > 0;
     }
+    mixed_target_active_ = cfg_.mixed_step_target_ms > 0 && any_decoding;
 
     /* A span is for a prefill alone in its step (ChunkGeometry::span). A spanned step takes as
      * long as the intervals it carries, so a decode row riding along would wait that long for its
@@ -1920,7 +1993,7 @@ const RadBatch* Scheduler::step() {
      * to be walked needs 1 + the deepest window it can take, each prefill row a share, plus one
      * share when a request waits and a slot is free. Counted down as the loop walks, so a row's
      * reserve is what is behind it. */
-    const bool share_step = cfg_.busy_prefill_chunk != 0;
+    const bool share_step = cfg_.busy_prefill_chunk != 0 || mixed_target_active_;
     const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
     /* An eighth of this step's budget, which under a span is shared_tok for a shared step. */
     const int64_t share_tok = std::max<int64_t>(Q, budget / 8 / Q * Q);
@@ -1934,6 +2007,10 @@ const RadBatch* Scheduler::step() {
             if (pf) ++behind_pf; else behind_dec += dec_row_tok;
         }
     }
+    const int64_t admit_room = std::min<int64_t>(
+        (int64_t)free_cards_.size(), cfg_.max_seqs - (int64_t)running_.size());
+    const int64_t mixed_target_waits = mixed_target_active_
+        ? std::min<int64_t>((int64_t)waiting_.size(), std::max<int64_t>(0, admit_room)) : 0;
     const bool admit_waits = share_step && !waiting_.empty() && !free_cards_.empty() &&
                              (int64_t)running_.size() < cfg_.max_seqs;
     /* The first prefill chunk held back this step (its index in plan_.e before the sort) and what
@@ -1977,13 +2054,15 @@ const RadBatch* Scheduler::step() {
         if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
         if (prefill) {
             const int64_t shares = share_step ? behind_pf + (admit_waits ? 1 : 0) : 0;
+            const int64_t mixed_target_shares = mixed_target_active_ ? behind_pf + mixed_target_waits : 0;
             const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
             const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty(),
-                                         /*rows_only=*/shares == 0);
+                                         /*rows_only=*/shares == 0, mixed_target_shares, behind_dec);
             const int64_t end = chunk_end(r, target);
             want = plan_chunk(r.n_computed, end, cap, &ckpt, r.checkpoint_at, &r);
             /* A run read both ways (bidi_fit) the share cannot hold takes the step instead. */
-            if (want <= 0 && cap < budget && prog_->encoder.bidirectional)
+            if (want <= 0 && cap < budget && prog_->encoder.bidirectional &&
+                (!mixed_target_active_ || r.media))
                 want = plan_chunk(r.n_computed, end, budget, &ckpt, r.checkpoint_at, &r);
             else if (cap < budget && want > 0 && capped_at < 0) {
                 const int64_t full = plan_chunk(r.n_computed, end, budget, nullptr,
@@ -2129,6 +2208,9 @@ const RadBatch* Scheduler::step() {
         s.sched_tokens = (int32_t)want;
         plan_.e.push_back(e);
         plan_.n_tok += want;
+        if (prefill && mixed_target_active_) {
+            mixed_target_prefill_planned_ += want;
+        }
         if (!prefill && s.n_draft > plan_.n_spec) plan_.n_spec = s.n_draft;
         budget -= want;
         ++i;
@@ -2173,7 +2255,15 @@ const RadBatch* Scheduler::step() {
                     ? share_tok : 0;
             admit_full_ = 0;
             admit_next_step_ = false;
-            const int as = admit_one(s, budget, areserve);
+            const int64_t mixed_target_shares = mixed_target_active_
+                ? std::min<int64_t>(
+                    (int64_t)waiting_.size() - (int64_t)at - 1,
+                    std::min<int64_t>(
+                        cfg_.max_seqs - (int64_t)plan_.e.size() - 1,
+                        (int64_t)free_cards_.size() - 1))
+                : 0;
+            const int as = admit_one(s, budget, areserve,
+                                     std::max<int64_t>(0, mixed_target_shares));
             /* A preempted request waiting for its whole-recompute gate lets the next one be asked;
              * an overdue one does not. The room the overdue path made this step is for it, and a
              * request queued behind it would take that room back: a victim just forced off for it,
@@ -2237,6 +2327,9 @@ const RadBatch* Scheduler::step() {
             s.entry = (int32_t)plan_.e.size();
             plan_.e.push_back(e);
             plan_.n_tok += s.sched_tokens;
+            if (mixed_target_active_) {
+                mixed_target_prefill_planned_ += s.sched_tokens;
+            }
             budget -= s.sched_tokens;
             took_.push_back(at);
             ++at;
@@ -2266,6 +2359,11 @@ const RadBatch* Scheduler::step() {
          * to it at most. */
         int64_t limit = std::min(capped_full, had + budget);
         if (cfg_.busy_prefill_chunk > 0) limit = std::min(limit, std::max(had, cfg_.busy_prefill_chunk));
+        if (mixed_target_active_ && mixed_target_.cap() > 0) {
+            const int64_t other = std::max<int64_t>(0, mixed_target_prefill_planned_ - had);
+            const int64_t left = std::max<int64_t>(0, mixed_target_.cap() - other);
+            limit = std::min(limit, std::max(had, left));
+        }
         int64_t ckpt = -1;
         const int64_t grown = e.ckpt_slot < 0 && limit > had
             ? plan_chunk(r.n_computed, chunk_end(r, s.seq_len()), limit, &ckpt, r.checkpoint_at, &r)
@@ -2276,6 +2374,7 @@ const RadBatch* Scheduler::step() {
             if (ckpt > 0) reserve_ckpt(e, r, ckpt, (int32_t)(ckpt - r.n_computed - 1));
             s.sched_tokens = (int32_t)grown;
             plan_.n_tok += grown - had;
+            if (mixed_target_active_) mixed_target_prefill_planned_ += grown - had;
             budget -= grown - had;
         }
         if (e.n_tokens < capped_full) ++m_.prefill_chunks_capped;
@@ -2313,6 +2412,11 @@ const RadBatch* Scheduler::step() {
     plan_.phase = any_pf && n_dec ? RAD_PHASE_MIXED
                 : any_pf         ? RAD_PHASE_PREFILL
                                  : RAD_PHASE_DECODE;
+    if (mixed_target_active_) {
+        mixed_target_prefill_continues_ = false;
+        for (const StepEntry& e : plan_.e)
+            if (e.is_prefill && !e.produces_token) mixed_target_prefill_continues_ = true;
+    }
 
     /* Step-shape counters. `steps_mixed` / `steps` shows how often a step carries both kinds of
      * row. `decode_rows_unspeculated` counts every decode row that took no draft, whatever the
@@ -2907,6 +3011,18 @@ int Scheduler::commit(StepResult& res) {
  *
  * Host timing, always available. Per-op device timing adds synchronisations that change the
  * mover's slot supply, so profiled runs are not comparable (spec §16). */
+void Scheduler::record_step(int64_t ns, int64_t end_ns) {
+    diag::StepRecord r;
+    r.step = m_.steps;
+    r.phase = plan_.phase;
+    r.n_seq = (int32_t)plan_.e.size();
+    r.prefill_tok = (int32_t)step_prefill_tok_;
+    r.decode_tok = (int32_t)step_decode_tok_;
+    r.ns = ns;
+    r.end_ns = end_ns;
+    step_ring_.push(r);
+}
+
 void Scheduler::step_finished() {
     std::lock_guard<std::mutex> lk(mu_);
     if (step_start_.time_since_epoch().count() == 0) return;   /* no step has run */
@@ -2915,6 +3031,9 @@ void Scheduler::step_finished() {
     const int64_t ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(step_end - step_start_).count();
     m_.step_ns += ns;
+    mixed_target_observe_locked(ns);
+    (this->*record_step_)(ns, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  step_end.time_since_epoch()).count());
     if (plan_.phase == RAD_PHASE_DECODE) {
         m_.step_ns_decode += ns;
         /* The single-sequence floor over the step just timed (rad::DecodeFloor). A mixed step
@@ -2970,6 +3089,48 @@ void Scheduler::step_finished() {
     last_step_at_ = step_end;
     /* So a second call, or one on a loop iteration that ran no step, charges nothing. */
     step_start_ = {};
+}
+
+/* The mixed-step target's one timing entry point. `step_finished` supplies the live bracket;
+ * note_mixed_step_cost supplies a deterministic bracket to scheduler tests and host simulations. */
+void Scheduler::mixed_target_observe_locked(int64_t ns) {
+    int64_t rows = 0;
+    for (const StepEntry& e : plan_.e) if (e.is_prefill) rows += e.n_tokens;
+    if (cfg_.mixed_step_target_ms <= 0 || plan_.phase != RAD_PHASE_MIXED ||
+        rows <= 0 || plan_.n_seq_decode <= 0 || ns <= 0) return;
+
+    const int64_t target_ns = cfg_.mixed_step_target_ms * 1000000ll;
+    ++m_.mixed_step_target_steps;
+    if (ns > target_ns) ++m_.mixed_step_target_misses;
+    const int64_t before = mixed_target_.cap();
+    mixed_target_.observe(rows, ns, target_ns, std::max<int64_t>(geo_.quantum, 1),
+                          geo_.shared_tok, mixed_target_prefill_continues_);
+    m_.mixed_step_target_prefill_cap = mixed_target_.cap();
+    if (mixed_target_.cap() != before && (int)log_level() >= (int)Log::Debug)
+        RAD_DEBUG("scheduler: mixed-step target observed %.2f ms over %lld prefill token(s); "
+                  "adaptive mixed-prefill cap %lld -> %lld for a %lld ms target",
+                  (double)ns / 1e6, (long long)rows, (long long)before,
+                  (long long)mixed_target_.cap(), (long long)cfg_.mixed_step_target_ms);
+}
+
+void Scheduler::note_mixed_step_cost(int64_t ns) {
+    std::lock_guard<std::mutex> lk(mu_);
+    mixed_target_observe_locked(ns);
+}
+
+uint64_t Scheduler::step_record_count() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return step_ring_.count();
+}
+
+size_t Scheduler::step_record_capacity() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return step_ring_.capacity();
+}
+
+uint64_t Scheduler::step_records(uint64_t from, std::vector<diag::StepRecord>* out) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return step_ring_.copy_since(from, out);
 }
 
 /* ------------------------------------------------------------------ the serial drafter */

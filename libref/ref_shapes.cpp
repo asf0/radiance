@@ -510,6 +510,22 @@ int ref_grid_embed_aa_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     return o.finish("grid_embed_aa", operand, out);
 }
 
+/* grid_embed_pad's: the same operands and drawing as grid_embed's. */
+int ref_grid_embed_pad_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), side = gi(p, n_p, "side", 0);
+    if (M <= 0 || n <= 0 || side <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, n });              /* x, INOUT */
+    o.t(D, { side * side, n });    /* table */
+    o.t_idx({ 4, M }, side, -1, 0);
+    return o.finish("grid_embed_pad", operand, out);
+}
+
+/* window_order declines: its `crd` rows, segment grids and `cu` boundaries must describe whole
+ * raster grids, and an index draw cannot; avx_check_hand.cpp and the unit tests build them. */
+int ref_window_order_shape(const RadParam*, int, int, RadOpdDesc*) { return RAD_E_UNSUPPORTED; }
+
 /* grid_embed's operands plus the prefix rows; coordinates drawn over the table's side. */
 int ref_grid_embed_cpe_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
@@ -3894,6 +3910,25 @@ int ref_resample_nearest_shape(const RadParam* p, int n_p, int operand, RadOpdDe
     o.t(D, { M / 3 + 1, n });                                 /* x: fewer rows than y */
     o.t(D, { M, n });                                         /* y */
     return o.finish("resample_nearest", operand, out);
+}
+
+int ref_elu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(act_dt(p, n_p), {M, n});
+    o.t(act_dt(p, n_p), {M, n});
+    return o.finish("elu", operand, out);
+}
+
+int ref_vq_euclidean_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), bins = gi(p, n_p, "bins", 0);
+    if (M <= 0 || n <= 0 || bins <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(act_dt(p, n_p), {M, n});
+    o.t(act_dt(p, n_p), {bins, n});
+    o.t_idx({M}, bins, -1, 0);
+    return o.finish("vq_euclidean", operand, out);
 }
 
 int ref_fourier_embed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

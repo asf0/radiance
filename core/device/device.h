@@ -12,6 +12,7 @@
 #include "rad_abi.h"
 #include "rad_device.h"
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <functional>
@@ -446,6 +447,12 @@ std::string dev_dma_lane(int device);
  * dump), or since a queue faulted. Anything advancing again clears it. 0 where the backend cannot
  * tell. */
 int64_t dev_stuck_ms();
+
+/* How long the device may be stuck (dev_stuck_ms) before the backend ends the process, in ms; 0
+ * never. Set from `scheduler.stuck-exit` before serving; a backend that can tell reads it when a
+ * stall is standing. A device that has advanced nothing for a minute is not coming back: the
+ * reported hangs stood for hours, and a stall that clears does so within seconds. */
+extern std::atomic<int64_t> dev_stuck_exit_ms;
 
 /* Longest run of dispatches a played tape leaves unordered. Of any kTapeOverlapRun + 1
  * consecutive packets on a queue one carries the barrier bit, so a launched packet still proves

@@ -372,6 +372,9 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["prefill_chunks_capped"] = m.prefill_chunks_capped;
         o["steps_decode"]    = m.steps_decode;
         o["steps_held"]      = m.steps_held;
+        o["mixed_step_target_steps"] = m.mixed_step_target_steps;
+        o["mixed_step_target_misses"] = m.mixed_step_target_misses;
+        o["mixed_step_target_prefill_cap"] = m.mixed_step_target_prefill_cap;
         /* Time inside steps. The one rate the page cannot derive: wall clock between polls also
          * covers idle time (see SchedMetrics::step_ns). */
         o["step_ns"]         = m.step_ns;

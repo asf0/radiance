@@ -660,6 +660,9 @@ std::vector<Case> build_cases() {
                               HF("theta", 10000.0), HF("eps", 1e-6), HI("rotary_dim", 0),
                               HI("v_norm", 1), HS("dtype", dt) });
         add("grid_embed", { HI("M", 20), HI("n", 72), HI("side", 6), HS("dtype", dt) });
+        /* The zero-padded form: drawn grids never exceed the table, so the off-table masking is
+         * covered by avx_check's hand-built case. */
+        add("grid_embed_pad", { HI("M", 20), HI("n", 72), HI("side", 6), HS("dtype", dt) });
         /* Two table sides. A drawn grid never exceeds the table, so upscaling is covered by
          * avx_check's hand-built case. */
         add("grid_embed_aa", { HI("M", 20), HI("n", 72), HI("side", 16), HS("dtype", dt) });
@@ -1243,6 +1246,13 @@ std::vector<Case> build_cases() {
     }
     add("vq_encode", { HI("M", 3), HI("n", 40), HI("dim", 5), HI("bins", 33),
                        HS("dtype", "f32") });
+    /* Mimi's Euclidean quantiser step at its codebook's shape and at widths that are no
+     * vector's, and the encoder's ELU over a row that is none either. */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("vq_euclidean", { HI("M", 7), HI("n", 256), HI("bins", 2048), HS("dtype", dt) });
+        add("vq_euclidean", { HI("M", 3), HI("n", 37), HI("bins", 33), HS("dtype", dt) });
+        add("elu", { HI("M", 6), HI("n", 645), HS("dtype", dt) });
+    }
     add("frame_store", { HI("M", 2), HI("n_codes", 16), HI("stride", 9), HI("rep", 2),
                          HI("skip", 0) });
     add("frame_store", { HI("M", 4), HI("n_codes", 3), HI("stride", 5), HI("rep", 1),

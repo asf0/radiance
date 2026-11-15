@@ -152,6 +152,14 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
               "or free the card.\n"
             : "Lower --gpu-headroom-mib, lower --max-num-batched-tokens (the arena scales with it), "
               "or free the card.\n";
+        /* KL mode holds a whole-vocabulary row for every scored token and lends no pool back, so
+         * its fixed cost sits far above a serve's at the same flags. Without naming the split, the
+         * operator has no way to know which knob to turn. */
+        const char* kld_hint = cfg.kld()
+            ? "KL mode holds a full-vocabulary logits row for every scored token and lends no pool "
+              "back: pass --gpu-headroom-mib and --host-pool-mib explicitly, and lower "
+              "--max-num-batched-tokens (the logits rows scale with it).\n"
+            : "";
         b.report = fmt(
             "VRAM does not cover the fixed costs before a single pool is sized:\n"
             "  card total         %10s\n"
@@ -169,6 +177,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             humanb(b.headroom).c_str(), humanb(b.arena).c_str(), humanb(b.staging).c_str(),
             humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(),
             humanb(b.prefetch).c_str(), humanb(-b.claimable).c_str(), how);
+        if (*kld_hint) b.report += kld_hint;
         if (log) RAD_ERR("%s", b.report.c_str());
         if (out) *out = b;
         return RAD_E_NOMEM;

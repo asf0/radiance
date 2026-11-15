@@ -403,10 +403,12 @@ int Reader::read_scheduler(const Item& sec, FleetConfig* out) {
         if      (k == "load-timeout")  s = duration(it, &out->load_timeout_ms);
         else if (k == "drain-timeout") s = duration(it, &out->drain_timeout_ms);
         else if (k == "keepalive")     s = duration(it, &out->keepalive_ms);
+        else if (k == "stuck-exit")    s = duration(it, &out->stuck_exit_ms);
         else if (k == "warm-up")       s = boolean(it, &out->warm_up);
         else {
             return fail(it.node, "scheduler." + k + " is not a scheduler key" +
-                                 suggest(k, { "load-timeout", "drain-timeout", "keepalive", "warm-up" }));
+                                 suggest(k, { "load-timeout", "drain-timeout", "keepalive",
+                                              "stuck-exit", "warm-up" }));
         }
         if (s < 0) return s;
     }
@@ -834,6 +836,7 @@ void print_reference(FILE* to) {
         "  load-timeout: DURATION               how long a request waits for its model (default 120s)\n"
         "  drain-timeout: DURATION              how long a model being evicted may finish requests (30s)\n"
         "  keepalive: DURATION                  SSE comment interval while a request waits (10s)\n"
+        "  stuck-exit: DURATION                 a device stuck this long ends the process (60s; 0 never)\n"
         "  warm-up: true|false                  fill free VRAM, then host RAM, with models at start (true)\n"
         "\ndefaults:                              any model key, merged under every model\n"
         "\nmodels:\n"

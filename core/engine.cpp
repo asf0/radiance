@@ -2457,12 +2457,14 @@ void Engine::tier_tick() {
     /* Release an entry once its host copy has landed, if the expert slab can use the blocks; a
      * later turn restores it with a copy. Otherwise (no lending, or the loan already covers every
      * slab slot) it stays in VRAM, and a request needing room takes it through trim. Snapshots
-     * are already in host memory. */
+     * are already in host memory. Stragglers with no host copy coming go too (PrefixCache::
+     * drop_clean): a few thousand such tokens near the top of the pool would otherwise hold the
+     * whole loan at zero until the server restarts. */
     if (lending_) {
         int64_t ceiling = 0;
         for (auto& r : ranks_) ceiling = std::max(ceiling, r->mover.loan_ceiling(Mover::kLendKV));
         const auto lk = sched_.hold();
-        if (lead.kv.loan_tokens() < ceiling) (void)lead.prefix.drop_clean();
+        if (lead.kv.loan_tokens() < ceiling) (void)lead.prefix.drop_clean(ceiling);
     }
 
     /* ---- capacity ---------------------------------------------------------------------------- */
@@ -2842,11 +2844,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         stepped.store(true, std::memory_order_release);
     });
 
-    if (cfg_.kld() || cfg_.calib()) {
+    if (cfg_.kld() || cfg_.calib() || cfg_.diagnose_mode()) {
         print_startup_report(RAD_OK);
         startup_watch_.reset();
     }
-    int s = cfg_.kld() ? run_kld() : cfg_.calib() ? run_calib() : run_server();
+    int s = cfg_.diagnose_mode() ? run_diagnose()
+          : cfg_.kld()           ? run_kld()
+          : cfg_.calib()         ? run_calib()
+                                 : run_server();
     startup_watch_.reset();
 
     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
@@ -3122,6 +3127,11 @@ std::string request_overrides(const Config& c) {
     return out;
 }
 }  /* namespace */
+
+SamplingParams Engine::sampling_defaults() const {
+    return resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);
+}
+
 /* The HTTP server over the engine. `/v1/completions`, `/v1/chat/completions`, `/v1/models`,
  * `/metrics` and `/health` are live. `/v1/embeddings` answers 501 unless the program is an
  * embedding program, and so do image, video and audio content parts unless the program declared an
@@ -3954,6 +3964,8 @@ int Engine::run_server() {
         in.branches = ad.branches == 1 ? 1 : 2;
         in.input_special = ad.input_special != 0;
         in.tmpl_ref = pg.agen_str.tmpl_ref;
+        in.tmpl_ref_instruct = pg.agen_str.tmpl_ref_instruct;
+        in.neg_tmpl_ref = pg.agen_str.neg_tmpl_ref;
         in.ref_item = pg.agen_str.ref_item;
         in.ref_rate = ad.ref_rate;
         in.ref_hop = ad.ref_hop;

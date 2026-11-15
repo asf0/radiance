@@ -172,6 +172,10 @@ static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT
 /* A learned position table resampled to each row's grid and added in (a vision tower's). */
 static const RadParamSpec pGridEmbed[] = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
+/* window_order: the window permutation of one pass, from the coordinate planes alone. */
+static const RadParamSpec pWindowOrder[] = { P_INT("M"), P_INT("window") };
+static const RadOperandSpec oWindowOrder[] = { OPD("crd"), OPD_O("cu"), OUT("idx"), OUT("inv"),
+                                               OUT("pos"), OUT("cuw") };
 /* grid_embed_cpe adds the rows a segment carries ahead of its patches (n_prefix, `prefix`). */
 static const RadParamSpec pGridEmbedCpe[] = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
                                               P_INTO("n_prefix") };
@@ -1095,6 +1099,8 @@ static const RadParamSpec pVqEncode[] = { P_INT("M"), P_INT("n"), P_INT("dim"), 
                                           P_STR("dtype") };
 static const RadOperandSpec oVqEncode[] = { INOUT("x"), WGT("in_w"), WGT("in_b"), WGT("cb"),
                                             WGT("out_w"), WGT("out_b"), OUT("codes") };
+static const RadParamSpec pVqEuclidean[] = { P_INT("M"), P_INT("n"), P_INT("bins"), P_STR("dtype") };
+static const RadOperandSpec oVqEuclidean[] = { INOUT("x"), WGT("cb"), OUT("codes") };
 static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
                                           P_INTO("rep"), P_STR("dtype") };
 static const RadOperandSpec oFrameMix[] = { OPD("hid"), WGT("logits"), WGT("scale"), OPD("lane"),
@@ -1227,6 +1233,23 @@ static const RadOpSchema kSchemas[] = {
   "`coord` is [4, M] -- row, column, grid height, grid width -- and the position is sampled "
   "bilinearly with the grid's corners on the table's corners (align_corners), edge taps clamped. "
   "The taps are summed in f32 and rounded to x's dtype, then added to x and rounded again." },
+{ "grid_embed_pad", ARR(pGridEmbed), ARR(oGridEmbed),
+  "x[m] += the table resampled at row m's grid position in the half-pixel-centre form "
+  "(align_corners=False) with grid_sample's padding_mode=\"zeros\": per axis taps at floor(src) "
+  "and floor(src) + 1 of src = (i + 0.5) * side / size - 0.5, each carrying the hat weight "
+  "(1 - |src - tap|)+, and a tap whose UNCLAMPED index falls outside the table contributes zero "
+  "rather than reading an edge. Same operands and tap order as `grid_embed`; equal to it whenever "
+  "the grid fits the table, different only when a grid upsamples past it (Muse's case)." },
+{ "window_order", ARR(pWindowOrder), ARR(oWindowOrder),
+  "The window-attention permutation of one encoder pass (HF's get_vision_window_index) computed "
+  "from the coordinates alone: `crd` [4, P] i32 is row, column, segment height, segment width per "
+  "patch and `cu` [S+1] i32 the per-frame segment boundaries. Windows of `window` patches "
+  "partition each segment, window-row-major, ragged at the segment's right and bottom edges, "
+  "patches raster within a window and windows never across segments. Outputs i32: `idx` [P], "
+  "slot -> source patch (the gather index); `inv` [P], the inverse; `pos` [2, P], each slot's rope "
+  "positions (col + 1, row + 1), component-major like the planes; `cuw` [P+1], the cumulative "
+  "window boundaries in the permuted order, n_windows + 1 entries used. `M` bands the pass; slots "
+  "past M are the identity. `window` <= 0 is the identity permutation, cuw = cu." },
 { "grid_embed_aa", ARR(pGridEmbed), ARR(oGridEmbed),
   "x += the side x side table resampled as torch's F.interpolate(bilinear, align_corners=False, "
   "antialias=True) resamples it to the row's grid -- SigLIP2's position embedding: per axis a "
@@ -2093,8 +2116,8 @@ static const RadOpSchema kSchemas[] = {
   "a 1-D convolution over the sequences `cu_seqlens` bounds, channels innermost: x [rows, cin], "
   "y [rows, cout], PyTorch's [cout, cin, k] weight and an optional bias, dilation `dil` and padding "
   "dil (k - 1) / 2 a side (k odd), or dil (k - 1) on the left with `causal` 1, zeros outside each "
-  "sequence; `res` added after the bias, then `act` none, tanh or clamp (to [-1, 1]). bf16 only "
-  "with `stride` > 1: one sequence [0, rows of x], an explicit `pad` and any k, output row m "
+   "sequence; `res` added after the bias, then `act` none, tanh or clamp (to [-1, 1]). With "
+   "`stride` > 1 and an explicit `pad` (bf16 only): one sequence [0, rows of x], any k, output row m "
   "reading x[m * stride + tap * dil - pad] — PyTorch's zero-padded strided conv exactly." },
 { "conv_t1d", ARR(pConvT1d), ARR(oConvT1d),
   "a transposed 1-D convolution of kernel `k` >= stride (2 stride by default), padding `pad` "
@@ -2123,7 +2146,10 @@ static const RadOpSchema kSchemas[] = {
 { "vq_encode", ARR(pVqEncode), ARR(oVqEncode),
   "one residual vector quantiser step: e = in_w x + in_b, the code the row of cb of greatest "
   "cosine with e (the lower index on a tie), then x -= out_w cb[code] + out_b; f32, x rounded "
-  "once." },
+   "once." },
+{ "vq_euclidean", ARR(pVqEuclidean), ARR(oVqEuclidean),
+  "nearest Euclidean centroid (lower index on ties), codes written and centroid subtracted from x." },
+{ "elu", ARR(pMnD), ARR(oUnary), "y = x >= 0 ? x : expm1(x), alpha 1." },
 { "frame_mix_store", ARR(pFrameMix), ARR(oFrameMix),
   "a frame's conditioning row: the softmax(logits)-weighted sum of hid's L planes times scale, "
   "stored at dst[lane * stride + frame - 1] for frame >= 1 and status[lane] >= 0." },
@@ -2356,6 +2382,12 @@ SIMPLE("ref_layernorm", "layernorm", "norm", "layer norm with gain and bias", DT
        ref_layernorm),
 SIMPLE("ref_grid_embed", "grid_embed", "elem",
        "bilinear resample of a learned position grid, added in", DT_FLOAT, ref_grid_embed),
+SIMPLE("ref_grid_embed_pad", "grid_embed_pad", "elem",
+       "half-pixel bilinear resample of a position grid, zero-padded taps, added in", DT_FLOAT,
+       ref_grid_embed_pad),
+SIMPLE("ref_window_order", "window_order", "elem",
+       "the window-attention permutation of one pass, from its coordinates", DT_ANY,
+       ref_window_order),
 SIMPLE("ref_grid_embed_aa", "grid_embed_aa", "elem",
        "antialiased half-pixel bilinear resample of a position grid, added in", DT_FLOAT,
        ref_grid_embed_aa),
@@ -2805,7 +2837,10 @@ SIMPLE("ref_cfg_topk_sample", "cfg_topk_sample", "sample", "a guided top-k pick 
 SIMPLE("ref_rvq_embed", "rvq_embed", "elem", "a frame's embedding from its residual codes",
        DT_FLOAT, ref_rvq_embed),
 SIMPLE("ref_vq_encode", "vq_encode", "elem",
-       "a residual quantiser's step: the nearest code by cosine", DT_FLOAT, ref_vq_encode),
+        "a residual quantiser's step: the nearest code by cosine", DT_FLOAT, ref_vq_encode),
+SIMPLE("ref_vq_euclidean", "vq_euclidean", "elem", "Euclidean residual quantiser", DT_FLOAT,
+       ref_vq_euclidean),
+SIMPLE("ref_elu", "elu", "elem", "ELU, alpha 1", DT_FLOAT, ref_elu),
 SIMPLE("ref_frame_mix_store", "frame_mix_store", "elem", "a frame's conditioning row into its lane",
        DT_FLOAT, ref_frame_mix_store),
 SIMPLE("ref_end_status", "end_status", "elem", "a frame's status from its first pick", DT_ANY,

@@ -625,6 +625,9 @@ typedef struct RadAudioGenBatch {
     const int32_t*  ref_cu_h;
     const int32_t*  ref_frame;
     const int32_t*  ref_frame_h;
+    /* ABI 40: PROMPT branch boundaries on the host, [n_seq + 1], including unequal
+     * reference-direction branches. Same rows as RadBatch::cu_seqlens on device. */
+    const int32_t*  prompt_cu_h;
 } RadAudioGenBatch;
 
 /* A window entry's flags on a WINDOW pass. FIRST is RAD_GEN_F_FIRST's bit and the others are clear

@@ -150,6 +150,57 @@ TEST(routed_expert_metadata_accepts_the_deepseek_and_glm_config_spellings) {
     CHECK_EQ(ck.meta().m.head_dim, (int64_t)0);
 }
 
+/* Muse Glimmer: the underscore-stripped model_type is the architecture id, the trunk's config
+ * lives under text_config (nested() reads it; the alias pass copies it to bare keys), and the
+ * head_dim 128 is read, not derived (6656/32 would be 208). The free-form keys a plugin reads --
+ * the layer schedule, the per-layer rotary bases, the family scalars -- flatten to strings under
+ * their dotted config.json spellings, and vision_config stays unaliased under its full prefix. */
+TEST(muse_glimmer_metadata_maps_the_trunk_and_keeps_the_family_keys) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+        "{\"model_type\":\"muse_glimmer\",\"architectures\":[\"MuseGlimmerForConditionalGeneration\"],"
+        "\"image_token_id\":200092,\"video_token_id\":200091,"
+        "\"text_config\":{\"hidden_size\":6656,\"num_hidden_layers\":52,"
+        "\"num_attention_heads\":32,\"num_key_value_heads\":2,\"head_dim\":128,"
+        "\"intermediate_size\":19968,\"vocab_size\":202048,\"rms_norm_eps\":1e-5,"
+        "\"post_norm_eps\":1e-8,\"sliding_window\":2048,\"max_position_embeddings\":131072,"
+        "\"qk_scale_factor\":3.87,\"output_multiplier\":0.19611613513818404,"
+        "\"final_logit_softcapping\":20.0,"
+        "\"rope_parameters\":{\"rope_theta\":500000.0,\"rope_type\":\"default\"},"
+        "\"layer_types\":[\"sliding_attention\",\"sliding_attention\",\"sliding_attention\","
+        "\"full_attention\"],\"layer_rope_theta\":[500000.0,500000.0,500000.0,0]},"
+        "\"vision_config\":{\"model_type\":\"muse_glimmer_vision\",\"hidden_size\":1536,"
+        "\"num_hidden_layers\":50,\"patch_size\":14}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    const MetaOwn& mo = ck.meta();
+    const RadModelMeta& m = mo.m;
+    CHECK_EQ(mo.arch, std::string("museglimmer"));
+    CHECK_EQ(mo.quant, std::string(""));
+    CHECK_EQ(mo.has("text_config.layer_rope_theta"), true);
+    CHECK_EQ(m.n_embd, (int64_t)6656);
+    CHECK_EQ(m.n_layers, (int64_t)52);
+    CHECK_EQ(m.n_head, (int64_t)32);
+    CHECK_EQ(m.n_head_kv, (int64_t)2);
+    CHECK_EQ(m.head_dim, (int64_t)128);
+    CHECK_EQ(m.n_ff, (int64_t)19968);
+    CHECK_EQ(m.n_vocab, (int64_t)202048);
+    CHECK_EQ(m.rms_eps, 1e-5f);
+    CHECK_EQ(m.n_ctx_train, (int64_t)131072);
+    CHECK_EQ(m.rope_theta, 500000.0);
+    /* The plugin's free-form reads: the aliased bare spellings and the dotted originals agree,
+     * and the layer arrays arrive as one space-separated string each. */
+    CHECK_EQ(rad_meta_gets(&m, "layer_types", ""), std::string("sliding_attention sliding_attention "
+                                                               "sliding_attention full_attention"));
+    CHECK_EQ(rad_meta_gets(&m, "layer_rope_theta", ""), std::string("500000 500000 500000 0"));
+    CHECK_EQ(rad_meta_geti(&m, "sliding_window", 0), (long long)2048);
+    CHECK_EQ(rad_meta_getf(&m, "qk_scale_factor", 0.0), 3.87);
+    CHECK_EQ(rad_meta_getf(&m, "post_norm_eps", 0.0), 1e-8);
+    /* vision_config is never aliased: only the full prefix carries it. */
+    CHECK_EQ(rad_meta_geti(&m, "vision_config.num_hidden_layers", -1), (long long)50);
+    CHECK_EQ(rad_meta_geti(&m, "num_hidden_layers", -1), (long long)52);
+    CHECK_EQ(rad_meta_gets(&m, "vision_config.model_type", ""), std::string("muse_glimmer_vision"));
+}
+
 /* The descriptor derives from quant_method and fmt whoever set them, including rad-convert's
  * --set: a bf16 checkpoint converted to block fp8 states that format and selects the fp8 plugin,
  * so the container never names one format and selects another's plugin. transformers' fp8 states

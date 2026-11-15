@@ -142,6 +142,23 @@ double sysfs_number(const std::string& path) {
     return f >> v ? v : -1;
 }
 
+/* A card's temperature in millidegrees: the sensor its driver labels `junction`, else temp1. amdgpu
+ * labels three, edge (temp1), junction and mem, and throttles on the junction, the hottest spot on
+ * the die: under a decode load an R9700 read 56 C at the edge and 75-77 C at the junction. A driver
+ * that labels none, or no junction, keeps temp1. -1 when neither can be read. */
+double card_temp_mc(const std::string& hwmon) {
+    for (int i = 1; i <= 8; ++i) {
+        const std::string t = hwmon + "/temp" + std::to_string(i);
+        std::ifstream f(t + "_label");
+        std::string label;
+        if (!(f >> label)) continue;
+        if (label != "junction") continue;
+        if (const double mc = sysfs_number(t + "_input"); mc >= 0) return mc;
+        break;
+    }
+    return sysfs_number(hwmon + "/temp1_input");
+}
+
 /* What the driver reports of a card right now: busy share, power and temperature, on the routes of
  * a dashboard being watched and nowhere on a request's path. A card that reports none adds none. */
 void card_telemetry(int card, json& o) {
@@ -156,7 +173,7 @@ void card_telemetry(int card, json& o) {
         double uw = sysfs_number(hp + "/power1_average");
         if (uw < 0) uw = sysfs_number(hp + "/power1_input");
         if (uw >= 0) o["power_w"] = uw / 1e6;
-        if (const double mc = sysfs_number(hp + "/temp1_input"); mc >= 0) o["temp_c"] = mc / 1000.0;
+        if (const double mc = card_temp_mc(hp); mc >= 0) o["temp_c"] = mc / 1000.0;
         break;
     }
 }
@@ -502,6 +519,7 @@ private:
 
 Fleet::Fleet(FleetConfig fc)
     : fc_(std::move(fc)), front_(transport_options(fc_), fc_.keepalive_ms) {
+    dev_stuck_exit_ms.store(fc_.stuck_exit_ms, std::memory_order_relaxed);
     bool any = false;
     int64_t head = 0;
     for (const ModelEntry& e : fc_.models) {
@@ -2301,6 +2319,7 @@ std::string Fleet::reload() {
         front_.update(e.name, e.aliases, nf.load_timeout_ms, required);
     }
     fc_ = std::move(nf);
+    dev_stuck_exit_ms.store(fc_.stuck_exit_ms, std::memory_order_relaxed);
     for (const ModelEntry& e : fc_.models)
         if (e.pin) demand(e.name);
     RAD_INFO("reload: %s applied, %zu model(s)", fc_.path.c_str(), fc_.models.size());

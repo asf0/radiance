@@ -263,7 +263,9 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
     const long long vn  = r4d_geti_or(a, "v_norm", 1);
     if (hd != 128 && hd != 256 && hd != 512) return R4D_NO(RAD_E_SHAPE);
     if (vk && !vn) return R4D_NO(RAD_E_INVAL);   // v from k is v's norm
-    if (nq < 0 || nkv <= 0 || rot <= 0 || rot > hd || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
+    /* rot 0 is the NoPE layer: the norm still runs, and `rotate` with half = 0 only copies the
+     * unrotated tail, which is the whole head. */
+    if (nq < 0 || nkv <= 0 || rot < 0 || rot > hd || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(qw) != hd || r4d_numel(kw) != hd) return R4D_NO(RAD_E_SHAPE);
     const char* mode = r4d_gets(a, "mode");
     if (mode && std::strcmp(mode, "neox")) return R4D_NO(RAD_E_UNSUPPORTED);

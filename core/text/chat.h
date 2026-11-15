@@ -114,7 +114,8 @@ public:
     /* Render. `messages` and `tools` are OpenAI-shaped JSON (`tools` may be null or empty).
      * Returns RAD_OK, RAD_E_INVAL when the request does not parse, or RAD_E_UNSUPPORTED when the
      * template refuses it (e.g. a system message without a system role, or tools without tool
-     * support). */
+     * support). Replayed history is read in other servers' shapes first: a turn's reasoning under
+     * `reasoning` or `thinking`, and a call whose arguments are null, blank or absent. */
     int apply(const Json& messages, const Json& tools,
               const ChatOptions& opt, ChatPrompt* out) const;
 

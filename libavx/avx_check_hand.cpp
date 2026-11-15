@@ -556,6 +556,37 @@ void shape_cases(std::vector<Hand>& hs) {
           .pi("M", 6).pi("n", N).pi("side", 4).pi("n_prefix", 3).ps("dtype", "f32");
         hs.push_back(std::move(gc));
 
+        /* Muse's zero-padded resample: a 4 x 4 table onto rows of an 8 x 8 grid, whose top row
+         * and right column reach taps off the table (zero-weight) and blend the rest. */
+        static const int32_t kPadCrd[4][6] = { { 0, 7, 1, 4, 7, 3 }, { 0, 7, 3, 2, 0, 7 },
+                                               { 8, 8, 8, 8, 8, 8 }, { 8, 8, 8, 8, 8, 8 } };
+        Hand gp("a 4 x 4 table onto an 8 x 8 grid, off-table taps weighted zero", "grid_embed_pad",
+                1e-6);
+        gp.dense(RAD_F32, { 6, N }, hfill(64), true)
+          .dense(RAD_F32, { 16, N }, hfill(65))
+          .dense(RAD_I32, { 4, 6 }, [](int64_t i) { return (float)kPadCrd[i / 6][i % 6]; })
+          .pi("M", 6).pi("n", N).pi("side", 4).ps("dtype", "f32");
+        hs.push_back(std::move(gp));
+
+        /* Muse's window permutation: a 12 x 10 segment and an 8 x 8 one, window 8 (the first
+         * segment's right and bottom windows are ragged). */
+        constexpr int64_t WP = 12 * 10 + 8 * 8;
+        Hand gw("12 x 10 and 8 x 8 segments, window 8", "window_order", 0.0);
+        gw.dense(RAD_I32, { 4, WP }, [=](int64_t i) {
+                   const int64_t p = i % WP, cplx = i / WP;
+                   const int seg = p < 120 ? 0 : 1, base = seg ? 120 : 0;
+                   const int gh = seg ? 8 : 12, gw_ = seg ? 8 : 10;
+                   const int q = (int)(p - base), r = q / gw_, c = q % gw_;
+                   return (float)(cplx == 0 ? r : cplx == 1 ? c : cplx == 2 ? gh : gw_);
+               })
+          .dense(RAD_I32, { 3 }, [](int64_t i) { return i == 0 ? 0.0f : i == 1 ? 120.0f : 184.0f; })
+          .dense(RAD_I32, { WP }, [](int64_t) { return 0.0f; }, true)
+          .dense(RAD_I32, { WP }, [](int64_t) { return 0.0f; }, true)
+          .dense(RAD_I32, { 2, WP }, [](int64_t) { return 0.0f; }, true)
+          .dense(RAD_I32, { WP + 1 }, [](int64_t) { return 0.0f; }, true)
+          .pi("M", WP).pi("window", 8);
+        hs.push_back(std::move(gw));
+
         /* LiLiCorr's candidates over two ranks' sample_logprobs rows: a merge that interleaves the
          * ranks, an equal value on both (the lower id first), a rank with an unfilled slot. Rows
          * of (max, sum, 4 (id, logit) pairs descending) a rank, k = 4, steps 3, n = 24. */

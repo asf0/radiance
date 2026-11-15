@@ -152,6 +152,9 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.steps_ahead = m.steps_ahead;
     o.prefill_chunks_capped = m.prefill_chunks_capped;
     o.steps_held = m.steps_held;
+    o.mixed_step_target_steps = m.mixed_step_target_steps;
+    o.mixed_step_target_misses = m.mixed_step_target_misses;
+    o.mixed_step_target_prefill_cap = m.mixed_step_target_prefill_cap;
     o.decode_rows_unspeculated = m.decode_rows_unspeculated;
     o.step_ns = m.step_ns;  o.step_ns_decode = m.step_ns_decode;
     o.step_ns_decode_best = m.step_ns_decode_best;

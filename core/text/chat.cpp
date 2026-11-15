@@ -263,6 +263,13 @@ static bool alias_reasoning(const ojson& messages, ojson* out) {
         }
         return v;
     };
+    /* A call that takes no arguments, as clients replay it: null, or the empty or blank string a
+     * client stores from a stream that sent none. */
+    auto no_arguments = [](const ojson& a) {
+        return a.is_null() ||
+               (a.is_string() && a.get_ref<const std::string&>().find_first_not_of(" \t\r\n") ==
+                                     std::string::npos);
+    };
     auto needs = [&](const ojson& m) {
         if (!m.is_object()) return false;
         const auto rc = m.find("reasoning_content");
@@ -283,7 +290,7 @@ static bool alias_reasoning(const ojson& messages, ojson* out) {
                 if (!call.is_object()) continue;
                 const auto fn = call.find("function");
                 if (!call.contains("type") || fn == call.end() || !fn->is_object() ||
-                    !fn->contains("arguments") || fn->at("arguments").is_null())
+                    !fn->contains("arguments") || no_arguments(fn->at("arguments")))
                     return true;
             }
         return false;
@@ -336,12 +343,39 @@ static bool alias_reasoning(const ojson& messages, ojson* out) {
                         call.erase("name");
                         call.erase("arguments");
                     }
-                } else if (!fn->contains("arguments") || fn->at("arguments").is_null()) {
+                } else if (!fn->contains("arguments") || no_arguments(fn->at("arguments"))) {
                     (*fn)["arguments"] = "{}";
                 }
             }
     }
     return true;
+}
+
+/* The first replayed call whose arguments are a string that is not JSON, as
+ * "messages[i].tool_calls[j].function.arguments is not JSON: <why>", or empty when every call's
+ * arguments parse. The template refuses such a conversation with the parser's words alone, which reads as
+ * the template's fault; this names the call. */
+static std::string bad_arguments(const ojson& messages) {
+    if (!messages.is_array()) return "";
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const ojson& m = messages[i];
+        const auto tcs = m.is_object() ? m.find("tool_calls") : m.end();
+        if (!m.is_object() || tcs == m.end() || !tcs->is_array()) continue;
+        for (size_t j = 0; j < tcs->size(); ++j) {
+            const ojson& tc = (*tcs)[j];
+            const auto fn = tc.is_object() ? tc.find("function") : tc.end();
+            if (!tc.is_object() || fn == tc.end() || !fn->is_object()) continue;
+            const auto args = fn->find("arguments");
+            if (args == fn->end() || !args->is_string()) continue;
+            try {
+                (void)ojson::parse(args->get_ref<const std::string&>());
+            } catch (const std::exception& e) {
+                return "messages[" + std::to_string(i) + "].tool_calls[" + std::to_string(j) +
+                       "].function.arguments is not JSON: " + e.what();
+            }
+        }
+    }
+    return "";
 }
 
 int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOptions& opt,
@@ -430,6 +464,11 @@ int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOpt
             }
         }
         if (!served) {
+            if (const std::string bad = bad_arguments(msgs); !bad.empty()) {
+                if (!opt.quiet) RAD_WARN("chat: request did not parse: %s", bad.c_str());
+                out->error = bad;
+                return RAD_E_INVAL;
+            }
             const std::string w = template_words(e.what());
             if (!opt.quiet) RAD_WARN("chat: the model's chat template refused the request: %s",
                                      w.c_str());

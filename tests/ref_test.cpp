@@ -1052,6 +1052,42 @@ TEST(group_router_selects_only_inside_the_best_groups) {
     CHECK_EQ(run("router_sigmoid_group_topk", bad), RAD_E_SHAPE);
 }
 
+TEST(group_router_at_the_tiny_geometry_keeps_four_of_eight_sixteen_expert_groups) {
+    T lg(RAD_F32, { 1, 128 }), bias(RAD_F32, { 128 }), ids(RAD_I32, { 1, 8 }), w(RAD_F32, { 1, 8 });
+    // One planted expert a group (16 a group): p 0.90, 0.30, 0.85, 0.10, 0.80, 0.05, 0.75, 0.70,
+    // and a floor of 0.001 everywhere else. The planted sums lead, so topk_group 4 keeps groups
+    // 0, 2, 4 and 6: the four largest planted experts are in, groups 1, 3, 5 and 7 bring nothing.
+    const float planted[8] = { 0.90f, 0.30f, 0.85f, 0.10f, 0.80f, 0.05f, 0.75f, 0.70f };
+    std::vector<float> p(128, 0.001f), lgv;
+    for (int g = 0; g < 8; ++g) p[g * 16 + 2] = planted[g];
+    for (size_t i = 0; i < p.size(); ++i) lgv.push_back(std::log(p[i] / (1 - p[i])));
+    lg.f(lgv);
+    bias.f(std::vector<float>(128, 0.0f));
+    A a;
+    a.t(lg).t(bias).t(ids).t(w).i("M", 1).i("n_expert", 128).i("top_k", 8).i("n_group", 8)
+        .i("topk_group", 4).i("norm", 1).d("route_scale", 2.5).s("dtype", "f32");
+    auto has = [&](int e) {
+        for (int i = 0; i < 8; ++i)
+            if (ids.iat(i) == e) return true;
+        return false;
+    };
+    REQUIRE_EQ(run("router_sigmoid_group_topk", a), RAD_OK);
+    CHECK_EQ(ids.iat(0), 2);    // the kept groups' planted experts, in score order:
+    CHECK_EQ(ids.iat(1), 34);   // 0.90, 0.85, 0.80, 0.75
+    CHECK_EQ(ids.iat(2), 66);
+    CHECK_EQ(ids.iat(3), 98);
+    for (int g : { 1, 3, 5, 7 }) CHECK(!has(g * 16 + 2));  // the dropped groups stay out
+    CHECK_NEAR(w.at(0), 2.5f * 0.90f / (0.90f + 0.85f + 0.80f + 0.75f + 0.004f), 1e-5);
+    // A correction bias ranks group 3's sum past group 6's and seats its expert; the weights
+    // stay the unbias'd sigmoid.
+    std::vector<float> bs(128, 0.0f);
+    bs[3 * 16 + 2] = 0.9f;
+    bias.f(bs);
+    REQUIRE_EQ(run("router_sigmoid_group_topk", a), RAD_OK);
+    CHECK(has(50));
+    CHECK(!has(98));
+}
+
 TEST(paged_latent_attention_is_causal_adds_the_rotary_part_and_gates_per_head) {
     // One sequence of three tokens, the last two queried (positions 1 and 2). Token 0 and 1 sit
     // in page 1, token 2 in page 0; a row is the latent (2) then the rotary part (2).
@@ -1253,7 +1289,7 @@ TEST(op_vocabulary) {
         "gemm_nt", "gemm_nt_bias", "gemm_nt_q", "gemm_nt_q_bias", "grid_embed",
         /* Runtime LoRA's two halves, issued by the core beside a trunk GEMM. */
         "lora_shrink", "lora_expand", "lora_expand_mm",
-        "grid_embed_aa", "grid_embed_cpe",
+        "grid_embed_aa", "grid_embed_cpe", "grid_embed_pad", "window_order",
         "attn_paged", "attn_dense", "kv_store", "kv_store_streamed", "rope", "rope_table",
         "attn_paged_sink",
         "qk_norm_rope", "qsa_block_key",
@@ -1289,7 +1325,7 @@ TEST(op_vocabulary) {
         "chan_split", "interleave2", "iota", "cu_repeat", "int_affine", "frame_store",
         /* Fish Audio drama-3's (arch/fishomni): the repetition-aware choice between two draws,
          * and its codec encoder's residual quantiser step. */
-        "ras_pick", "vq_encode",
+        "ras_pick", "vq_encode", "vq_euclidean", "elu",
         /* The video generator's (MiniMax-H3): its DiT's modulated norm and sampler step, its
          * decoder's patch unfold, tiles, stitch and positions, and the vocoder's alias-free
          * activation. */
@@ -4500,6 +4536,160 @@ TEST(op_grid_embed) {
     /* (2, 1) of 5 x 4 sits at table (1.0, 0.6667): rows 3 and 4 by 1/3 and 2/3. */
     const float want = (30.0f * (1.0f / 3.0f) + 40.0f * (2.0f / 3.0f));
     CHECK_NEAR(x.at(4), want, 1e-4);
+}
+
+/* grid_embed_pad: the half-pixel resample with grid_sample's zeros padding. A side-4 table onto
+ * rows of an 8 x 8 grid: src(i) = i / 2 - 0.25, so row 0 keeps only the in-range tap 0 (weight
+ * 3/4, the tap -1 masked), row 7 only tap 3 at 3/4 (tap 4 masked), and interior rows blend two.
+ * Table row h * 4 + w holds (4h + w + 1) and (4h + w + 1) / 2 in its two channels. */
+TEST(op_grid_embed_pad_zeroes_taps_beyond_the_table) {
+    const int64_t side = 4, n = 2;
+    std::vector<float> tab((size_t)(side * side * n));
+    for (int64_t r = 0; r < side * side; ++r)
+        for (int64_t i = 0; i < n; ++i) tab[(size_t)(r * n + i)] = (float)(r + 1) * (i ? 0.5f : 1.0f);
+    T table(RAD_F32, { side * side, n }); table.f(tab);
+    /* Rows (0,0), (7,7), (1,3), (4,2), (7,0), (3,7) of the 8 x 8 grid. */
+    T x(RAD_F32, { 6, n }); x.f({ 100, 100, 100, 100, 100, 100,
+                                  100, 100, 100, 100, 100, 100 });
+    T crd(RAD_I32, { 4, 6 });
+    crd.n({ 0, 7, 1, 4, 7, 3,   0, 7, 3, 2, 0, 7,   8, 8, 8, 8, 8, 8,   8, 8, 8, 8, 8, 8 });
+    A a; a.t(x).t(table).t(crd).i("M", 6).i("n", n).i("side", side).s("dtype", "f32");
+    CHECK_OK(run("grid_embed_pad", a));
+    /* Hand-computed: joint weight = the product of the axes' in-range hat weights (the off-table
+     * tap contributes nothing), v(h,w) = 4h + w + 1; channel 1 holds v / 2, x starts at 100. */
+    /* (0,0): both axes tap 0 only, at 3/4 each -> 9/16 * 1 = 0.5625. */
+    /* (7,7): both axes tap 3 only at 3/4 -> 9/16 * 16 = 9. */
+    /* (1,3): rows 0,1 at 3/4, 1/4; cols 1,2 at 3/4, 1/4 -> 3.25.
+       (4,2): rows 1,2 at 1/4, 3/4; cols 0,1 at 1/4, 3/4 -> 8.75. */
+    /* (7,0): row tap 3 at 3/4 (tap 4 masked), col tap 0 at 3/4 (tap -1 masked) -> 9/16 * 13 = 7.3125. */
+    /* (3,7): rows 1,2; col tap 3 at 3/4 (tap 4 masked) -> 9/16 * 8 + 3/16 * 12 = 6.75. */
+    const float want[6] = { 0.5625f, 9.0f, 3.25f, 8.75f, 7.3125f, 6.75f };
+    for (int64_t m = 0; m < 6; ++m) {
+        CHECK_NEAR(x.at(m * n), 100.0f + want[m], 1e-5);
+        CHECK_NEAR(x.at(m * n + 1), 100.0f + want[m] * 0.5f, 1e-5);
+    }
+}
+
+/* A grid no larger than the table never masks a tap, and at scale 1 the half-pixel form reads
+ * each row whole: a 4 x 4 grid on the side-4 table is the table itself. */
+TEST(op_grid_embed_pad_in_range_reads_the_table) {
+    const int64_t side = 4, n = 1;
+    std::vector<float> tab((size_t)(side * side));
+    for (int64_t r = 0; r < side * side; ++r) tab[(size_t)r] = (float)(r + 1);
+    T table(RAD_F32, { side * side, n }); table.f(tab);
+    T x(RAD_F32, { 2, n }); x.f({ 0, 0 });
+    T crd(RAD_I32, { 4, 2 }); crd.n({ 2, 3,   1, 2,   4, 4,   4, 4 });
+    A a; a.t(x).t(table).t(crd).i("M", 2).i("n", n).i("side", side).s("dtype", "f32");
+    CHECK_OK(run("grid_embed_pad", a));
+    CHECK_NEAR(x.at(0), 10.0f, 1e-6);   /* table row 2 * 4 + 1 = 10 */
+    CHECK_NEAR(x.at(1), 15.0f, 1e-6);   /* table row 3 * 4 + 2 = 15 */
+}
+
+/* window_order: the permutation, its inverse, the rope positions and every cuw boundary, checked
+ * against an in-test reference that sorts the patches by (segment, window row, window column,
+ * raster) -- no arithmetic shared with the slot formula. The grids are laid out segment by
+ * segment, each a raster gh x gw block. */
+namespace {
+
+struct WinCase {
+    std::vector<std::pair<int64_t, int64_t>> grids;   /* (height, width) per segment */
+    int64_t window;
+};
+
+/* Builds the case, runs the op, checks the outputs against the sort reference and the hand-derived
+ * cuw boundaries. Returns the number of disagreements. */
+int64_t run_window_case(const char* name, const WinCase& c, const std::vector<int64_t>& cuw_want,
+                        std::vector<int64_t>* idx_out = nullptr) {
+    int64_t P = 0;
+    std::vector<int64_t> cu{ 0 };
+    for (const auto& g : c.grids) { P += g.first * g.second; cu.push_back((int64_t)P); }
+    std::vector<int64_t> crd(4 * (size_t)P, 0);
+    struct Ord { int64_t seg, wr, wc, r, cc, p; };
+    std::vector<Ord> ord;
+    for (size_t s = 0; s < c.grids.size(); ++s) {
+        const int64_t base = s ? cu[s] : 0;
+        for (int64_t r = 0; r < c.grids[s].first; ++r)
+            for (int64_t q = 0; q < c.grids[s].second; ++q) {
+                const int64_t p = base + r * c.grids[s].second + q;
+                crd[(size_t)p] = (int32_t)r;
+                crd[(size_t)P + (size_t)p] = (int32_t)q;
+                crd[2 * (size_t)P + (size_t)p] = (int32_t)c.grids[s].first;
+                crd[3 * (size_t)P + (size_t)p] = (int32_t)c.grids[s].second;
+                ord.push_back({ (int64_t)s, c.window > 0 ? r / c.window : 0,
+                                c.window > 0 ? q / c.window : 0, r, q, p });
+            }
+    }
+    std::stable_sort(ord.begin(), ord.end(), [](const Ord& l, const Ord& r) {
+        if (l.seg != r.seg) return l.seg < r.seg;
+        if (l.wr != r.wr) return l.wr < r.wr;
+        if (l.wc != r.wc) return l.wc < r.wc;
+        if (l.r != r.r) return l.r < r.r;
+        return l.cc < r.cc;
+    });
+    T crd_t(RAD_I32, { 4, P }); crd_t.n(crd);
+    T cu_t(RAD_I32, { 1, (int64_t)cu.size() }); cu_t.n(cu);
+    T idx(RAD_I32, { 1, P }); T inv(RAD_I32, { 1, P });
+    T pos(RAD_I32, { 2, P }); T cuw(RAD_I32, { 1, P + 1 });
+    A a; a.t(crd_t).t(cu_t).t(idx).t(inv).t(pos).t(cuw).i("M", P).i("window", c.window);
+    CHECK_OK(run("window_order", a));
+    int64_t bad = 0;
+    for (int64_t slot = 0; slot < P; ++slot) {
+        const int64_t src = idx.iat(slot), want = ord[(size_t)slot].p;
+        if (src != want) { ++bad; fprintf(stderr, "  %s: idx[%lld] %lld want %lld\n", name,
+                                          (long long)slot, (long long)src, (long long)want); }
+        if (inv.iat(want) != slot) ++bad;
+        if (idx.iat(inv.iat(slot)) != slot) ++bad;   /* idx and inv are inverses */
+        /* pos: (col + 1, row + 1) of the slot's source patch, read off the reference's order. */
+        if (pos.iat(slot) != ord[(size_t)slot].cc + 1) ++bad;
+        if (pos.iat(P + slot) != ord[(size_t)slot].r + 1) ++bad;
+    }
+    for (size_t i = 0; i < cuw_want.size(); ++i)
+        if (cuw.iat((int64_t)i) != cuw_want[i]) {
+            ++bad;
+            fprintf(stderr, "  %s: cuw[%zu] %lld want %lld\n", name, i,
+                    (long long)cuw.iat((int64_t)i), (long long)cuw_want[i]);
+        }
+    if (idx_out) for (int64_t i = 0; i < P; ++i) idx_out->push_back(idx.iat(i));
+    return bad;
+}
+
+}  /* namespace */
+
+/* One 48 x 40 segment, window 32: windows 32 x 32, 32 x 8, 16 x 32, 16 x 8 -- ragged right and
+ * bottom. The first patch of the second window is row 0, column 32, patch 256. */
+TEST(op_window_order_ragged_segment) {
+    std::vector<int64_t> gather;
+    const int64_t bad = run_window_case(
+        "48x40 w32", { { { 48, 40 } }, 32 }, { 0, 1024, 1280, 1792, 1920, 1920, 1920 }, &gather);
+    CHECK_EQ(bad, 0LL);
+    CHECK_EQ(gather[0], 0LL);
+    CHECK_EQ(gather[1024], 32LL);    /* window (0,1) starts at row 0, column 32: patch 32 */
+    CHECK_EQ(gather[1920 - 1], 48 * 40 - 1LL);
+}
+
+/* Video-style: two segments back to back, windows never across the segment boundary. */
+TEST(op_window_order_two_segments) {
+    const int64_t bad = run_window_case(
+        "two segments w16", { { { 32, 32 }, { 16, 16 } }, 16 },
+        { 0, 256, 512, 768, 1024, 1280, 1280, 1280, 1280 });
+    CHECK_EQ(bad, 0LL);
+}
+
+/* Window-divisible: every window exactly window x window. */
+TEST(op_window_order_divisible) {
+    const int64_t bad = run_window_case(
+        "16x24 w8", { { { 16, 24 } }, 8 }, { 0, 64, 128, 192, 256, 320, 384, 384 });
+    CHECK_EQ(bad, 0LL);
+}
+
+/* window 0: the identity, cuw = cu, the rope positions still swapped and offset by one. */
+TEST(op_window_order_window_zero_is_the_identity) {
+    const int64_t P = 9 * 7 + 5 * 5;
+    std::vector<int64_t> gather;
+    const int64_t bad = run_window_case("identity w0", { { { 9, 7 }, { 5, 5 } }, 0 },
+                                        { 0, 63, 88, 88 }, &gather);
+    CHECK_EQ(bad, 0LL);
+    for (int64_t i = 0; i < P; ++i) CHECK_EQ(gather[(size_t)i], i);
 }
 
 TEST(op_qk_norm_rope) {
@@ -8505,6 +8695,45 @@ TEST(vq_encode_takes_the_nearest_code_by_cosine_and_leaves_the_residual) {
     CHECK_EQ(run("vq_encode", b), RAD_E_SHAPE);
 }
 
+TEST(breeze_euclidean_quantisation_preserves_distance_and_tie_order) {
+    T x(RAD_F32, {3, 2}); x.f({4, 0, 2, 0, 0, 3});
+    T cb(RAD_F32, {3, 2}); cb.f({1, 0, 3, 0, 0, 2});
+    T codes(RAD_I32, {3});
+    A a; a.t(x).t(cb).t(codes).i("M", 3).i("n", 2).i("bins", 3).s("dtype", "f32");
+    CHECK_OK(run("vq_euclidean", a));
+    /* Cosine would choose 0 for [4, 0]; Euclidean must choose the longer centroid 1.
+     * [2, 0] is exactly equidistant from 0 and 1 and chooses the lower index. */
+    CHECK_EQ(codes.iat(0), 1); CHECK_EQ(codes.iat(1), 0); CHECK_EQ(codes.iat(2), 2);
+    CHECK_EQ(x.at(0), 1.0f); CHECK_EQ(x.at(1), 0.0f);
+    CHECK_EQ(x.at(2), 1.0f); CHECK_EQ(x.at(3), 0.0f);
+    CHECK_EQ(x.at(4), 0.0f); CHECK_EQ(x.at(5), 1.0f);
+    CHECK_OK(run("vq_euclidean", a));  /* next residual step, not the original vector */
+    CHECK_EQ(codes.iat(0), 0); CHECK_EQ(codes.iat(1), 0); CHECK_EQ(codes.iat(2), 2);
+    A bad; bad.t(x).t(cb).t(codes).i("M", 3).i("n", 2).i("bins", 4).s("dtype", "f32");
+    CHECK_EQ(run("vq_euclidean", bad), RAD_E_SHAPE);
+}
+
+TEST(breeze_elu_has_unit_alpha_and_works_in_place) {
+    T x(RAD_F32, {4, 1}); x.f({-1, 0, 2, -100});
+    A a; a.t(x).t(x).i("M", 4).i("n", 1).s("dtype", "f32");
+    CHECK_OK(run("elu", a));
+    CHECK(std::abs(x.at(0) - (-0.6321205588f)) < 1e-7f);
+    CHECK_EQ(x.at(1), 0.0f); CHECK_EQ(x.at(2), 2.0f); CHECK_EQ(x.at(3), -1.0f);
+}
+
+TEST(breeze_downsample_replication_is_a_prefix_and_crop) {
+    /* Original [1, 2, 3, 4], replicate left pad of 2 -> [1, 1, 1, 2, 3, 4].
+     * An ordinary causal conv on the prefixed input gives one extra leading row. */
+    T x(RAD_F32, {6, 1}); x.f({1, 1, 1, 2, 3, 4});
+    T w(RAD_F32, {1, 1, 4}); w.f({1, 10, 100, 1000});
+    T cu(RAD_I32, {2}); cu.n({0, 6});
+    T y(RAD_F32, {3, 1});
+    A a; a.t(x).t(w).t(cu).tnull().t(y).i("M", 6).i("cin", 1).i("cout", 1).i("k", 4)
+          .i("dil", 1).i("causal", 1).i("stride", 2).s("dtype", "f32");
+    CHECK_OK(run("conv1d", a));
+    CHECK_EQ(y.at(1), 2111.0f); CHECK_EQ(y.at(2), 4321.0f);
+}
+
 /* snake_aa's paddings, with the activation the identity (alpha 0: sin(0 u) = 0). Ratio 2, filters
  * of 4: P = 1. Sequence [10, 20, 40] pads to [10, 10, 20, 40, 40]; the transposed f_up [1, 2, 3, 4]
  * gives [10, 20, 40, 60, 50, 80, 100, 160, 160, 240, 120, 160], doubled and cropped by 3 a side:
@@ -10065,6 +10294,8 @@ std::vector<Geo> geometries() {
         G("hc_project", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("scale", 1.0).s("dtype", "f32")),
         G("mtp_enter", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("eps", 1e-6).s("dtype", "f32")),
         G("grid_embed", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
+        G("grid_embed_pad", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
+        G("window_order", "M", 12, a.i("M", R).i("window", 4)),
         G("grid_embed_aa", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
         G("grid_embed_cpe", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
         G("lili_cand", "M", 3, a.i("M", R).i("k", 4).i("world", 1).i("steps", 3).i("n", 8)
@@ -10346,6 +10577,8 @@ std::vector<Geo> geometries() {
         G("ras_pick", "M", 2, a.i("M", R).i("win", 4).i("lo", 1).i("hi", 9).i("rep", 1)),
         G("vq_encode", "M", 3, a.i("M", R).i("n", 16).i("dim", 4).i("bins", 24)
                                 .s("dtype", "f32")),
+        G("vq_euclidean", "M", 3, a.i("M", R).i("n", 16).i("bins", 24).s("dtype", "f32")),
+        G("elu", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("resample_nearest", "M", 6, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("fourier_embed", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("win_input", "M", 8, a.i("M", R).i("n_lat", 4).i("n_zero", 2).i("n_cond", 3)
@@ -10444,7 +10677,10 @@ bool undrawable(const char* op) {
     return !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2") ||
            !std::strcmp(op, "pixtral_merge") ||
            /* sample_logprobs rows (sorted pairs, positive sums): avx_check_hand.cpp builds them */
-           !std::strcmp(op, "lili_cand");
+           !std::strcmp(op, "lili_cand") ||
+           /* Whole raster grids with segment boundaries: the window_order cases here and in
+            * avx_check_hand.cpp build them. */
+           !std::strcmp(op, "window_order");
 }
 
 uint32_t lcg(uint32_t* s) { *s = *s * 1664525u + 1013904223u; return *s >> 8; }

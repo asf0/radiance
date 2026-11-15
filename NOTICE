@@ -42,7 +42,8 @@ Written by Deadcode, with contributions from:
   routed reads with their own router's counts and its deposit wait, the stop-string hold-back, and
   the sampler's planes by the step's token bound, its n-gram ban beside a drafter and no candidate
   cut over a top-1 row, and --prefill-interleave auto[:SHARE], sized from measured step times and
-  served by default
+  served by default, and the diagnose mode, in which the engine measures itself, with its token
+  parity and reproducibility checks
 - baKon: three-rank tensor parallelism, serving any world size from the shipped container, the
   request log, an uneven world's per-rank KV and weights split, --rope-scaling, the model entry's
   context length, root and capabilities, /props, the three-rank two-shot all-reduce and tiered-int8
@@ -55,11 +56,11 @@ Written by Deadcode, with contributions from:
   host) and decode-hot residency (--expert-profile, --expert-pin-top), prefix hits over KV groups of
   different block sizes and a hybrid's window in the checkpoint slot, --prefix-resume exact,
   DeepSeek-V4.1-Flash's conversion from its release (the Engram tables, the fused imatrix, the
-  UD-IQ1_S recipe and rad-convert --chat-template), a preempted prefill admitted only with its
-  whole recompute and the running sequences' next blocks free and the bound on its wait
-  (--preempt-wait-ms), prompt lookup alone (--spec-ngram) with each sequence's n-gram index and
-  the gate that verifies a proposal only when it pays, and DeepSeek-V4.1's reply format with its
-  DSML tool calls, and expert_stats_report.py
+  UD-IQ1_S recipe and rad-convert --chat-template), a preempted prefill admitted only with its whole
+  recompute and the running sequences' next blocks free and the bound on its wait
+  (--preempt-wait-ms), prompt lookup alone (--spec-ngram) with each sequence's n-gram index and the
+  gate that verifies a proposal only when it pays, and DeepSeek-V4.1's reply format with its DSML
+  tool calls, and expert_stats_report.py, and the KL mode's own line in the VRAM shortfall report
 - hazyumps: static YaRN for the Qwen rotary paths
 - malic: ParoQuant, with its MXFP4, int5 and int4 checkpoints imported and served, the Givens
   rotation as stages and as dense per-group matrices on the matrix cores, and the 5- and 4-bit
@@ -130,13 +131,17 @@ Written by Deadcode, with contributions from:
   JSON export, with the page's JavaScript driven by tests/js
 - C_Tamas: control vectors, loaded when the deployment asks and applied as a per-layer residual
   projection, KV streaming for a context bigger than VRAM (--kv-resident), and the dashboard's
-  request history, KV streaming traffic and one-unit KV meter
+  request history, KV streaming traffic and one-unit KV meter, and the mapped tier kept in the page
+  cache across a load
 - J-Nova: Unlimited-OCR, and Sage-A1.5 with its vision tower and its DFlash2 drafter
-- thekk1: the fp8 QK and PV legs of the h256 prefill attention (--attn-prefill-fp8)
+- thekk1: the fp8 QK and PV legs of the h256 prefill attention (--attn-prefill-fp8), and the
+  diagnosis of the expert loan held at zero by leftover cache blocks
 - lortht: Krea 2's rebalance of the text taps and its presets, MiniMax-H3's modulation rows, and
   keyframes carried through a latent upscale
 - Quackster: cards with a small PCI BAR, their kernel arguments kept in host memory
-- farcryjohn: periodic window snapshots that let an edited prompt reuse its prefix
+- farcryjohn: periodic window snapshots that let an edited prompt reuse its prefix, and
+  Breeze-TTS-2's native voice cloning with its delivery direction (the Qwen3-TTS reference encoder,
+  vq_euclidean and elu)
 - gostar: snapshot-backed prefix KV kept across recomputes, and Tencent's Hy-Memory (HYV3) -- its
   BF16, FP8 and GGUF adapters, its KV scales, its native sectioned tool calls, and its W4 decode
   (the per-128 I4 expert packing, the one-row W4/W5 epilogue and the fused prologue and folds),
@@ -145,7 +150,9 @@ Written by Deadcode, with contributions from:
   tool calls) with its DSpark drafter (exact attention and Markov walk ops), the prefill split keyed
   by live KV bounds, and --gpu-memory-mib
 - launch80_assets: tuning collectives as the exchange they serve at the served configuration, the
-  per-layer embeddings' read-ahead queue and gather regimes, and the step loop's stall watch
+  per-layer embeddings' read-ahead queue and gather regimes, and the step loop's stall watch, and
+  Meta Muse Glimmer 30B -- the museglimmer plugins, its windowed vision tower, its DFlash drafter,
+  the ATEM tool dialect and its context extension
 - hugypufy: M2XFP4 -- its quantiser, its GEMMs and its linears in the Qwen3.8 trunk and the DFlash2
   drafter -- and the ParoQuant M2XFP4 import
 - steki: Gemma 4 E2B's per-layer MLP width and the bf16 descriptor for Google's E2B/E4B
@@ -161,8 +168,10 @@ Written by Deadcode, with contributions from:
   and its gated three-tile form at 8 waves
 - RikshaDriver: libr3d, the RDNA3 (gfx11) kernel library, and its wave-matrix rewrite: the GEMMs
   retiled to 16x128 blocks, the grouped MoE GEMMs, the norms and quantisers, and the QSA and MoE
-  router rows, its MoE GEMMs at w4a8 and w4a4 with dequant_w4, row_topk_merge, ngram_ids and
-  the biased and short GEMMs, and w4a4's reference implementation
+  router rows, its MoE GEMMs at w4a8 and w4a4 with dequant_w4, row_topk_merge, ngram_ids and the
+  biased and short GEMMs, and w4a4's reference implementation, and Ling-3.0-tiny on bailing_hybrid
+  from its GGUF releases (the K-quant and IQ4_NL imports, the MLA query LoRA) with libr3d's
+  gemm_nt_f32, ple_conv, grouped router, kda_update, mla_project and mla_attn_paged
 - fl0l0u: every request entry point bounded, gated and sanitised (JSON parses bounded in depth,
   errors safe on invalid UTF-8, control bytes kept off the log, the dashboard's CSP, cross-origin
   browsers refused on the loopback-only routes, method-scoped API-key exemptions), prompt ids that
@@ -185,10 +194,16 @@ Written by Deadcode, with contributions from:
   rows), and the DMA lane's room check over a reused fence slot
 - neuromanMD: libr3d's MXFP4 GEMM leaving VRAM exponent planes unscanned from the host, and its
   branch-free e4m3_to_f32
-- everplays: the paged attention at seven queries a KV head, head_dim 128 (Nanbeige4.3-33B)
+- everplays: the paged attention at seven queries a KV head, head_dim 128 (Nanbeige4.3-33B), and
+  Recursive Flint -- its plugin, the sink-aware WMMA prefill attention and the fused prologue at
+  rotary_dim 0
 - Kezi: the decode tile arms of the int4 and int5 x int8 GEMM
-- dschmitz: the two-rank fused writes' host-mailbox twins taking their chained forms
+- dschmitz: the two-rank fused writes' host-mailbox twins taking their chained forms, the card
+  telemetry's junction temperature, and a replayed tool call's blank arguments read as the empty
+  object with arguments that are not JSON refused naming the call
 - eniga: the diagnosis of GLM-5.3-Flash's template refused for tools (jinja's unique filter)
+- tnhnyzc: the mixed-step service-time target (mixed-step-target-ms)
+- aelfwyne: the diagnosis of draft trees refusing the int8 KV cache's rows
 
 This product includes software from the following projects, each under the MIT License. The
 license text is in the file named beside each.

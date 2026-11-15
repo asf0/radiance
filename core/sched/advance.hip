@@ -31,7 +31,7 @@ __global__ __launch_bounds__(kThreads) void r4dchain_step_advance(rad::AdvanceAr
 }
 
 /* ADV_COMPACT: block (x, y) is work item x (a pool, layer and head) of batch row y; its threads
- * split the K|V row into 16-byte chunks. Chained like the advance where launches chain, every
+ * split the K|V row into 16-byte chunks and its last words. Chained like the advance where launches chain, every
  * block waiting for the kernels before it and counting itself in after its moves. */
 constexpr int kCompactThreads = 64;
 __device__ __forceinline__ void step_compact_body(const rad::AdvanceArgs& a) {

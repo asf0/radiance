@@ -792,6 +792,10 @@ private:
                   std::vector<std::unique_ptr<server::Sink>>& sinks, bool fit_pool,
                   const char* tag, int every_s,
                   const std::function<void(size_t, double)>& progress, int* bad);
+    /* --diagnose (core/engine_diagnose.cpp), replacing run_server: runs a fixed workload on this
+     * engine -- decode by prompt category, a concurrency sweep, a prefill sweep, interference --
+     * and writes DIR/diagnose.json and DIR/diagnose.md instead of listening. */
+    int  run_diagnose();
     int  score_rows(const RadBatch* b, const StepOut& so);
     std::unique_ptr<Kld> kld_;
     std::vector<float*>  kld_host_;
@@ -806,6 +810,10 @@ private:
     long long calib_tokens_ = 0;
     /* The engine half of /server_info, as a JSON object. See the definition in engine.cpp. */
     std::string engine_info() const;
+    /* The sampler a request that sends no settings runs with: the container's generation defaults
+     * with the operator's flags over them (resolve_sampling_defaults, engine.cpp). A mode that
+     * builds requests with no client -- --diagnose -- samples with what the server would. */
+    SamplingParams sampling_defaults() const;
 
     /* ---- startup report inputs (engine_diag.cpp). `decisions_` holds each value startup resolved
      * and why, recorded where it was resolved; the rest are facts only startup saw. */

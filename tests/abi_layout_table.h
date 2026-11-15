@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 39 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 40 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -142,7 +142,7 @@
 { "RadBuildCtx", "gen_max_refs", 184, 8 },
 { "RadBuildCtx", "expert_file_tier", 192, 4 },
 { "RadBuildCtx", "slot_base", 196, 4 },
-{ "RadAudioGenBatch", "", 0, 344 },
+{ "RadAudioGenBatch", "", 0, 352 },
 { "RadAudioGenBatch", "n_lane", 0, 8 },
 { "RadAudioGenBatch", "lane", 8, 8 },
 { "RadAudioGenBatch", "lane_h", 16, 8 },
@@ -188,7 +188,8 @@
 { "RadAudioGenBatch", "ref_cu_h", 320, 8 },
 { "RadAudioGenBatch", "ref_frame", 328, 8 },
 { "RadAudioGenBatch", "ref_frame_h", 336, 8 },
-{ "RadAudioGenDecl", "", 0, 280 },
+{ "RadAudioGenBatch", "prompt_cu_h", 344, 8 },
+{ "RadAudioGenDecl", "", 0, 296 },
 { "RadAudioGenDecl", "name", 0, 8 },
 { "RadAudioGenDecl", "tmpl", 8, 8 },
 { "RadAudioGenDecl", "neg_token", 16, 4 },
@@ -228,6 +229,8 @@
 { "RadAudioGenDecl", "ref_hop", 256, 8 },
 { "RadAudioGenDecl", "ref_max_samples", 264, 8 },
 { "RadAudioGenDecl", "ref_max", 272, 4 },
+{ "RadAudioGenDecl", "tmpl_ref_instruct", 280, 8 },
+{ "RadAudioGenDecl", "neg_tmpl_ref", 288, 8 },
 { "RadControlVector", "", 0, 32 },
 { "RadControlVector", "dir", 0, 8 },
 { "RadControlVector", "scales", 8, 8 },
@@ -243,7 +246,7 @@
 { "RadAudioFormat", "language_lead", 48, 8 },
 { "RadAudioFormat", "languages", 56, 8 },
 { "RadAudioFormat", "n_languages", 64, 4 },
-{ "RadChatFormat", "", 0, 208 },
+{ "RadChatFormat", "", 0, 216 },
 { "RadChatFormat", "struct_size", 0, 4 },
 { "RadChatFormat", "name", 8, 8 },
 { "RadChatFormat", "reasoning_open", 16, 8 },
@@ -274,6 +277,7 @@
 { "RadChatFormat", "object_bare_keys", 192, 4 },
 { "RadChatFormat", "reasoning_anywhere", 196, 4 },
 { "RadChatFormat", "arg_json_value_prefix", 200, 8 },
+{ "RadChatFormat", "content_open", 208, 8 },
 { "RadConstraint", "", 0, 32 },
 { "RadConstraint", "key", 0, 8 },
 { "RadConstraint", "op", 8, 4 },

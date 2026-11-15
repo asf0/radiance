@@ -17,6 +17,7 @@
 #include "lookup.h"
 #include "metrics.h"
 #include "ngram.h"
+#include "diag/diagnose.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -230,6 +231,17 @@ public:
     void     take_completed(std::vector<uint64_t>* out);
     int      reap(uint64_t id);
 
+    /* ---------------------------------------------------------- the step record (--diagnose)
+     *
+     * One diag::StepRecord per committed step, in a ring sized at init and only with --diagnose: a
+     * serving process keeps no ring and records nothing. A reader takes every step a phase ran --
+     * its shape and its time -- without a second clock. Both calls take the lock; `step_records`
+     * appends what came after `from` and returns how many of those the ring overwrote before they
+     * were read (diag/diagnose.h). */
+    uint64_t step_record_count() const;
+    size_t   step_record_capacity() const;   /* 0 without --diagnose */
+    uint64_t step_records(uint64_t from, std::vector<diag::StepRecord>* out) const;
+
     /* ---------------------------------------------------------- the lock, for the engine
      *
      * Every mutation of the KV manager and the prefix cache happens under this lock; neither has
@@ -374,6 +386,9 @@ public:
      * so the draft rounds are charged to the step (see the definition). Without it the counters
      * stay correct but there is no timing. */
     void            step_finished();
+    /* Feed the open mixed step a completed service time, as step_finished does. Visible for
+     * deterministic scheduler tests and timed host simulations. */
+    void            note_mixed_step_cost(int64_t ns);
 
     /* ---------------------------------------------------- the serial drafter (spec §10)
      *
@@ -514,7 +529,8 @@ public:
      * and `shared` says rows are already planned ahead of it. Returns `budget` when
      * --busy-prefill-chunk is off, or when auto has nothing to reserve. */
     int64_t busy_cap(int64_t n_computed, int64_t n_target, int64_t budget, int64_t reserve,
-                     bool shared = false, bool rows_only = false) const;
+                     bool shared = false, bool rows_only = false,
+                     int64_t mixed_target_shares = 0, int64_t mixed_target_decode_reserve = 0) const;
     /* Where a prefill chunk of a `n_target`-token sequence may end. For a sequence with a runtime
      * window (IKVManager::set_window) a chunk ends at the prompt, and past it the output a
      * recompute replays runs one token a step: the ring rewrites its slots in place, so a
@@ -800,6 +816,13 @@ private:
      * throughput window; metrics() decays what it reports by this. */
     std::chrono::steady_clock::time_point last_step_at_ = std::chrono::steady_clock::now();
     int64_t step_prefill_tok_ = 0, step_decode_tok_ = 0;
+    /* The step record, picked once at init: with --diagnose the ring is sized and record_step is
+     * written into it, without it step_finished calls a no-op. One indirect call a step, no test
+     * of the mode and no ring on the serving path. Callers of step_finished hold mu_. */
+    void record_step(int64_t ns, int64_t end_ns);
+    void record_no_step(int64_t, int64_t) {}
+    void (Scheduler::*record_step_)(int64_t, int64_t) = &Scheduler::record_no_step;
+    diag::StepRing step_ring_;
     /* --prefill-interleave: decode-only steps still owed before the next chunk, and how many
      * prefilling requests the last step() held back. step_next_locked stops issuing ahead once
      * the hold is spent, or the chunk would wait as long as the decoders keep stepping ahead. */
@@ -812,6 +835,17 @@ private:
     static constexpr int64_t kInterleaveAutoMax = 64;
     double  ema_chunk_s_ = 0.0, ema_decode_s_ = 0.0;
     void    step_cost_locked(bool chunk, double seconds);
+    /* --mixed-step-target-ms: learned mixed-step cap and whether this planning pass has a decoder
+     * whose output latency the cap protects. */
+    MixedStepTarget mixed_target_;
+    bool            mixed_target_active_ = false;
+    /* Aggregate prefill rows already admitted to this mixed step. The learned cap is a budget
+     * for the step, not a per-request allowance. */
+    int64_t         mixed_target_prefill_planned_ = 0;
+    /* At least one prefill in the issued mixed step has work beyond this chunk. Unlike a true
+     * prompt tail, a policy or checkpoint-limited chunk is representative feedback. */
+    bool            mixed_target_prefill_continues_ = false;
+    void            mixed_target_observe_locked(int64_t ns);
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;
@@ -875,7 +909,8 @@ private:
     /* RAD_OK, or a negative status when the request cannot be admitted now, nor anything behind
      * it. `reserve`: tokens of the step to leave for the requests queued behind this one
      * (--busy-prefill-chunk; busy_cap); 0 plans the chunk on the whole budget. */
-    int  admit_one(SchedReq& s, int64_t budget, int64_t reserve = 0);
+    int  admit_one(SchedReq& s, int64_t budget, int64_t reserve = 0,
+                   int64_t mixed_target_shares = 0);
     /* Positive sentinel from admit_one: the request waits (its context is still being read off
      * disk, or a preempted prefill has no room yet) and the walk may ask the one behind it. */
     static constexpr int kAdmitWait = 1;

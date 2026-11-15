@@ -32,6 +32,7 @@
 #include "text/chatfmt.h"
 #include "text/chatparse.h"
 
+#include "../arch/museglimmer/chat.h"
 #include <arch/rad_deepseek41_chat.h>
 
 #include "util/json.h"
@@ -2668,5 +2669,129 @@ TEST(a_long_reply_holds_a_constant_number_of_bytes) {
     }
 }
 
-RAD_TEST_MAIN()
+/* ================================================================== Muse's channels
+ *
+ * The model opens its own channel after `<|start|>assistant`: ` to=self<|message|>` reasoning
+ * first, or ` to=user<|message|>` straight into the answer when it does not reason
+ * (arch/museglimmer/chat.h). The header of an answer that follows reasoning is reasoning_close's;
+ * the header of an answer that does not is content_open's. */
 
+static std::shared_ptr<const ReplyParser> muse_parser(bool tools, bool extract = true) {
+    static const json t = agent_tools();
+    ChatFormat f;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(museglimmer::muse_chat_format(), &f, &why));
+    ReplyOptions ro;
+    ro.extract_reasoning = extract;
+    ro.terminators = { "<|eot|>" };
+    if (tools) ro.tools = &t;
+    return parser_of(f, ro);
+}
+
+/* `reply` read whole, then streamed at every cut: the answer must come out as `content`, with
+ * `reasoning` split off and no call. */
+static void muse_reads(const std::shared_ptr<const ReplyParser>& rp, const std::string& reply,
+                       const std::string& content, const std::string& reasoning = "") {
+    REQUIRE(rp);
+    const ReplyMessage m = reply_parse(*rp, reply);
+    if (m.content != content || m.reasoning != reasoning || !m.calls.empty())
+        ::radtest::fail(__FILE__, __LINE__, "reply " + quote(reply) + " read as content " +
+                        quote(m.content) + ", reasoning " + quote(m.reasoning) + ", " +
+                        std::to_string(m.calls.size()) + " calls");
+    const std::string e = stream_all(*rp, reply);
+    if (!e.empty()) ::radtest::fail(__FILE__, __LINE__, "reply " + quote(reply) + ": " + e);
+    ++::radtest::checks();
+}
+
+/* A reply with no reasoning opens on the user channel, and the header is not content. */
+TEST(a_muse_reply_that_opens_on_the_content_channel_drops_its_header) {
+    for (bool tools : { false, true }) {
+        const auto rp = muse_parser(tools);
+        muse_reads(rp, " to=user<|message|>Here are five prime numbers: 2, 3, 5, 7, 11.<|eot|>",
+                   "Here are five prime numbers: 2, 3, 5, 7, 11.");
+        muse_reads(rp, "to=user<|message|>Hi", "Hi");
+        muse_reads(rp, "\n to=user<|message|>\nHi there\n", "\nHi there");
+        muse_reads(rp, " to=user<|message|>", "");
+        /* The header's words later in the answer are the answer's. */
+        muse_reads(rp, " to=user<|message|>write to=user<|message|> next", "write to=user<|message|> next");
+    }
+    /* Reasoning kept inline (reasoning_format none): the answer's header is still dropped. */
+    muse_reads(muse_parser(false, false), " to=user<|message|>Hi<|eot|>", "Hi");
+}
+
+/* Text that starts like the header but is not it is the reply, unchanged, and nothing of it is
+ * held back for good. */
+TEST(a_muse_reply_that_only_starts_like_the_content_header_is_unchanged) {
+    for (bool tools : { false, true }) {
+        const auto rp = muse_parser(tools);
+        for (const char* r : { "to=users are asked to wait", "to=user", "to=user<|message", "to=",
+                               "to=user<|message|", "to=user <|message|>x", "to=use", "t",
+                               "to=user<|messages|>x", "to=self", "to=sel", "x to=user<|message|>y",
+                               "to=user to=user<|message|>y" })
+            muse_reads(rp, r, r);
+        muse_reads(rp, "to=users are asked to wait<|eot|>", "to=users are asked to wait");
+        muse_reads(rp, "to=user\n<|message|>x", "to=user\n<|message|>x");
+    }
+}
+
+/* Reasoning first, then the user channel: the header after the block is reasoning_close's, and
+ * a header-shaped string inside the answer stays. */
+TEST(a_muse_reply_that_reasons_first_reads_as_before) {
+    for (bool tools : { false, true }) {
+        const auto rp = muse_parser(tools);
+        muse_reads(rp, " to=self<|message|>Five primes.<|eom|><|start|>assistant to=user<|message|>2, 3, 5, 7, 11.<|eot|>",
+                   "2, 3, 5, 7, 11.", "Five primes.");
+        muse_reads(rp, " to=self<|message|>r<|eom|><|start|>assistant to=user<|message|>to=user<|message|>x",
+                   "to=user<|message|>x", "r");
+    }
+}
+
+/* A tool call after reasoning is handed off exactly as before: the channel header is framing, the
+ * call is a call, and the content is empty. */
+TEST(a_muse_tool_call_after_reasoning_is_unchanged) {
+    const auto rp = muse_parser(true);
+    REQUIRE(rp);
+    const std::string reply =
+        " to=self<|message|>Look at it.<|eom|><|start|>assistant to=read<|message|>"
+        "<atem:function_calls>\n<atem:invoke name=\"read\">\n"
+        "<atem:parameter name=\"path\">a.txt</atem:parameter>\n</atem:invoke>\n"
+        "</atem:function_calls>";
+    const ReplyMessage m = reply_parse(*rp, reply);
+    CHECK_EQ(m.content, std::string());
+    CHECK_EQ(m.reasoning, std::string("Look at it."));
+    REQUIRE_EQ(m.calls.size(), (size_t)1);
+    CHECK_EQ(m.calls[0].name, std::string("read"));
+    CHECK_EQ(m.calls[0].arguments, std::string("{\"path\":\"a.txt\"}"));
+    const std::string e = stream_all(*rp, reply);
+    CHECK(e.empty());
+    if (!e.empty()) std::fprintf(stderr, "%s\n", e.c_str());
+}
+
+/* The header is a declared literal like any other: it travels in the ABI struct, reads as absent
+ * from a struct that ends before it, and a format without one reads a reply as it always did. */
+TEST(the_content_header_is_declared_through_the_abi_struct) {
+    ChatFormat f;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(museglimmer::muse_chat_format(), &f, &why));
+    CHECK_EQ(f.content_open, std::string("to=user<|message|>"));
+    CHECK_OK(chat_format_check(f, &why));
+    const std::vector<std::string> mk = chat_format_markers(f);
+    CHECK(std::find(mk.begin(), mk.end(), "to=user<|message|>") != mk.end());
+    /* A plugin compiled before the field: struct_size stops short of it. */
+    RadChatFormat old = *museglimmer::muse_chat_format();
+    old.struct_size = (uint32_t)offsetof(RadChatFormat, content_open);
+    ChatFormat g;
+    CHECK_OK(chat_format_from_abi(&old, &g, &why));
+    CHECK(g.content_open.empty());
+    CHECK_EQ(g.reasoning_open, f.reasoning_open);
+    CHECK(chat_format_describe(g).find("content") == std::string::npos);
+    /* Without it the header is content, as before. */
+    std::shared_ptr<const ReplyFormat> rf;
+    CHECK_OK(ReplyFormat::compile(g, &rf, &why));
+    ReplyOptions ro;
+    std::shared_ptr<const ReplyParser> rp;
+    CHECK_OK(ReplyParser::create(rf, ro, &rp, &why));
+    CHECK_EQ(reply_parse(*rp, " to=user<|message|>Hi").content, std::string("to=user<|message|>Hi"));
+}
+
+RAD_TEST_MAIN()

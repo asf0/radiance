@@ -154,6 +154,7 @@ void Metrics::sample(const SchedMetrics& m) {
     /* Nanoseconds in the scheduler, seconds on the wire, as engine_step_seconds_* use. */
     g_step_best_.set((double)m.step_ns_decode_best / 1e9);
     g_step_recent_.set((double)m.step_ns_decode_recent / 1e9);
+    g_mixed_step_target_cap_.set((double)m.mixed_step_target_prefill_cap);
     const int seen = std::max(0, std::min(m.draft_depth_seen, (int)MAX_DRAFT_POS));
     for (int j = 0; j < seen; ++j) {
         const int64_t r = m.draft_pos_reached[j];
@@ -184,6 +185,8 @@ void Metrics::sample(const SchedMetrics& m) {
     c_steps_ahead_.advance_to(m.steps_ahead);
     c_prefill_capped_.advance_to(m.prefill_chunks_capped);
     c_steps_held_.advance_to(m.steps_held);
+    c_mixed_step_target_steps_.advance_to(m.mixed_step_target_steps);
+    c_mixed_step_target_misses_.advance_to(m.mixed_step_target_misses);
     c_rows_unspec_.advance_to(m.decode_rows_unspeculated);
     c_step_secs_.advance_to((double)m.step_ns * 1e-9);
     c_step_secs_decode_.advance_to((double)m.step_ns_decode * 1e-9);
@@ -418,6 +421,16 @@ std::string Metrics::render() const {
     w.counter("radiance:engine_steps_held_total",
               "Decode-only steps run after a prefill chunk while other sequences decode "
               "(--prefill-interleave).", L, c_steps_held_.get());
+    w.counter("radiance:mixed_step_target_steps_total",
+              "Mixed prefill/decode steps observed by --mixed-step-target-ms.",
+              L, c_mixed_step_target_steps_.get());
+    w.counter("radiance:mixed_step_target_misses_total",
+              "Mixed steps whose completed service time exceeded --mixed-step-target-ms.",
+              L, c_mixed_step_target_misses_.get());
+    if (g_mixed_step_target_cap_.get() > 0)
+        w.gauge("radiance:mixed_step_target_prefill_cap",
+                "Current learned prefill-row cap used while decode sequences are active.",
+                L, g_mixed_step_target_cap_.get());
     w.counter("radiance:decode_rows_unspeculated_total",
               "Decode rows that took no draft, for any reason.",
               L, c_rows_unspec_.get());

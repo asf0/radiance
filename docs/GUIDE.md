@@ -314,6 +314,8 @@ and runs.
 | `qwen4exp_fp8` | Qwen4-Exp / Qwen3.8-Flash-Next: hybrid Gated DeltaNet + gated attention, 512 experts |
 | `gemma4` | Gemma 4 text decoders (26B-A4B MoE and the dense members): bf16 trunk, routed experts bf16 or block fp8, and the DFlash drafter |
 | `gemma4_bf16` | Gemma 4 dense in bf16, with its vision tower |
+| `museglimmer` | Meta Muse Glimmer 30B: gated attention alternating sliding-window (rotary) and NoPE full layers, Gemma-2 double norms, a 50-block windowed ViT; bf16 |
+| `museglimmer_ct` | the same trunk as an int4 container (`--set quantization_config.quant_method=compressed-tensors`) |
 | `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
 | `nomicbert` | nomic-embed-text-v2-moe, an embedding model (§5.6) |
@@ -1469,6 +1471,32 @@ short of the boundary and the next step finishes it. A prompt with nothing besid
 `off` lets a chunk take the whole step; `N` holds a shared chunk to N tokens (startup warns when N is
 under the stager's step). `radiance:engine_prefill_chunks_capped_total` counts the chunks held back.
 
+**Adaptive mixed-step latency** (`mixed-step-target-ms: N`, default off). A mixed step contains
+both prefill rows and at least one decoding sequence. When this flag is set, completed mixed steps
+teach a model-agnostic controller an aggregate prefill-row cap. The cap is shared fairly among the
+prefills in that step, decode rows are reserved first, and a lone prefill remains unchanged. This
+is a soft service-time target, not a request deadline: timing starts when the engine issues the
+step and ends after its forward and speculative-drafter work. Queueing, HTTP transport and the
+client are outside it, and the legal chunk quantum, fixed decode cost, media passes or host jitter
+can make the target unattainable.
+
+The controller starts at one quarter of the model's shared-step capacity, corrects an over-target
+representative chunk immediately, and grows cautiously after three clearly under-target samples.
+A true prompt tail does not change the learned cap; a checkpoint or fixed busy-chunk boundary does,
+because the prompt continues and a lower cap can shorten its next step. If the target is lower than
+one legal mixed step, the cap bottoms out at one prefill quantum and misses remain visible. Startup
+refuses configurations whose token budget or explicit busy cap cannot carry one legal prefill
+quantum beside a decode row. When the batch budget cannot carry one quantum for every simultaneous
+prefill, equal sharing applies to the requests that fit and the scheduler's priority/arrival order
+continues the rest on later steps; startup prints that capacity. Raise the batch budget if every
+admitted prefill must progress in every mixed step.
+
+Use the target for an interactive multi-user deployment where long fresh prompts otherwise make
+active streams pause. It redistributes when useful work completes; it does not make the prefill
+free, and may lower fresh-prefill throughput under contention. Pin and measure the target per
+deployment rather than branching the scheduler by model name. The relevant metrics are
+`radiance:mixed_step_target_steps_total`, `_misses_total`, and `_prefill_cap`.
+
 **Check the prefix cache after changing the chunk.** The larger arena shrinks the KV pool (here
 516,864 to 499,920 pool tokens, 3.3%), and §4.3's cliff is sharp. With two ~180K sessions (first
 turns back to back, then the first session's second turn), a 512 chunk took 137.7 s, 130.0 s and
@@ -1844,7 +1872,9 @@ models:
 - `prefix-cache-mib: N` enables the host tier, up to N MiB. It holds attention blocks only; a hybrid
   model's linear-state snapshots are already in host memory, in the `checkpoint-slots` store. A
   conversation larger than the tier keeps its start there and is prefilled again past it once VRAM
-  gives the rest up; the startup log warns when the tier holds less than one `max-model-len`
+  gives the rest up (for a request that needs the room, or where a few leftover blocks high in the
+  pool keep the expert slab's loan from most of it under `placement: expert_tiered`); the startup
+  log warns when the tier holds less than one `max-model-len`
   conversation and says how many MiB would, and a `kv tiers: ... got no host copy` line appears when
   it happens (`/sessions` `moved.held_back`).
   While a KV group streams (`kv-resident`), the tier is off and its MiB are not reserved: a
@@ -2297,6 +2327,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 |---|---|---|
 | `max-num-batched-tokens: N` | 2048 | largest token count one step may carry |
 | `prefill-interleave: N` | auto:1 (0 under `deterministic: true`, KL mode, generators) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time, `auto:SHARE` in SHARE of it (0 < SHARE <= 4); `0` lets every step carry a chunk |
+| `mixed-step-target-ms: N` | 0 (off) | soft completed-service-time target for mixed prefill/decode steps; learns one aggregate prefill cap while decoders are active and leaves uncontended prefill unchanged (§4.5) |
 | `preempt-wait-ms: N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step. A preempted request publishes what it computed to the prefix cache, as a finished one does, so its recompute adopts its prompt instead of computing it again; under pressure the cache gives those blocks back, the newest last, before another request is preempted |
 | `busy-prefill-chunk: MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `max-num-seqs: N` | 256 | largest number of sequences one step may carry |
@@ -2446,6 +2477,18 @@ keys are refused on it, and so are the pixel bands.
 | `kld-lora: NAME` | run the documents through the `lora` adapter `NAME` (§4.9.1), e.g. against a reference recorded from the merged checkpoint |
 | `kld-lora-sources: PREFIX` | with `kld-lora`, only the documents whose `source` starts with `PREFIX` run through the adapter; the rest run as the base, in the same steps |
 
+**Self-measurement**, instead of serving: a fixed workload, a report, an exit code; see [DIAGNOSE.md](DIAGNOSE.md)
+
+| key | default | |
+|---|---|---|
+| `diagnose: DIR` | — | run a fixed workload instead of serving and write `DIR/diagnose.json` and `DIR/diagnose.md`: step times, tokens a step, draft acceptance, TTFT, emission intervals, jitter, by prompt category, concurrency and prefill depth |
+| `diagnose-tokens: N` | 256 | tokens a decode stream generates |
+| `diagnose-runs: N` | 3 | measured runs of each point, after one unmeasured |
+| `diagnose-concurrency: LIST` | 1,2,4,8 | stream counts of the concurrency sweep |
+| `diagnose-prefill: LIST` | 1024,4096,16384,65536 | prompt lengths of the prefill sweep |
+| `diagnose-corpus: FILE` | built-in | JSONL of category prompts |
+| `diagnose-baseline: FILE` | — | an earlier `diagnose.json`: compare every request's tokens with it |
+
 **Diagnostics**
 
 | key | |
@@ -2488,7 +2531,7 @@ keys are refused on it, and so are the pixel bands.
 | `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client (§5.9) |
 | `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and clients of llama-server's own API (§5.9) |
 | `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves) and `root` (the `model` path) as vLLM reports them, and `capabilities` (the same object `/server_info` reports); `:id` returns the entry itself, as OpenAI's retrieve does |
-| `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness |
+| `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness; 503 with `"status": "stuck"` once the device has advanced nothing for a minute. A device stuck for `scheduler.stuck-exit` (60s; `0` never) ends the process (exit status 70, the queues it is stuck on in the log), so a restart policy brings the server back |
 | `GET /load` | current load |
 | `GET /version` | server version |
 | `GET /props` | llama-server's props: `n_ctx`, `total_slots`, `modalities`, `model_path`, the chat template and its capabilities, `bos_token`/`eos_token`, and the request defaults under llama-server's names |
@@ -3551,12 +3594,48 @@ curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json
   minutes; the model ends the speech at the end of the text. The prompt holds at most 512 tokens.
 - **`seed`**, **`response_format`**, **`speed`** and **`voice`** are read as for music below
   (`voice` is ignored here too: the instructions say who speaks); `num_inference_steps` is refused
-  (the model has no denoiser). Cloning a voice from a recording is not served.
+  (the model has no denoiser).
+
+**Voice cloning:** supply `references: [{"audio": "...", "text": "..."}]`, with one clean recording
+and its exact transcript. `audio` is a base64-encoded audio file or a base64 data URL, not a server
+path or remote URL. The server decodes/resamples it to 24 kHz mono. The recording may hold at most
+10 seconds, including zero-padding to whole 1920-sample frames. Its transcript, audio frames and
+new speech together must fit the 512-row prompt. Obtain the speaker's consent and rights to the
+recording before cloning.
+
+```sh
+python3 - <<'PY' > clone.json
+import base64, json
+with open("reference.wav", "rb") as f:
+    audio = base64.b64encode(f.read()).decode("ascii")
+print(json.dumps({"input": "Here is a new sentence in the reference voice.",
+                  "references": [{"audio": audio, "text": "The exact words in reference.wav."}],
+                  "guidance_scale": 1, "response_format": "wav", "seed": 42}))
+PY
+curl --fail-with-body http://localhost:8000/v1/audio/speech \
+    -H 'Content-Type: application/json' --data-binary @clone.json -o clone.wav
+```
+
+Cloning uses Breeze's `ref_clone_tata` continuation template. Omit `instructions` and use
+`guidance_scale: 1` (the default) to keep the reference delivery. To direct the cloned voice,
+also supply `instructions`, for example `"Speak softly and slowly, with a reassuring delivery."`,
+and start with `guidance_scale: 4`. This selects `ref_edit_tata`: the conditional prompt includes
+the reference and direction, while its guidance baseline includes the same reference without
+direction. Each branch has its own text length and reference-frame map; the audio is encoded
+once and shared. Higher guidance strengthens direction but can affect naturalness or identity.
+This is ordinary two-branch guidance, not Breeze's three-branch dual-guidance mode (not served).
+WAV, PCM, HTTP streaming and the speech WebSocket use the same reference encoder and templates.
+**Reconvert older Breeze `.rad` files with the updated recipe to clone voices:** older conversions
+omitted the audio encoder's weights. Such a container still serves speech as before, and a request
+with `references` is answered 400 (`this model takes no reference audio`). The new encoder and its
+Euclidean codebooks stay in f32; no Python model runtime or external encoder service is needed for
+requests.
 
 Speech is played four frames (0.32 s) at a time as it is made, so the streamed forms below carry it
 as it is spoken. On one R9700 a sentence is made at 0.6 of the time it plays (5.1 s of speech in
 3.1 s), and a stream's first audio comes 0.21 s after the request; four speak at once at about the
-speed they play (43 s of speech in 12.1 s). Breeze-TTS-2 is licensed for research and
+speed they play (43 s of speech in 12.1 s). These measurements are for reference-free speech;
+cloning adds reference-encoding work before the first frame. Breeze-TTS-2 is licensed for research and
 non-commercial use only, and BreezeBlue counts hosting it as an API as commercial.
 
 #### Speech: drama-3
@@ -4152,6 +4231,8 @@ always 1 and carries the cache's settings as labels: `cache_dtype`, `block_size`
 | `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `draft-window: adaptive` (§4.6) |
 | `engine_prefill_chunks_capped_total` | prefill chunks held back to share a step (§4.5) |
 | `engine_steps_held_total` | decode-only steps `prefill-interleave` ran between chunks (§4.5) |
+| `mixed_step_target_steps_total`, `mixed_step_target_misses_total` | mixed steps observed by `mixed-step-target-ms`, and those whose completed engine service time exceeded its soft target (§4.5) |
+| `mixed_step_target_prefill_cap` | current learned aggregate prefill-row cap; absent while the policy is off (§4.5) |
 | `attn_cached_tokens_total`, `linear_cached_tokens_total` | prefix reuse, both halves |
 | `linear_checkpoints_written_total`, `linear_prefix_cache_hit_rate` | |
 | `prefix_cache_evictions_total`, `prefix_cache_ckpt_evictions_total` | |
@@ -4313,7 +4394,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 2.0.0
+I STARTUP REPORT -- radiance 2.1.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [models.flashnext.model]
 I   --tp                               2                                           [models.flashnext.tp]

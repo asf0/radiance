@@ -2615,6 +2615,24 @@ TEST(the_steps_a_prefill_interleave_held_are_counted) {
     CHECK(it != d.samples.end() && it->second == 6.0);
 }
 
+TEST(the_mixed_step_target_controller_is_observable) {
+    Metrics m("m", 1024);
+    server::SchedMetrics s;
+    s.mixed_step_target_steps = 9;
+    s.mixed_step_target_misses = 2;
+    s.mixed_step_target_prefill_cap = 384;
+    m.sample(s);
+    PromDoc d = parse_prom(m.render());
+    CHECK_EQ((int)d.errors.size(), 0);
+    CHECK_EQ(d.type["radiance:mixed_step_target_steps_total"], std::string("counter"));
+    CHECK_EQ(d.type["radiance:mixed_step_target_misses_total"], std::string("counter"));
+    CHECK_EQ(d.type["radiance:mixed_step_target_prefill_cap"], std::string("gauge"));
+    const auto cap = d.samples.find(
+        "radiance:mixed_step_target_prefill_cap{model_name=\"m\",engine=\"0\"}");
+    CHECK(cap != d.samples.end());
+    if (cap != d.samples.end()) CHECK_NEAR(cap->second, 384.0, 1e-9);
+}
+
 /* Each draft position's acceptances are a counter next to its reach. At a fixed depth position
  * j+1's reach is j's acceptances, but an adaptive window can end at j with j taken, so a ratio
  * over a window needs both. Here two verifies end at position 1 with it accepted. */

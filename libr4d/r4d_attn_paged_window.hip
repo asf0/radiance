@@ -30,8 +30,8 @@
  *   k_descale / v_descale per (sequence, kv head), absent = 1
  *   attn_paged_sink: `sinks` [query heads] f32, one logit a head in the scaled-score domain, in
  *     the softmax's maximum and denominator and with no value (LiLiCorr's drafter). Folded in where
- *     a row is normalised: the unsplit kernel's store and the merge. The WMMA kernel takes none,
- *     so a sink launch stays scalar.
+ *     a row is normalised: the unsplit kernel's store, the merge, and the WMMA prefill kernel's
+ *     running max and denominator. A decode-sized sink launch stays scalar.
  *
  * Paged layout: kv_cache[n_blocks, kv_heads, 16, 2*head_dim], K then V per slot, so one block of
  * one KV head is a contiguous run of 16 * 2 * head_dim elements; a key tile is one or two runs,
@@ -732,7 +732,12 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
     for (int mc = 0; mc < kDQ / 16; ++mc)
 #pragma unroll
         for (int e = 0; e < 8; ++e) oacc[mc][e] = 0.0f;
-    float m = -__builtin_inff(), l = 0.0f;
+    /* The learned sink is a key with no value: it joins the running max and the denominator
+     * (log2 domain). Keys are split across lane and lane^16, so only lane h=0 seeds the sink's
+     * weight of one; the final lt2 adds the two lanes. */
+    const float sink = A.sinks ? A.sinks[kh * GQA + g] * 1.4426950408889634f
+                               : -__builtin_inff();
+    float m = sink, l = (A.sinks && h == 0) ? 1.0f : 0.0f;
 
     /* ---- the key tiles, one paged block each, prefetched one ahead through registers */
     uint4 pk[KPT], pv[VPT][2];
@@ -1249,7 +1254,7 @@ static int launch_attn(const RadArgs* a, RadStream stream, bool sink = false) {
                             rows >= n_seq * (kWmmaMinQ / 2);
         const bool aligned = rad_ptr_aligned(q->data, 16) && rad_ptr_aligned(o->data, 16) &&
                              (q_rs | q_hs | o_rs | o_hs) % 8 == 0;
-        if (shaped && aligned && !sk) {
+        if (shaped && aligned) {
             constexpr int BQW = WGeo<HD>::R / GQA;
             int64_t ntw = 0, tpsw = 0;
             if (!cu) {
@@ -1282,6 +1287,7 @@ static int launch_attn(const RadArgs* a, RadStream stream, bool sink = false) {
             W.window = (int)window;
             W.shared_window = SHARED;
             W.ahead = FWD ? 1 : 0;
+            W.sinks = sk ? (const float*)sk->data : nullptr;
             W.n_split = 1;
             R4D_KLAUNCH(R4D_KNAME(attn_wmma_kernel<HD, GQA, KV8>), dim3((unsigned)ntw, (unsigned)kvh, 1u),
                        dim3(kWThreads), (hipStream_t)stream, W);
@@ -1304,7 +1310,6 @@ static int launch_attn(const RadArgs* a, RadStream stream, bool sink = false) {
                        !rad_ptr_aligned(a->scratch, 16)))
             ns = 1;   /* never wrong, only slower: the unsplit kernel writes the rows itself */
     }
-
     AttnArgs A{};
     A.q = (const uint16_t*)q->data;           A.q_rs = q_rs;  A.q_hs = q_hs;
     A.kv = (const unsigned char*)kv->data;    A.kv_sb = kv->stride[0];  A.kv_sh = kv->stride[1];
@@ -1365,7 +1370,9 @@ extern "C" {
     int r4d_rad_attn_window_h##HD##_gqa##G##_i8(const RadArgs* a, RadStream s) {                  \
         return r4d_win::launch_attn<HD, G, 2>(a, s);                                              \
     }
-R4D_WIN_DEF(128, 1)
+/* h128 gqa16: Muse Glimmer's sliding layers, 32 query heads over 2 KV heads; the same
+ * launch_attn the sink variant below already runs at this geometry. */
+R4D_WIN_DEF(128, 1) R4D_WIN_DEF(128, 16)
 R4D_WIN_DEF(256, 1) R4D_WIN_DEF(256, 2) R4D_WIN_DEF(256, 4) R4D_WIN_DEF(256, 8)
 R4D_WIN_DEF(512, 1) R4D_WIN_DEF(512, 2) R4D_WIN_DEF(512, 4) R4D_WIN_DEF(512, 8) R4D_WIN_DEF(512, 16)
 #undef R4D_WIN_DEF

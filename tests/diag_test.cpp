@@ -750,4 +750,45 @@ TEST(the_json_carries_every_section) {
     CHECK(text.find("WARN link-below-max") != std::string::npos);
 }
 
+TEST(a_card_sample_reads_temperatures_by_label_and_the_current_level) {
+    Root r;
+    const std::string d = "/sys/bus/pci/devices/0000:03:00.0";
+    r.put(d + "/power_dpm_force_performance_level", "auto\n");
+    r.put(d + "/pp_dpm_sclk", "0: 500Mhz\n1: 1800Mhz *\n2: 2350Mhz\n");
+    r.put(d + "/pp_dpm_mclk", "0: 96Mhz\n1: 1258Mhz *\n");
+    r.put(d + "/gpu_busy_percent", "0\n");
+    r.put(d + "/hwmon/hwmon3/temp1_input", "45000\n");
+    r.put(d + "/hwmon/hwmon3/temp1_label", "edge\n");
+    r.put(d + "/hwmon/hwmon3/temp2_input", "61000\n");
+    r.put(d + "/hwmon/hwmon3/temp2_label", "junction\n");
+    r.put(d + "/hwmon/hwmon3/temp3_input", "52000\n");
+    r.put(d + "/hwmon/hwmon3/temp3_label", "mem\n");
+    r.put(d + "/hwmon/hwmon3/power1_input", "31000000\n");   /* no power1_average: the instant reading */
+    /* A card whose driver labels nothing: its temp1 is the edge sensor. */
+    const std::string e = "/sys/bus/pci/devices/0000:07:00.0";
+    r.put(e + "/hwmon/hwmon5/temp1_input", "38000\n");
+    r.put(e + "/hwmon/hwmon5/power1_average", "12000000\n");
+    r.put(e + "/hwmon/hwmon5/power1_input", "99000000\n");
+
+    const auto s = diag::sample_cards(r.dir, { "0000:03:00.0", "0000:07:00.0", "0000:0b:00.0" });
+    REQUIRE(s.size() == 3);
+    CHECK_EQ(s[0].perf_level, std::string("auto"));
+    CHECK_EQ(s[0].sclk_cur, std::string("1800Mhz"));
+    CHECK_EQ(s[0].mclk_cur, std::string("1258Mhz"));
+    CHECK_EQ(s[0].busy_percent, 0);
+    CHECK_EQ(s[0].edge_mc, (int64_t)45000);
+    CHECK_EQ(s[0].junction_mc, (int64_t)61000);
+    CHECK_EQ(s[0].mem_mc, (int64_t)52000);
+    CHECK_EQ(s[0].power_uw, (int64_t)31000000);
+    CHECK_EQ(s[1].edge_mc, (int64_t)38000);
+    CHECK_EQ(s[1].junction_mc, (int64_t)-1);
+    CHECK_EQ(s[1].power_uw, (int64_t)12000000);   /* the average, when there is one */
+    CHECK(s[1].perf_level.empty());
+    /* A card with no files at all is all unknown, not an error. */
+    CHECK_EQ(s[2].bdf, std::string("0000:0b:00.0"));
+    CHECK_EQ(s[2].edge_mc, (int64_t)-1);
+    CHECK_EQ(s[2].power_uw, (int64_t)-1);
+    CHECK(s[2].sclk_cur.empty());
+}
+
 RAD_TEST_MAIN()

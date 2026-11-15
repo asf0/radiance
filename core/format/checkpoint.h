@@ -49,6 +49,10 @@ struct SrcTensor {
     std::vector<int64_t> shape;                        /* row-major */
     const void*          data = nullptr;
     int64_t              bytes = 0;
+    /* Owned payload for a derived tensor: a checkpoint's layout rebuilt at load time (the Ling
+     * GGUF's head-last k_b/v_b fused into the plugin's interleaved kv_b, its expert-last stacks
+     * regrouped per expert). When non-empty `data` points here and `rad_dtype` is RAD_F32. */
+    std::vector<float>   owned;
     /* GPTQ-packed (auto_gptq's layout, shared by AutoRound's `auto_round:auto_gptq` export):
      * `data` is the qweight's int32 words [K * bits / 32, N], each packing 32 / bits codes along K
      * from the low bits up, unsigned with zero point 2^(bits-1). The tensor described is the
@@ -220,6 +224,13 @@ private:
     int add_torch_files();
     int open_gguf(const std::string& path);
     void detect_import();
+    /* The Ling GGUF's layouts the plugin's names expect, rebuilt at load so the container's
+     * recipe never sees the source layout: the KDA layers' ssm_a (the exporter's exp(A_log))
+     * logged back to ssm_a_raw, the MLA layers' head-last k_b and v_b fused into one
+     * interleaved kv_b, the quantised q_b split into the plugin's nope and rope blocks, and
+     * the shared experts re-spelled under the block's mlp.shared_experts prefix. The routed
+     * stacks stay where the reader's fastest-first flip leaves them. */
+    int bailingmoe3_layouts();
 
     enum Kind { None, Gguf, SafeT } kind_ = None;
     std::string path_, dir_, tok_dir_, meta_dir_;

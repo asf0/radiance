@@ -4725,6 +4725,110 @@ TEST(dropping_a_clean_entry_gives_its_vram_back_and_keeps_it_restorable) {
     CHECK_EQ(x.f.pc.drop_clean(), 0);               /* nothing left to drop */
 }
 
+/* A conversation larger than the host tier keeps its end in VRAM only, with no host copy coming,
+ * so it never becomes clean. Left high in the pool by sequences that have since gone, a few such
+ * blocks stop the expert loan below them for as long as the server runs. drop_clean forgets them
+ * where giving them up lends far more than it loses, inside the loan it is asked about and once
+ * no sequence reads them. */
+struct Stragglers {
+    Fixture f;
+    IdleTiers t;
+    int64_t all = 0;
+    /* `slots` host entries; a sequence 9 over the bottom `under` blocks. */
+    int build(int slots, int under) {
+        int s = f.build(/*with_linear=*/false, 0);
+        if (s < 0) return s;
+        IdleTiers::Config c = tier_config(slots * 1024, 1024);
+        c.block_tokens = 16;
+        s = t.configure(c);
+        if (s < 0) return s;
+        f.pc.set_tiers(&t);
+        all = f.kv.total_blocks(G_FULL);
+        if (under <= 0) return RAD_OK;
+        s = f.kv.add_sequence(9);
+        return s < 0 ? s : f.kv.ensure(9, 16 * under);
+    }
+    /* A sequence that comes and goes: what makes drop_clean look again. */
+    void pass() {
+        CHECK_OK(f.kv.add_sequence(77));
+        CHECK_OK(f.kv.ensure(77, 16));
+        f.kv.free_sequence(77);
+    }
+};
+
+TEST(stragglers_with_no_host_copy_coming_leave_vram_for_the_loan) {
+    Stragglers x;
+    CHECK_OK(x.build(/*slots=*/16, /*under=*/300));
+    REQUIRE(x.all >= 400);
+    const auto prompt = tok_run(7700, 336);
+    publish(x.f, 1, prompt, 320);                   /* twenty blocks, at 300 and up */
+    CHECK_EQ(copy_now(x.t).size(), 16u);
+    CHECK_EQ(x.t.stats().held_back, 4ll);
+    const int64_t goal = (x.all - 100) * 16;        /* a loan down to block 100 */
+
+    /* Still read by its sequence: nothing goes, whatever the loan. */
+    CHECK_EQ(x.f.pc.drop_clean(goal), 0);
+    x.f.kv.free_sequence(9);
+    x.f.kv.free_sequence(1);
+
+    /* No loan asked for: the copied start leaves VRAM, the four blocks past the tier stay. */
+    CHECK_EQ(x.f.pc.drop_clean(), 16);
+    CHECK_EQ(x.f.pc.resident(), 4ll);
+    CHECK_EQ(x.f.pc.stats().evictions, 0ll);
+    CHECK_EQ(x.f.kv.straggler_mark(G_FULL), 0ll);   /* four blocks keep 316 from the loan */
+    const int64_t pinned = x.f.kv.spare_tokens();
+    CHECK(pinned <= (x.all - 316) * 16);
+    /* A loan that stops above them takes nothing. */
+    x.pass();
+    CHECK_EQ(x.f.pc.drop_clean((x.all - 330) * 16), 0);
+    CHECK_EQ(x.f.pc.resident(), 4ll);
+
+    /* The loan the slab is short of reaches below them: they are forgotten, the start is not. */
+    x.pass();
+    CHECK_EQ(x.f.pc.drop_clean(goal), 4);
+    CHECK_EQ(x.f.pc.resident(), 0ll);
+    CHECK_EQ(x.f.pc.size(), 16ll);
+    CHECK_EQ(x.f.pc.stats().evictions, 4ll);
+    CHECK_EQ(x.f.kv.pool_bytes_used(G_FULL), 0ll);
+    CHECK(x.f.kv.spare_tokens() > pinned);
+    CHECK_OK(x.f.kv.set_loan(x.f.kv.spare_tokens()));
+    CHECK_EQ(x.f.pc.restorable_from(prompt, {}).size(), 16u);
+}
+
+/* Context that fills its part of the pool is not a straggler, with or without a host copy: the
+ * loan stops at its edge and takes none of it, however large the loan asked about. The end of an
+ * older conversation left far above it is, and goes alone. */
+TEST(cached_context_that_fills_its_part_of_the_pool_stays_and_the_blocks_far_above_it_go) {
+    Stragglers x;
+    CHECK_OK(x.build(/*slots=*/8, /*under=*/300));
+    REQUIRE(x.all >= 400);
+    const auto older = tok_run(7800, 16 * 12 + 16);
+    publish(x.f, 1, older, 16 * 12);                /* twelve blocks, at 300 and up */
+    CHECK_EQ(copy_now(x.t).size(), 8u);             /* its start fills the tier */
+    x.f.kv.free_sequence(9);
+    x.f.kv.free_sequence(1);
+    const auto dense = tok_run(9100, 16 * 200 + 16);
+    publish(x.f, 2, dense, 16 * 200);               /* two hundred blocks from the bottom */
+    CHECK_EQ(copy_now(x.t).size(), 0u);             /* no room, and none is made here */
+    x.f.kv.free_sequence(2);
+
+    CHECK_EQ(x.f.pc.drop_clean(), 8);               /* the older start, to the host */
+    CHECK_EQ(x.f.pc.resident(), 204ll);
+    CHECK_EQ(x.f.kv.held_top_blocks(G_FULL), 312ll);
+    CHECK_EQ(x.f.kv.straggler_mark(G_FULL), 200ll); /* the edge of the dense part */
+
+    x.pass();
+    const int64_t goal = x.all * 16;                /* every block the pool has */
+    CHECK_EQ(x.f.pc.drop_clean(goal), 4);
+    CHECK_EQ(x.f.pc.resident(), 200ll);
+    CHECK_EQ(x.f.kv.held_top_blocks(G_FULL), 200ll);
+    CHECK_EQ(x.f.kv.straggler_mark(G_FULL), 200ll); /* nothing above the dense part now */
+    x.pass();
+    CHECK_EQ(x.f.pc.drop_clean(goal), 0);           /* which keeps every block */
+    CHECK_EQ(x.f.pc.resident(), 200ll);
+    CHECK_EQ(x.f.pc.lookup(dense, {}).n_attn_tokens, 16 * 200);
+}
+
 TEST(a_recomputed_shared_prefix_keeps_its_original_host_copy_and_snapshot) {
     /* A short request shares less than one checkpoint with an off-device conversation, so it
      * recomputes instead of adopting that prefix. Its different prefill shape can round the KV

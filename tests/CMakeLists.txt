@@ -10,12 +10,12 @@
 #   fast     every test with none of slow, gpu, oot and perf, set at the end of this file: the
 #            inner loop (`ctest --preset fast`, or `ctest -L fast`)
 #
-# arch_test, glm5next_test, nemotron35_test, spark25_arch_test and nemotronh_test do not link rad_core: they supply
+# arch_test, bailing_hybrid_arch_test, flint_arch_test, glm5next_test, museglimmer_test, nemotron35_test, spark25_arch_test and nemotronh_test do not link rad_core: they supply
 # their own recording fake of the declare-phase C ABI (arch_fakes.h), so plugins are tested without
 # depending on core/build/'s builder. With the archive linked, a new ABI call missing from the fake
 # would pull in rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a
 # single undefined reference.
-set(RAD_TESTS_NO_CORE arch_test glm5next_test nemotron35_test spark25_arch_test nemotronh_test)
+set(RAD_TESTS_NO_CORE arch_test bailing_hybrid_arch_test breeze_arch_test flint_arch_test glm5next_test museglimmer_test nemotron35_test spark25_arch_test nemotronh_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -137,6 +137,7 @@ set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every c
 set(RAD_TEST_CPU_BUDGET_arch_test 15)  # every plugin's graph declared; ~10.8 s with the batched-tower case
 set(RAD_TEST_CPU_BUDGET_device_test 30)  # on a card, the paging and remap cases spin in stream waits: ~10 s; with no card (the image's test stage) they copy, write and compare on the host: 17-19 s
 set(RAD_TEST_CPU_BUDGET_glm5next_test 20)  # GLM-5.3-Flash's graphs and op schemas: ~4.8 s built by GCC 16, ~10.1 s by GCC 14 (the image's Ubuntu)
+set(RAD_TEST_CPU_BUDGET_museglimmer_test 10)  # Muse Glimmer's trunk and tower graphs and steps: ~2 s built by GCC 14
 
 # Binaries whose OpenMP team is busy for most of their run, so a parallel ctest counts them as a
 # team's worth of slots rather than one.
@@ -415,7 +416,7 @@ endif()
 # arch_test and nemotronh_test read libref's vocabulary from $RADIANCE_HOME/kernels to check that
 # each architecture declares on it, and glm5next_test the loaded libraries' op schemas, so libref is
 # built before them.
-foreach(t arch_test glm5next_test nemotronh_test)
+foreach(t arch_test breeze_arch_test glm5next_test nemotronh_test)
   if(TARGET libref AND TARGET ${t})
     add_dependencies(${t} libref)
   endif()
@@ -565,9 +566,10 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_mhc.hip ${R4D_DIR}/r4d_kda.hip
                 ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip
                 ${R4D_DIR}/r4d_kv_resolve.hip ${R4D_DIR}/r4d_dsa.hip
-                ${R4D_DIR}/r4d_keyed.hip ${R4D_DIR}/r4d_lili.hip)
+                ${R4D_DIR}/r4d_keyed.hip ${R4D_DIR}/r4d_lili.hip
+                ${R4D_DIR}/r4d_vit_muse.hip)
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
-                  dsa lili)
+                  dsa lili vit)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -608,7 +610,8 @@ else()
                 ${R4D_EMU}/test_f32.cpp ${R4D_EMU}/test_mhc.cpp
                 ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_mla.cpp
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
-                ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_lili.cpp)
+                ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_lili.cpp
+                ${R4D_EMU}/test_vit.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -645,7 +648,7 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili)
+  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
@@ -865,9 +868,23 @@ endif()
 # standalone against it with find_package(radiance). The result must match the tree's plugins,
 # vocabulary and registration, and serve rad-kbench's fixture through the installed tools
 # (tests/oot_plugins.sh). libr4d is included when the tree built it, with the same HIP compiler,
-# targets and RAD_HIP_VOPD_REPEATABLE. Labelled `oot`: it rebuilds every plugin and takes minutes.
+# targets, build type and RAD_HIP_VOPD_REPEATABLE. Labelled `oot`: it rebuilds every plugin and
+# takes minutes.
+#
+# An installed radiance finds ROCm through ROCM_PATH and HIP_PATH (radiance-config.cmake), so the
+# test gets the root of the HIP runtime this tree links, and that root's tools first on PATH: the
+# out-of-tree build then uses the tree's ROCm whatever the shell that runs ctest exports. Left to
+# the caller's environment, a shell without them failed to find hip_runtime.h, and one naming
+# another ROCm build linked the out-of-tree libr4d against that one's runtime.
 set(RAD_OOT_COMPILER "")
 set(RAD_OOT_TARGETS "")
+set(RAD_OOT_ENV "")
+if(RAD_HIP_FOUND AND RAD_HIP_RUNTIME)
+  get_filename_component(RAD_OOT_ROCM "${RAD_HIP_RUNTIME}" DIRECTORY)
+  get_filename_component(RAD_OOT_ROCM "${RAD_OOT_ROCM}" DIRECTORY)
+  set(RAD_OOT_ENV "ROCM_PATH=${RAD_OOT_ROCM}" "HIP_PATH=${RAD_OOT_ROCM}"
+                  "PATH=${RAD_OOT_ROCM}/bin:${RAD_OOT_ROCM}/lib/llvm/bin:$ENV{PATH}")
+endif()
 if(RAD_HIP_FOUND AND TARGET libr4d)
   get_target_property(RAD_OOT_R4D_ARCH libr4d HIP_ARCHITECTURES)
   string(REPLACE ";" "\\;" RAD_OOT_R4D_ARCH "${RAD_OOT_R4D_ARCH}")
@@ -877,13 +894,13 @@ endif()
 add_test(NAME oot_plugins
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/oot_plugins.sh
                  ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR}/oot "${RAD_OOT_COMPILER}" "${RAD_OOT_TARGETS}"
-                 "${RAD_HIP_VOPD_REPEATABLE}" "${CMAKE_CXX_COMPILER}")
+                 "${RAD_HIP_VOPD_REPEATABLE}" "${CMAKE_CXX_COMPILER}" "${CMAKE_BUILD_TYPE}")
 # RESOURCE_LOCK kbench_memory: its replay holds operands in host memory as the kbench entries do.
 set_tests_properties(oot_plugins PROPERTIES
   LABELS "oot"
   TIMEOUT 3600
   RESOURCE_LOCK kbench_memory
-  ENVIRONMENT "CMAKE_GENERATOR=${CMAKE_GENERATOR};${RAD_TEST_OMP_ENV}")
+  ENVIRONMENT "CMAKE_GENERATOR=${CMAKE_GENERATOR};${RAD_TEST_OMP_ENV};${RAD_OOT_ENV}")
 
 # ================================================================== the kernel library, as a test
 #

@@ -35,6 +35,9 @@
 #include <cstdlib>
 #include <cstring>
 
+/* The f32 reference encoder shares rope's schema but keeps its activations in f32. */
+extern "C" int r4d_rad_encoder_rope(const RadArgs*, RadStream);
+
 namespace {
 
 constexpr uint32_t kWave    = 32;
@@ -2391,9 +2394,13 @@ static int rope_emit(const RadArgs* a, RadStream s, bool rows_form) {
     const RadTensor* qkv = r4d_opt(a, RP_QKV);
     const RadTensor* pos = r4d_opt(a, RP_POS);
     if (!qkv || !pos) return R4D_NO(RAD_E_INVAL);
+    if (qkv->dtype == RAD_F32) return r4d_rad_encoder_rope(a, s);
     R4D_NEED(dt_bf16(qkv));
     R4D_NEED(dt_i32(pos));
-    if (!r4d_contig(pos)) return R4D_NO(RAD_E_STRIDE);
+    /* A component list is read at its own pitch: a [C, M] view of a [C, P] buffer (a tower's
+     * per-pass rope positions) is row-contiguous with a leading stride wider than M. */
+    if (pos->rank == 2 ? pos->stride[1] != 1 : pos->stride[0] != 1)
+        return R4D_NO(RAD_E_STRIDE);
 
     const long long head_dim  = r4d_geti_or(a, "head_dim", 0);
     const long long n_head    = r4d_geti_or(a, "n_head", 0);
@@ -2452,7 +2459,7 @@ static int rope_emit(const RadArgs* a, RadStream s, bool rows_form) {
         if (mc != 3 && [&] { int t = 0; for (int c = 0; c < n_sec; ++c) t += sec[c];
                              return t != (int)(rot / 2); }())
             return R4D_NO(RAD_E_SHAPE);
-        plane = (int)pos->shape[1];
+        plane = (int)(pos->stride[0] >= pos->shape[1] ? pos->stride[0] : pos->shape[1]);
     }
 
     const float theta  = (float)r4d_getf(a, "theta", 10000.0);

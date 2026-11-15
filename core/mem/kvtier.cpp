@@ -356,8 +356,10 @@ void IdleTiers::plan_writeback(int64_t max_entries, std::vector<TierJob>* out) {
         RAD_WARN("kv tiers: %lld entries (%lld tokens of context) got no host copy: the host "
                  "tier (--prefix-cache-mib, %s, %lld tokens) is full of context used more "
                  "recently or nearer the start of its conversation. They stay in VRAM only and "
-                 "are prefilled again once VRAM gives them up; a larger --prefix-cache-mib holds "
-                 "more. Counted in /sessions moved.held_back",
+                 "are prefilled again once VRAM gives them up, which it does for a request that "
+                 "needs the room, or where a few of them keep the expert loan from most of the "
+                 "pool; a larger --prefix-cache-mib holds more. "
+                 "Counted in /sessions moved.held_back",
                  (long long)held, (long long)(held * cfg_.block_tokens),
                  humanb(arena_.cap_bytes()).c_str(),
                  (long long)(arena_.capacity() * cfg_.block_tokens));
@@ -373,6 +375,15 @@ void IdleTiers::take_clean(std::vector<BlockHash>* out) {
         out->push_back(k);
     }
     clean_q_.clear();
+}
+
+bool IdleTiers::no_copy_coming(const BlockHash& key) const {
+    std::lock_guard lk(mu_);
+    auto it = recs_.find(key);
+    if (it == recs_.end()) return false;
+    const Rec& r = it->second;
+    if (r.pending || r.doomed || r.tier != KVTier::Device || r.host_slot >= 0) return false;
+    return !r.queued || (wb_stuck_ && arena_.full());
 }
 
 bool IdleTiers::droppable(const BlockHash& key) const {

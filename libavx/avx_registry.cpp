@@ -144,6 +144,9 @@ static const RadParamSpec pLayernorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"
 static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT("y") };
 static const RadParamSpec pGridEmbed[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
+static const RadParamSpec pWindowOrder[] = { P_INT("M"), P_INT("window") };
+static const RadOperandSpec oWindowOrder[] = { OPD("crd"), OPD_O("cu"), OUT("idx"), OUT("inv"),
+                                               OUT("pos"), OUT("cuw") };
 static const RadParamSpec pGridEmbedCpe[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
                                                 P_INTO("n_prefix") };
 static const RadOperandSpec oGridEmbedCpe[] = { INOUT("x"), WGT("table"), OPD("coord"), WGT_O("prefix") };
@@ -859,6 +862,8 @@ static const RadParamSpec pVqEncode[] = { P_INT("M"), P_INT("n"), P_INT("dim"), 
                                           P_STR("dtype") };
 static const RadOperandSpec oVqEncode[] = { INOUT("x"), WGT("in_w"), WGT("in_b"), WGT("cb"),
                                             WGT("out_w"), WGT("out_b"), OUT("codes") };
+static const RadParamSpec pVqEuclidean[] = { P_INT("M"), P_INT("n"), P_INT("bins"), P_STR("dtype") };
+static const RadOperandSpec oVqEuclidean[] = { INOUT("x"), WGT("cb"), OUT("codes") };
 static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
                                           P_INTO("rep"), P_STR("dtype") };
 static const RadOperandSpec oFrameMix[] = { OPD("hid"), WGT("logits"), WGT("scale"), OPD("lane"),
@@ -1013,6 +1018,13 @@ static const RadOpSchema kSchemas[] = {
 { "layernorm", ARR(pLayernorm), ARR(oLayernorm), "layer norm with gain and optional bias." },
 { "grid_embed", ARR(pGridEmbed), ARR(oGridEmbed),
   "x += a side x side position table resampled bilinearly to the row's grid." },
+{ "grid_embed_pad", ARR(pGridEmbed), ARR(oGridEmbed),
+  "x += the table resampled half-pixel bilinear (align_corners=False) with zero-padded taps: a "
+  "tap off the table contributes nothing rather than reading an edge (Muse's)." },
+{ "window_order", ARR(pWindowOrder), ARR(oWindowOrder),
+  "The window-attention permutation of one pass from its coordinate planes: idx/inv the "
+  "permutation and its inverse, pos the swapped one-offset rope positions, cuw the cumulative "
+  "window boundaries; window <= 0 is the identity." },
 { "grid_embed_aa", ARR(pGridEmbed), ARR(oGridEmbed),
   "x += the table resampled as torch's antialiased half-pixel bilinear, SigLIP2's." },
 { "lili_cand", ARR(pLiliCand), ARR(oLiliCand),
@@ -1457,6 +1469,10 @@ static const RadOpSchema kSchemas[] = {
 { "vq_encode", ARR(pVqEncode), ARR(oVqEncode),
   "one residual vector quantiser step: the code of greatest cosine with in_w x + in_b, then "
   "x -= out_w cb[code] + out_b; libref's arithmetic in another summation order." },
+{ "vq_euclidean", ARR(pVqEuclidean), ARR(oVqEuclidean),
+  "the nearest Euclidean centroid (the lower index on a tie): its code written and the centroid "
+  "subtracted from x, libref's arithmetic." },
+{ "elu", ARR(pMnD), ARR(oUnary), "y = x >= 0 ? x : expm1(x), alpha 1." },
 { "frame_mix_store", ARR(pFrameMix), ARR(oFrameMix),
   "a frame's softmax-weighted mix of hidden planes, stored into its lane, bit for bit libref's." },
 { "end_status", ARR(pEndStatus), ARR(oEndStatus),
@@ -1678,6 +1694,12 @@ SIMPLE("avx_layernorm", "layernorm", "norm", "layer norm with gain and bias", DT
        L(layernorm)),
 SIMPLE("avx_grid_embed", "grid_embed", "elem",
        "bilinear resample of a learned position grid, added in", DT_FLOAT, L(grid_embed)),
+SIMPLE("avx_grid_embed_pad", "grid_embed_pad", "elem",
+       "half-pixel bilinear resample of a position grid, zero-padded taps, added in", DT_FLOAT,
+       L(grid_embed_pad)),
+SIMPLE("avx_window_order", "window_order", "elem",
+       "the window-attention permutation of one pass, from its coordinates", DT_ANY,
+       L(window_order)),
 SIMPLE("avx_grid_embed_aa", "grid_embed_aa", "elem",
        "antialiased half-pixel bilinear resample of a position grid, added in", DT_FLOAT,
        L(grid_embed_aa)),
@@ -2076,6 +2098,9 @@ SIMPLE("avx_rvq_embed", "rvq_embed", "elem", "a frame's embedding from its resid
        DT_FLOAT, L(rvq_embed)),
 SIMPLE("avx_vq_encode", "vq_encode", "elem",
        "a residual quantiser's step: the nearest code by cosine", DT_FLOAT, L(vq_encode)),
+SIMPLE("avx_vq_euclidean", "vq_euclidean", "elem",
+       "a residual quantiser's step: the nearest centroid by distance", DT_FLOAT, L(vq_euclidean)),
+SIMPLE("avx_elu", "elu", "elem", "ELU, alpha 1", DT_FLOAT, L(elu)),
 SIMPLE("avx_frame_mix_store", "frame_mix_store", "elem",
        "a frame's conditioning row into its lane", DT_FLOAT, L(frame_mix_store)),
 SIMPLE("avx_end_status", "end_status", "elem", "a frame's status from its first pick", DT_ANY,

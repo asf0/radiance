@@ -1585,8 +1585,8 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
         return RAD_E_INVAL;
     }
     /* References: a template with both of its slots, an item with one transcript before its one
-     * clip, and the clips' geometry; read whole by one branch's prompt (an unconditional branch
-     * would need references of its own). */
+     * clip, and the clips' geometry. Two branches may repeat the same reference prompt at
+     * guidance 1; reference CFG would need a separate unconditional frame map and is refused. */
     if (d->tmpl_ref) {
         auto once = [](const char* t, const char* k) {
             const char* a = t ? std::strstr(t, k) : nullptr;
@@ -1601,13 +1601,33 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
                              "{input} once each, and ref_item {text} before its one {audio}", nm);
             return RAD_E_INVAL;
         }
-        if (d->branches != 1 || !d->prompt_whole || d->ref_rate <= 0 || d->ref_hop <= 0 ||
-            d->ref_max <= 0 || d->ref_max_samples < d->ref_hop) {
-            err(RAD_E_INVAL, "declare_audio_generator '%s': references are read by a model of one "
-                             "branch from whole prompts, clips at a rate (%lld Hz) in frames of "
+        if (!d->prompt_whole || d->ref_rate <= 0 || d->ref_hop <= 0 ||
+            d->ref_max <= 0 || d->ref_max_samples < d->ref_hop ||
+            (d->branches != 1 && (!d->neg_tmpl || d->default_cfg != 1.0 ||
+                                  std::strstr(d->neg_tmpl, "{references}")))) {
+            err(RAD_E_INVAL, "declare_audio_generator '%s': references need whole prompts and "
+                             "guidance 1 (two branches need a plain negative template); clips at "
+                             "a rate (%lld Hz) in frames of "
                              "%lld samples, at most %d of them and %lld samples a request", nm,
                 (long long)d->ref_rate, (long long)d->ref_hop, (int)d->ref_max,
                 (long long)d->ref_max_samples);
+            return RAD_E_INVAL;
+        }
+    }
+    if (d->tmpl_ref_instruct || d->neg_tmpl_ref) {
+        auto once = [](const char* t, const char* key) {
+            const char* p = t ? std::strstr(t, key) : nullptr;
+            return p && !std::strstr(p + 1, key);
+        };
+        if (!d->tmpl_ref || !d->tmpl_ref_instruct || !d->neg_tmpl_ref || d->branches == 1 ||
+            !once(d->tmpl_ref_instruct, "{references}") ||
+            !once(d->tmpl_ref_instruct, "{input}") ||
+            !once(d->tmpl_ref_instruct, "{instructions}") ||
+            !once(d->neg_tmpl_ref, "{references}") || !once(d->neg_tmpl_ref, "{input}") ||
+            std::strstr(d->neg_tmpl_ref, "{instructions}")) {
+            err(RAD_E_INVAL, "declare_audio_generator '%s': reference direction needs paired "
+                             "conditional/reference-only templates with one references/input "
+                             "slot each and instructions only in the conditional template", nm);
             return RAD_E_INVAL;
         }
     }
@@ -1704,6 +1724,8 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
     prog_.agen_str.tmpl_plain = d->tmpl_plain ? d->tmpl_plain : "";
     prog_.agen_str.neg_tmpl = d->neg_tmpl ? d->neg_tmpl : "";
     prog_.agen_str.tmpl_ref = d->tmpl_ref ? d->tmpl_ref : "";
+    prog_.agen_str.tmpl_ref_instruct = d->tmpl_ref_instruct ? d->tmpl_ref_instruct : "";
+    prog_.agen_str.neg_tmpl_ref = d->neg_tmpl_ref ? d->neg_tmpl_ref : "";
     prog_.agen_str.ref_item = d->tmpl_ref && d->ref_item ? d->ref_item : "";
     prog_.audio_gen = *d;
     /* As for the image generator: the Program is moved after declare; strings live in agen_str. */
@@ -1712,6 +1734,8 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
     prog_.audio_gen.tmpl_plain = nullptr;
     prog_.audio_gen.neg_tmpl = nullptr;
     prog_.audio_gen.tmpl_ref = nullptr;
+    prog_.audio_gen.tmpl_ref_instruct = nullptr;
+    prog_.audio_gen.neg_tmpl_ref = nullptr;
     prog_.audio_gen.ref_item = nullptr;
     /* Without references the clips' geometry is nothing: the driver stages none. */
     if (!d->tmpl_ref) {

@@ -156,6 +156,10 @@ public:
     void take_clean(std::vector<BlockHash>* out);
     /* Host copy landed and no job out: the blocks can leave VRAM at no cost. */
     bool droppable(const BlockHash& key) const;
+    /* In VRAM only with no host copy coming: none made or on its way, and either none asked for
+     * (a full arena refused it, Stats::held_back) or the queue it waits in has stopped because
+     * the arena is full of entries worth more. */
+    bool no_copy_coming(const BlockHash& key) const;
     /* The cache released the blocks; the record becomes a host record on the host list. Its
      * snapshot stays in its store slot. */
     void drop_commit(const BlockHash& key);

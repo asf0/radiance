@@ -161,6 +161,9 @@ int64_t r4d_rad_attn_qrow_h128_gqa8_scratch(const RadArgs*);
  * row pitch, so they serve both attn_paged and attn_paged_qrow. */
 int     r4d_rad_attn_window_h128_gqa1_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h128_gqa1_i8 (const RadArgs*, RadStream);
+/* h128 gqa16: Muse Glimmer's 32 query heads over 2 KV heads. */
+int     r4d_rad_attn_window_h128_gqa16_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h128_gqa16_i8 (const RadArgs*, RadStream);
 /* The same kernels under attn_paged_sink (a sink logit a query head). */
 int     r4d_rad_attn_window_sink_h128_gqa8_bf16 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_sink_h128_gqa8_i8  (const RadArgs*, RadStream);
@@ -292,6 +295,14 @@ int     r4d_rad_snake                 (const RadArgs*, RadStream);
 int     r4d_rad_cfg_topk_sample       (const RadArgs*, RadStream);
 int     r4d_rad_rvq_embed             (const RadArgs*, RadStream);
 int     r4d_rad_vq_encode             (const RadArgs*, RadStream);
+int     r4d_rad_vq_euclidean          (const RadArgs*, RadStream);
+int     r4d_rad_elu                   (const RadArgs*, RadStream);
+int     r4d_rad_encoder_layernorm     (const RadArgs*, RadStream);
+int     r4d_rad_encoder_gelu          (const RadArgs*, RadStream);
+int     r4d_rad_encoder_rope          (const RadArgs*, RadStream);
+int     r4d_rad_encoder_attn          (const RadArgs*, RadStream);
+int     r4d_rad_gemm_f32_nt           (const RadArgs*, RadStream);
+int     r4d_shape_vq_euclidean        (const RadParam*, int, int, RadOpdDesc*);
 int     r4d_rad_frame_mix_store       (const RadArgs*, RadStream);
 int     r4d_rad_end_status            (const RadArgs*, RadStream);
 int     r4d_rad_ras_pick              (const RadArgs*, RadStream);
@@ -882,6 +893,9 @@ int r4d_rad_layernorm       (const RadArgs*, RadStream);
 int r4d_rad_grid_embed      (const RadArgs*, RadStream);
 int r4d_rad_grid_embed_aa    (const RadArgs*, RadStream);
 int r4d_rad_grid_embed_cpe   (const RadArgs*, RadStream);
+/* Muse's vision-tower coordinate ops (r4d_vit_muse.hip). */
+int r4d_rad_grid_embed_pad   (const RadArgs*, RadStream);
+int r4d_rad_window_order     (const RadArgs*, RadStream);
 int r4d_rad_gemm_nt_bias    (const RadArgs*, RadStream);
 /* gemm_nt_bias at f32 (r4d_gemm_f32_nt_bias.hip). */
 int r4d_rad_gemm_f32_nt_bias(const RadArgs*, RadStream);
@@ -948,6 +962,9 @@ int r4d_shape_scatter_rows_bf16(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_layernorm      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_grid_embed     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_grid_embed_cpe (const RadParam*, int, int operand, RadOpdDesc*);
+/* Muse's vision-tower coordinate ops. */
+int r4d_shape_grid_embed_pad (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_window_order   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gemm_nt_bias   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_unary          (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_fill           (const RadParam*, int, int operand, RadOpdDesc*);

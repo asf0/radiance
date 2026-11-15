@@ -382,6 +382,20 @@ extern "C" int r4d_shape_grid_embed_cpe(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* grid_embed_pad's: the same operands and drawing as grid_embed's. */
+extern "C" int r4d_shape_grid_embed_pad(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), side = pi(p, n_p, "side");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, n), opd(D, side * side, n), opd_idx(4, M, side) };
+    R4D_PICK(l);
+}
+
+/* window_order declines: its `crd` rows, segment grids and `cu` boundaries must describe whole
+ * raster grids, and an index draw cannot; the emu and unit tests build them by hand. */
+extern "C" int r4d_shape_window_order(const RadParam*, int, int, RadOpdDesc*) {
+    return RAD_E_UNSUPPORTED;
+}
+
 extern "C" int r4d_shape_gemm_nt_bias(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
     const uint32_t D = dt_act(p, n_p, "dtype");
@@ -602,6 +616,13 @@ extern "C" int r4d_shape_unary(const RadParam* p, int n_p, int operand,
     const int64_t n = pi(p, n_p, "n");
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = { opd(D, M, n), opd(D, M, n) };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_vq_euclidean(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), bins = pi(p, n_p, "bins");
+    if (M <= 0 || n <= 0 || bins <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {opd(RAD_F32, M, n), opd(RAD_F32, bins, n), opd(RAD_I32, 1, M)};
     R4D_PICK(l);
 }
 

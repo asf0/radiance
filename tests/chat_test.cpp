@@ -367,6 +367,50 @@ TEST(replayed_tool_call_arguments_render_as_parameter_xml) {
     CHECK(pb.prompt.find("<function=read>") != std::string::npos);
 }
 
+/* A tool-call round in the current turn, as a client replays it, with the call's arguments as
+ * `args` (absent when null). */
+static json replayed_round(const json* args) {
+    json fn = {{"name", "read"}};
+    if (args) fn["arguments"] = *args;
+    json msgs = json::array();
+    msgs.push_back({{"role", "user"}, {"content", "Read /work/a.py."}});
+    msgs.push_back({{"role", "assistant"}, {"content", ""},
+                    {"tool_calls", json::array({{{"id", "c1"}, {"type", "function"},
+                                                 {"function", fn}}})}});
+    msgs.push_back({{"role", "tool"}, {"tool_call_id", "c1"}, {"content", "print(1)\n"}});
+    return msgs;
+}
+
+/* A call without arguments, replayed as "" (a stored stream) or with no `arguments`, is the
+ * empty object. Refusing it refused every later turn of the conversation. */
+TEST(a_replayed_call_with_empty_or_absent_arguments_is_the_empty_object) {
+    if (!qwen().need()) return;
+    const json empty = "", spaces = "  \n", obj = "{}";
+    ChatPrompt want;
+    ChatOptions opt;
+    CHECK_OK(qwen().t->apply(replayed_round(&obj), tools_json(), opt, &want));
+    CHECK(want.prompt.find("<function=read>\n</function>") != std::string::npos);
+    for (const json* a : {&empty, &spaces, (const json*)nullptr}) {
+        ChatPrompt p;
+        CHECK_OK(qwen().t->apply(replayed_round(a), tools_json(), opt, &p));
+        CHECK_EQ(p.prompt, want.prompt);
+    }
+}
+
+/* Arguments that are not JSON are still refused, but as the request's fault and naming the call,
+ * not as a refusal by the template. */
+TEST(replayed_arguments_that_are_not_json_are_refused_naming_the_call) {
+    if (!qwen().need()) return;
+    const json bad = "{\"path\": \"/work/a.py\"";
+    ChatPrompt p;
+    ChatOptions opt;
+    opt.quiet = true;
+    CHECK_EQ(qwen().t->apply(replayed_round(&bad), tools_json(), opt, &p), (int)RAD_E_INVAL);
+    CHECK(p.error.find("messages[1].tool_calls[0].function.arguments is not JSON") !=
+          std::string::npos);
+    CHECK(p.error.find("template") == std::string::npos);
+}
+
 /* ------------------------------------------------------------------ golden renders
  *
  * Every shipped template renders the requests in tests/data/chat/golden/cases.json byte for byte

@@ -353,6 +353,7 @@ int chat_format_from_abi(const RadChatFormat* in, ChatFormat* out, std::string* 
     f.object_bare_keys    = c.object_bare_keys != 0;
     f.reasoning_anywhere  = c.reasoning_anywhere != 0;
     f.arg_json_value_prefix = s(c.arg_json_value_prefix);
+    f.content_open        = s(c.content_open);
     *out = std::move(f);
     return RAD_OK;
 }
@@ -468,6 +469,7 @@ std::string chat_format_describe(const ChatFormat& f) {
              (f.reasoning_anywhere ? " anywhere" : "");
     else
         s += " no reasoning";
+    if (!f.content_open.empty()) s += "; content " + show(f.content_open);
     if (f.has_tools() && !f.section_open.empty())
         s += "; section " + show(f.section_open) + ".." + show(f.section_close);
     if (f.has_tools() && f.object_args()) {
@@ -498,7 +500,8 @@ std::string chat_format_describe(const ChatFormat& f) {
 
 std::vector<std::string> chat_format_markers(const ChatFormat& f) {
     std::vector<std::string> out;
-    for (const std::string* s : { &f.reasoning_open, &f.reasoning_close, &f.section_open,
+    for (const std::string* s : { &f.reasoning_open, &f.reasoning_close, &f.content_open,
+                                  &f.section_open,
                                   &f.section_close, &f.call_open, &f.call_close, &f.name_prefix,
                                   &f.name_suffix, &f.call_end, &f.arg_prefix, &f.arg_name_suffix,
                                   &f.arg_value_prefix, &f.arg_json_value_prefix,

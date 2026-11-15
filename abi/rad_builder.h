@@ -1279,13 +1279,22 @@ typedef struct RadAudioGenDecl {
      * prepare() has limited to those a caller may write), and so is the text after it. A clip is
      * mono f32 in [-1, 1] at `ref_rate`, right-padded with zeros to a whole number of `ref_hop`
      * samples, each `ref_hop` samples one frame; a request's clips hold at most `ref_max_samples`
-     * samples together. NULL `tmpl_ref`: references are refused. */
+     * samples together. With two branches, references require default_cfg 1 and a plain
+     * neg_tmpl: guidance 1 repeats the conditional prompt and frame map in both branches.
+     * Reference direction is opt-in through the templates appended below. NULL `tmpl_ref`:
+     * references are refused. */
     const char* tmpl_ref;
     const char* ref_item;
     int64_t     ref_rate;
     int64_t     ref_hop;
     int64_t     ref_max_samples;
     int32_t     ref_max;
+    /* ABI 40: reference-plus-instructions uses tmpl_ref_instruct ({references},
+     * {instructions}, {input} once each). Its guidance baseline is neg_tmpl_ref
+     * ({references}, {input}, no instructions). Both branches retain the same clips;
+     * their text lengths and reference-frame maps may differ. NULL: direction refused. */
+    const char* tmpl_ref_instruct;
+    const char* neg_tmpl_ref;
 } RadAudioGenDecl;
 
 int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
@@ -1862,6 +1871,13 @@ typedef struct RadChatFormat {
      * decides how its value is read, whatever the schema says; the grammar writes the one the
      * schema calls for. NULL: the schema alone types a value. */
     const char* arg_json_value_prefix;
+
+    /* A header the model writes first when it answers without reasoning, in place of
+     * reasoning_open: the reply then starts with this literal, which is dropped, and the rest is
+     * content. A reply that starts with anything else, or with only part of it, is read as
+     * written. When the model does reason, its header after the block is reasoning_close's.
+     * NULL or "": the reply starts with its content. */
+    const char* content_open;
 } RadChatFormat;
 
 /* Return the format, or NULL for "derive it from the chat template". Called once at startup. */

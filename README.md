@@ -54,6 +54,11 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Stable Diffusion XL bf16 and its finetunes (Illustrious, NoobAI, Pony): text to image, one card | `illustrious-xl-v2.0-bf16.rad` (6.4 GiB), from any single-file SDXL checkpoint | [convert](#convert-a-checkpoint) | — |
 | EmbeddingGemma 2 bf16: text, image, video and audio embeddings, one card | `embeddinggemma2-bf16.rad` (1.4 GiB) | [convert](#convert-a-checkpoint) | `tp1.yaml`, `tp2.yaml` |
 | nomic-embed-text-v2-moe bf16: text embeddings, one card | `nomic-embed-v2-moe-bf16.rad` (959 MB) | [convert](#convert-a-checkpoint) | — |
+| Meta Muse Glimmer 30B bf16: text, images and video; sliding-window rotary layers between NoPE full ones, a windowed ViT | `muse-glimmer-30b-bf16.rad` (56 GiB) | [convert](#convert-a-checkpoint) | — |
+| Meta Muse Glimmer 30B w4a8: int4 trunk, images and video, one card | `muse-glimmer-30b-w4a8.rad` (16 GiB) | [convert](#convert-a-checkpoint) | — |
+| Meta Muse Glimmer 30B IQ8R: rotated int8 trunk, int8 head, DFlash drafter, images and video | `muse-glimmer-30b-iq8r-dflash.rad` (36 GiB) | [download](https://huggingface.co/StillDeadcode/muse-glimmer-30b-iq8r-dflash) | — |
+| Recursive Flint (39.8B, about 2.5B active) IQ8R: rotated int8 trunk and experts, two cards | `flint-iq8r.rad` (38 GiB) | [download](https://huggingface.co/StillDeadcode/flint-iq8r) | — |
+| Ling-3.0-tiny IQ8R: rotated int8 trunk and experts, one card | `ling-3.0-tiny-iq8r.rad` (7.9 GiB) | [download](https://huggingface.co/StillDeadcode/ling-3.0-tiny-iq8r) | — |
 | Nemotron 3.5 Embed 1B BF16: text and image embeddings, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Embed-1B-BF16) | — |
 | Nemotron 3.5 Embed 8B BF16: text and image embeddings, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16) | — |
 | Nemotron 3.5 Rerank 8B BF16: text/image document relevance, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16) | `tp1.yaml`, `tp2.yaml` |
@@ -351,6 +356,17 @@ build/bin/rad-convert /srv/models/hf/google/gemma-4-31B-it -o gemma4-31b-dense-q
     --recipe data/recipes/gemma4-31b-dense-bf16-q8-df.recipe \
     --set quantization_config.quant_method=compressed-tensors \
     --draft-model /srv/models/hf/z-lab/gemma-4-31B-it-DFlash
+# Meta's Muse Glimmer 30B, as it ships (bf16), with an int4 trunk and int8 attention values, or
+# with an IQ8R trunk and an int8 head
+build/bin/rad-convert /srv/models/hf/meta-models/Muse-Glimmer-30B -o muse-glimmer-30b-bf16.rad \
+    --recipe data/recipes/museglimmer-30b-bf16.recipe
+build/bin/rad-convert /srv/models/hf/meta-models/Muse-Glimmer-30B -o muse-glimmer-30b-w4a8.rad \
+    --recipe data/recipes/museglimmer-30b-w4a8.recipe \
+    --set quantization_config.quant_method=compressed-tensors
+build/bin/rad-convert /srv/models/hf/meta-models/Muse-Glimmer-30B -o muse-glimmer-30b-iq8r-dflash.rad \
+    --draft-model /srv/models/hf/meta-models/Muse-Glimmer-30B-assistant \
+    --recipe data/recipes/museglimmer-30b-iq8r.recipe \
+    --set quantization_config.quant_method=compressed-tensors
 build/bin/rad-convert /srv/models/hf/ukisai/Swift-1.5-Qwen3.8-27b-W4A16-AWQ -o swift15-27b-w4a16.rad \
     --recipe data/recipes/q38-27b-w4a16.recipe
 # Any single-file SDXL checkpoint (SDXL 1.0, Illustrious, NoobAI, Pony, a civitai finetune), with
@@ -394,6 +410,7 @@ ctest --test-dir build -L oot              # rebuilds every bundled plugin out o
 |---|---|
 | [`docs/GUIDE.md`](docs/GUIDE.md) | installing, converting, serving, the HTTP API, operating a server |
 | [`docs/TOOLS.md`](docs/TOOLS.md) | every flag of every tool, and the recipe syntax |
+| [`docs/DIAGNOSE.md`](docs/DIAGNOSE.md) | `diagnose`: the engine measures itself, and what makes a run a measurement |
 | [`docs/DOCKER.md`](docs/DOCKER.md) | the image and the compose files |
 | [`docs/PREPARING_YOUR_RIG.md`](docs/PREPARING_YOUR_RIG.md) | a two-R9700 machine from firmware setup to a serving model |
 | [`docs/PLUGIN.md`](docs/PLUGIN.md) | writing a kernel library, architecture or quantiser plugin, including one for another AMD card |

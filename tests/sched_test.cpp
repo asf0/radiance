@@ -17,7 +17,6 @@
 #include <cstring>
 #include <new>
 #include <string>
-
 #include <unistd.h>
 
 using namespace rad;
@@ -294,6 +293,29 @@ TEST(the_device_fakes_are_the_ones_linked) {
     CHECK(p != nullptr);
     CHECK(g_fake_device);
     rad_dev_free(p, RAD_MEM_DEVICE);
+}
+
+/* THE STEP RECORD EXISTS ONLY FOR --diagnose. Sizing the ring at every init put 2.5 MiB and a
+ * record a step on the serving path for a report nobody asked for. Off: no ring, no record. On:
+ * the ring and one record each of the three steps. */
+TEST(the_step_record_exists_only_with_diagnose) {
+    for (const bool on : { false, true }) {
+        Fixture f;
+        f.build();
+        if (on) f.cfg.diagnose = "/tmp/radiance-diagnose-not-written";   /* Scheduler only reads it */
+        CHECK_OK(f.start());
+        CHECK_EQ(f.sch.step_record_capacity(), on ? (size_t)(1u << 16) : (size_t)0);
+        f.submit(64, 8);
+        for (int i = 0; i < 3; ++i) {
+            CHECK(f.sch.step() != nullptr);
+            f.commit_plain();
+            f.sch.step_finished();
+        }
+        CHECK_EQ(f.sch.step_record_count(), on ? (uint64_t)3 : (uint64_t)0);
+        std::vector<rad::diag::StepRecord> out;
+        CHECK_EQ(f.sch.step_records(0, &out), (uint64_t)0);
+        CHECK_EQ(out.size(), on ? (size_t)3 : (size_t)0);
+    }
 }
 
 /* ================================================================== geometry + chunking */
@@ -3248,6 +3270,354 @@ TEST(an_explicit_busy_prefill_chunk_holds_the_chunk_to_it) {
     CHECK(f.sch.step() != nullptr);
     for (const StepEntry& e : f.sch.plan().e)
         if (e.seq == a) CHECK_EQ(e.n_tokens, 128);
+}
+
+TEST(the_mixed_step_target_controller_corrects_misses_and_grows_cautiously) {
+    MixedStepTarget d;
+    d.seed(300, 64, 2048);
+    CHECK_EQ(d.cap(), 256);
+    d.reset();
+    /* 1024 rows taking four times the 100 ms target predicts a 256-row cap. */
+    d.observe(1024, 400000000, 100000000, 64, 2048);
+    CHECK_EQ(d.cap(), 256);
+    CHECK_EQ(d.limit(2048, 64), 256);
+
+    /* A step in the dead band does not chase noise. */
+    d.observe(256, 80000000, 100000000, 64, 2048);
+    CHECK_EQ(d.cap(), 256);
+
+    /* Three comfortably fast full-cap steps grow toward the measured 512 rows, one quarter at a
+     * time and on the model's quantum. */
+    for (int i = 0; i < 3; ++i) d.observe(256, 50000000, 100000000, 64, 2048);
+    CHECK_EQ(d.cap(), 320);
+    /* A short tail cannot make the deployment's cap grow. */
+    d.observe(64, 10000000, 100000000, 64, 2048, /*representative=*/false);
+    CHECK_EQ(d.cap(), 320);
+    /* A later miss corrects immediately. */
+    d.observe(320, 200000000, 100000000, 64, 2048);
+    CHECK_EQ(d.cap(), 128);
+}
+
+TEST(the_mixed_step_target_recovers_from_fixed_cost_backoff_and_ignores_short_tails) {
+    MixedStepTarget d;
+    d.seed(64, 64, 2048);
+    /* Fixed decode cost makes proportional scaling round back to 64, but sustained 80%-of-target
+     * steps still earn a one-quantum probe. */
+    for (int i = 0; i < 3; ++i) d.observe(64, 160000000, 200000000, 64, 2048);
+    CHECK_EQ(d.cap(), 128);
+    /* A short tail can miss because of fixed cost; it did not exercise the cap and cannot lower
+     * the next full chunk. */
+    d.observe(32, 260000000, 200000000, 64, 2048, /*representative=*/false);
+    CHECK_EQ(d.cap(), 128);
+    /* The same short row count is representative when a fixed policy or checkpoint boundary,
+     * rather than the end of a prompt, limited it. Repeated slow work must be able to lower the
+     * controller below that other limit. */
+    d.seed(2048, 64, 8192);
+    d.observe(512, 400000000, 200000000, 64, 8192, /*representative=*/true);
+    CHECK_EQ(d.cap(), 256);
+    /* An impossible target bottoms out at one legal quantum without underflow. */
+    d.observe(128, 1000000000, 1000000, 64, 2048);
+    CHECK_EQ(d.cap(), 64);
+    d.observe(64, 1000000000, 1000000, 64, 2048);
+    CHECK_EQ(d.cap(), 64);
+}
+
+TEST(a_mixed_step_target_does_not_throttle_an_uncontended_prefill) {
+    Fixture f;
+    share_fixture(f, /*busy off=*/0);
+    f.cfg.mixed_step_target_ms = 200;
+    CHECK_OK(f.start());
+    f.submit(3500, 64);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.plan().e.size(), 1);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 512);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_steps, 0);
+}
+
+TEST(a_mixed_step_target_refuses_a_batch_that_cannot_mix_one_prefill_quantum) {
+    Fixture f;
+    share_fixture(f, /*busy off=*/0);
+    f.cfg.mixed_step_target_ms = 200;
+    f.cfg.max_seqs = 2;
+    f.cfg.max_tok = 64;                    /* quantum 64, no room for a decode row beside it */
+    CHECK_EQ(f.start(), RAD_E_INVAL);
+}
+
+TEST(a_mixed_step_target_validates_the_shared_budget_under_a_prefill_span) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/128, /*max_ctx=*/4096);
+    f.cfg.checkpoint_interval = 64;
+    f.cfg.prefill_span = 2;
+    f.cfg.max_seqs = 2;
+    f.cfg.mixed_step_target_ms = 200;
+    /* The lone-prefill budget is 128, but a mixed step uses shared_tok=64: too little for the
+     * 64-row quantum beside even one ordinary decode row. */
+    CHECK_EQ(f.start(), RAD_E_INVAL);
+}
+
+TEST(a_mixed_step_target_refuses_an_explicit_cap_below_the_prefill_quantum) {
+    Fixture f;
+    share_fixture(f, /*busy below the 64-row quantum=*/32);
+    f.cfg.mixed_step_target_ms = 200;
+    CHECK_EQ(f.start(), RAD_E_INVAL);
+}
+
+TEST(a_mixed_step_target_keeps_decode_rows_in_both_priority_orders_and_busy_modes) {
+    for (int64_t busy : { -1ll, 128ll }) {
+        for (int prefill_priority : { -1, 1 }) {
+            Fixture f;
+            share_fixture(f, busy);
+            f.cfg.mixed_step_target_ms = 200;
+            f.cfg.max_seqs = 2;
+            f.cfg.max_tok = 128;
+            f.cfg.checkpoint_interval = 128;
+            CHECK_OK(f.start());
+
+            const uint64_t d = f.submit(100, 512, /*priority=*/0);
+            CHECK(f.sch.step() != nullptr);
+            f.commit_plain(11);
+            const uint64_t p = f.submit(3500, 64, prefill_priority);
+            CHECK(f.sch.step() != nullptr);
+            CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+            bool saw_d = false, saw_p = false;
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq == d && !e.is_prefill) saw_d = true;
+                if (e.seq == p && e.is_prefill) saw_p = true;
+            }
+            CHECK(saw_d);
+            CHECK(saw_p);
+        }
+    }
+}
+
+/* The scheduler feeds completed mixed-step timing into the controller. A deterministic timing
+ * sample stands in for step_finished's live bracket. The following step must use the learned cap
+ * even when --busy-prefill-chunk is off. */
+TEST(a_mixed_step_target_adapts_the_next_mixed_prefill_step) {
+    Fixture f;
+    share_fixture(f, /*busy off: the target controller stands on its own=*/0);
+    f.cfg.mixed_step_target_ms = 2;
+    CHECK_OK(f.start());
+
+    const uint64_t d = f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    const uint64_t p = f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    /* This fixture's 512-row mixed capacity seeds at one quarter, on its 64-row quantum. */
+    CHECK_EQ(f.sch.metrics().mixed_step_target_prefill_cap, 128);
+    int64_t first = 0;
+    for (const StepEntry& e : f.sch.plan().e) if (e.seq == p) first = e.n_tokens;
+    CHECK(first > 0);
+    f.commit_plain(12);
+    f.sch.note_mixed_step_cost(12000000);
+    const int64_t learned = f.sch.metrics().mixed_step_target_prefill_cap;
+    CHECK(learned >= 64);
+    CHECK(learned < first);
+
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    int64_t next = 0;
+    for (const StepEntry& e : f.sch.plan().e) if (e.seq == p) next = e.n_tokens;
+    CHECK(next > 0);
+    CHECK(next <= learned);
+    CHECK(f.sch.find(d) != nullptr);
+}
+
+/* The learned limit is a budget for the whole mixed step, not for each prefill independently.
+ * Otherwise a burst of N fresh requests can schedule N times the measured safe amount and miss
+ * the latency target precisely when the server is busiest. */
+TEST(a_mixed_step_target_caps_aggregate_mixed_prefill_rows) {
+    Fixture f;
+    share_fixture(f, /*busy off: the target controller stands on its own=*/0);
+    f.cfg.mixed_step_target_ms = 200;
+    f.cfg.max_seqs = 3;
+    CHECK_OK(f.start());
+
+    const uint64_t d = f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    f.submit(3500, 64, /*priority=*/1);
+    f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    CHECK(f.sch.find(d) != nullptr);
+
+    int64_t prefill_rows = 0;
+    int prefills = 0;
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (!e.is_prefill) continue;
+        prefill_rows += e.n_tokens;
+        ++prefills;
+    }
+    /* The 128-row seed is shared as one 64-row quantum apiece. */
+    CHECK_EQ(prefills, 2);
+    CHECK(prefill_rows <= f.sch.metrics().mixed_step_target_prefill_cap);
+    CHECK_EQ(f.sch.metrics().queue_depth, 0);
+}
+
+TEST(a_mixed_step_target_gives_each_burst_prefill_one_quantum_when_the_target_cannot) {
+    Fixture f;
+    share_fixture(f, /*busy off=*/0);
+    f.cfg.mixed_step_target_ms = 200;
+    f.cfg.max_seqs = 4;
+    CHECK_OK(f.start());
+
+    f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    for (int i = 0; i < 3; ++i) f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+
+    int prefills = 0;
+    int64_t rows = 0;
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (!e.is_prefill) continue;
+        ++prefills;
+        rows += e.n_tokens;
+        CHECK_EQ(e.n_tokens, 64);
+    }
+    CHECK_EQ(prefills, 3);
+    CHECK_EQ(rows, 192);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_prefill_cap, 128);
+    CHECK_EQ(f.sch.metrics().queue_depth, 0);
+}
+
+TEST(a_mixed_step_target_keeps_a_decoder_behind_a_bidirectional_text_prefill) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/128, /*max_ctx=*/4096);
+    f.cfg.checkpoint_interval = 64;
+    f.cfg.busy_prefill_chunk = 0;
+    f.cfg.mixed_step_target_ms = 200;
+    f.cfg.max_seqs = 2;
+    f.prog.encoder.bidirectional = 1;
+    CHECK_OK(f.start());
+
+    const uint64_t d = f.submit(40, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+
+    bool saw_decode = false, saw_prefill = false;
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (e.seq == d && !e.is_prefill) saw_decode = true;
+        if (e.seq == p && e.is_prefill) saw_prefill = true;
+    }
+    CHECK(saw_decode);
+    CHECK(saw_prefill);
+}
+
+TEST(a_cancelled_mixed_prefill_still_teaches_from_the_work_that_ran) {
+    Fixture f;
+    share_fixture(f, /*busy off=*/0);
+    f.cfg.mixed_step_target_ms = 2;
+    CHECK_OK(f.start());
+
+    f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    const int64_t before = f.sch.metrics().mixed_step_target_prefill_cap;
+    CHECK_OK(f.sch.cancel(p));
+    f.commit_plain(12);
+    f.sch.note_mixed_step_cost(12000000);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_steps, 1);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_misses, 1);
+    CHECK(f.sch.metrics().mixed_step_target_prefill_cap < before);
+    REQUIRE(f.sch.find(p) != nullptr);
+    CHECK_EQ((int)f.sch.find(p)->state, (int)ReqState::Cancelled);
+    if (f.sch.has_deferred()) f.sch.release_deferred();
+    CHECK(!f.kv.has_sequence(p));
+    CHECK_OK(f.sch.reap(p));
+    CHECK(f.sch.find(p) == nullptr);
+}
+
+TEST(a_mixed_step_target_preserves_speculative_verification_in_a_mixed_step) {
+    Fixture f;
+    share_fixture(f, /*busy off=*/0);
+    f.cfg.mixed_step_target_ms = 200;
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+
+    const uint64_t d = f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(d, draft, 4));
+    f.submit(3500, 64, /*priority=*/1);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->phase, RAD_PHASE_MIXED);
+    CHECK_EQ(b->n_spec, 4);
+    CHECK_EQ(b->n_seq_decode, 1);
+    CHECK_OK(f.commit(12, 0, [](const StepEntry& e) { return e.is_prefill ? 0 : 2; }));
+    f.sch.step_finished();
+    CHECK_EQ(f.sch.metrics().mixed_step_target_steps, 1);
+    const Request* rd = f.sch.find(d);
+    REQUIRE(rd != nullptr);
+    CHECK_EQ((int)rd->output.size(), 4);
+    CHECK_EQ(rd->output[1], 21);
+    CHECK_EQ(rd->output[2], 22);
+    CHECK_EQ(rd->output[3], 12);
+    CHECK_EQ(rd->n_computed, 103);
+    CHECK_EQ(rd->n_accepted, 2);
+}
+
+TEST(a_mixed_step_target_composes_with_auto_interleave_and_burst_prefills) {
+    Fixture f;
+    share_fixture(f, /*busy off: the target controller stands on its own=*/0);
+    f.cfg.mixed_step_target_ms = 2;
+    f.cfg.prefill_interleave = -1;
+    f.cfg.prefill_interleave_share = 1.0;
+    f.cfg.max_seqs = 3;
+    CHECK_OK(f.start());
+    /* One decode-only step after each mixed chunk, deterministically. */
+    f.sch.note_step_cost(true, 0.4);
+    f.sch.note_step_cost(false, 0.4);
+
+    const uint64_t d = f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    const uint64_t p1 = f.submit(3500, 64, /*priority=*/1);
+    const uint64_t p2 = f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    int first_prefills = 0;
+    for (const StepEntry& e : f.sch.plan().e)
+        if (e.is_prefill && (e.seq == p1 || e.seq == p2)) ++first_prefills;
+    CHECK_EQ(first_prefills, 2);
+    f.commit_plain(12);
+    f.sch.note_mixed_step_cost(12000000);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_steps, 1);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_prefill_cap, 64);
+
+    CHECK(f.sch.step() != nullptr);                     /* auto interleave: decoder alone */
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_DECODE);
+    CHECK_EQ((int)f.sch.plan().e.size(), 1);
+    CHECK_EQ(f.sch.plan().e[0].seq, d);
+    f.commit_plain(13);
+    f.sch.note_mixed_step_cost(12000000);               /* a held step teaches nothing */
+    CHECK_EQ(f.sch.metrics().mixed_step_target_steps, 1);
+    CHECK_EQ(f.sch.metrics().steps_held, 1);
+
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    int next_prefills = 0;
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (!e.is_prefill || (e.seq != p1 && e.seq != p2)) continue;
+        CHECK_EQ(e.n_tokens, 64);
+        ++next_prefills;
+    }
+    CHECK_EQ(next_prefills, 2);                         /* neither burst prompt starves */
+    CHECK(f.sch.find(d) != nullptr);
 }
 
 /* ================================================================== decode-only steps between chunks */

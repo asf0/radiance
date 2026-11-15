@@ -508,6 +508,18 @@ public:
 
     /* Blocks of a group the cache may hand out: the carve less the loan. */
     int64_t live_blocks(int32_t group) const;
+    /* The same under a loan of `tokens`: the first block of the group that loan would take. A
+     * group that does not lend answers its whole carve. */
+    int64_t live_blocks_at(int32_t group, int64_t tokens) const;
+    /* Where a group's stragglers start. A loan reaches down only to the highest held block, so a
+     * few held blocks high in the pool keep everything between them and the dense part of the
+     * cache from the expert slab. Giving up the held blocks at or above a mark m extends what
+     * can be lent by (held top - m) blocks at the cost of the blocks held there; the mark is the
+     * m that gains the most over kStragglerCost times that cost, to a bucket of held_hist_. The
+     * held top itself when no m gains anything: a pool held densely up to its top has no
+     * stragglers, and the edge of a dense part is never one. Rank 0 only. */
+    int64_t straggler_mark(int32_t group) const;
+    static constexpr int64_t kStragglerCost = 16;
 
     /* ---------------- flex (docs/MULTIMODEL.md §6) ----------------
      *

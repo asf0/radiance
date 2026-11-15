@@ -347,6 +347,7 @@ int meta_from_gguf(GgufFile& g, MetaOwn* out) {
      * pass through in the free-form list. */
     const std::string a = out->arch;
     if (a == "hy_v3") out->arch = "hyv3";
+    if (a == "bailingmoe3") out->arch = "bailinghybrid";
     auto gi = [&](const char* suffix, int64_t dflt) -> int64_t {
         int64_t v = 0;
         return g.get_i64(a + "." + suffix, &v) ? v : dflt;
@@ -443,6 +444,57 @@ int meta_from_gguf(GgufFile& g, MetaOwn* out) {
         out->kv("attention_bias", "0");
         out->kv("mlp_bias", "0");
     }
+    if (a == "bailingmoe3") {
+        /* Ling 3.0 (the arch alias above): the release GGUF spells the family's keys
+         * bailingmoe3.*, and the plugin (arch/bailing_hybrid) reads them as the checkpoint's
+         * config.json names, so the reader re-spells them here and one plugin serves both
+         * formats. eps and rope_theta take the generic paths above. Four of the family's
+         * design choices the GGUF does not carry are Ling 3.0's, stated as constants. */
+        if (gi("kda.head_dim", 0) <= 0 || gi("rope.dimension_count", 0) <= 0 ||
+            gi("attention.key_length_mla", 0) <= gi("rope.dimension_count", 0))
+            return RAD_E_FORMAT;
+        out->kv("num_attention_heads", fmt("%lld", (long long)m.n_head));
+        /* The typed head_dim the generic pass fell back to (the MLA query width) is not the
+         * KDA head the plugin asserts; rad-convert publishes the typed fields before the kv
+         * table, and lookups take the first row, so the typed field must carry the 128. */
+        out->m.head_dim = (int)gi("kda.head_dim", 0);
+        out->kv("head_dim", fmt("%lld", (long long)gi("kda.head_dim", 0)));
+        /* The GGUF's key_length_mla is the full query (nope + rotary); the plugin's
+         * qk_nope_head_dim is the rotary part subtracted. */
+        out->kv("qk_nope_head_dim",
+                fmt("%lld", (long long)(gi("attention.key_length_mla", 0) - gi("rope.dimension_count", 0))));
+        out->kv("qk_rope_head_dim", fmt("%lld", (long long)gi("rope.dimension_count", 0)));
+        out->kv("v_head_dim", fmt("%lld", (long long)gi("attention.value_length_mla", 0)));
+        out->kv("kv_lora_rank", fmt("%lld", (long long)gi("attention.kv_lora_rank", 0)));
+        out->kv("q_lora_rank", fmt("%lld", (long long)gi("attention.q_lora_rank", 0)));
+        out->kv("num_experts", fmt("%lld", (long long)m.n_expert));
+        out->kv("num_experts_per_tok", fmt("%lld", (long long)m.n_expert_used));
+        out->kv("n_group", fmt("%lld", (long long)gi("expert_group_count", 0)));
+        out->kv("topk_group", fmt("%lld", (long long)gi("expert_group_used_count", 0)));
+        out->kv("moe_intermediate_size", fmt("%lld", (long long)gi("expert_feed_forward_length", 0)));
+        out->kv("moe_shared_expert_intermediate_size",
+                fmt("%lld", (long long)gi("expert_shared_feed_forward_length", 0)));
+        out->kv("num_shared_experts", fmt("%lld", (long long)m.n_expert_shared));
+        out->kv("intermediate_size", fmt("%lld", (long long)m.n_ff));
+        out->kv("first_k_dense_replace", fmt("%lld", (long long)gi("leading_dense_block_count", 0)));
+        out->kv("short_conv_kernel_size", fmt("%lld", (long long)gi("ssm.conv_kernel", 0)));
+        out->kv("kda_lower_bound", fmt("%.17g", gf("kda.gate_lower_bound", 0.0)));
+        out->kv("routed_scaling_factor", fmt("%.17g", gf("expert_weights_scale", 1.0)));
+        out->kv("norm_topk_prob", fmt("%lld", (long long)gi("expert_weights_norm", 0)));
+        out->kv("kda_safe_gate", fmt("%lld", (long long)gi("kda.safe_gate", 0)));
+        out->kv("layer_group_size", "4");
+        out->kv("no_kda_lora", "1");
+        out->kv("rope_interleave", "1");
+        out->kv("gated_attention_proj_granularity_type", "head_wise");
+        out->kv("num_nextn_predict_layers", "0");
+        /* The plugin picks its checkpoint names from this: the GGUF spells the family's tensors
+         * blk. and ssm. names (and carries the layouts bailingmoe3_layouts rebuilds), the safetensors
+         * their config.json spellings. */
+        out->kv("gguf_source", "1");
+        std::string gating = "sigmoid";
+        g.get_str("bailingmoe3.expert_gating_func", &gating);
+        out->kv("score_function", gating);
+    }
 
     /* Everything else, stringified, for the plugin. Arrays are summarised (small integer arrays
      * spelled out); tokenizer keys are skipped, since the vocab has its own section. */
@@ -497,7 +549,9 @@ int Checkpoint::open_gguf(const std::string& path) {
         index_.emplace(s.name, tensors_.size());
         tensors_.push_back(std::move(s));
     }
-    return meta_from_gguf(gguf_, &meta_);
+    RAD_TRY(meta_from_gguf(gguf_, &meta_));
+    if (meta_.arch == "bailinghybrid") RAD_TRY(bailingmoe3_layouts());
+    return RAD_OK;
 }
 
 int Checkpoint::add_shard(const std::string& p, const std::string& prefix,
@@ -556,6 +610,7 @@ int shard_list(const std::string& dir, const std::string& index, bool index_give
 }
 
 }  /* namespace */
+
 
 /* A JSON file flattened under `prefix`; absent is not an error when `optional`. */
 static int meta_merge_json_file(const std::string& path, const std::string& prefix, bool optional,
@@ -1382,10 +1437,13 @@ void Checkpoint::detect_import() {
                           "; it is read in groups of 16";
         if (algos.empty() && import_why_.empty())
             import_why_ = "ModelOpt's quantization_config names no quant_algo";
+        /* W4A16_NVFP4 is the same NVFP4 weight with bf16 activations, which is what this reader
+         * serves either way: activations are quantised from their own values, never from a stored
+         * input scale. NVIDIA's Muse Glimmer release states it per layer beside FP8. */
         for (const std::string& a : algos)
-            if (a != "NVFP4" && a != "FP8" && import_why_.empty())
-                import_why_ = "ModelOpt's quant_algo '" + a + "' is not one this reads; NVFP4 "
-                              "and FP8 (per tensor), alone or per layer, are";
+            if (a != "NVFP4" && a != "W4A16_NVFP4" && a != "FP8" && import_why_.empty())
+                import_why_ = "ModelOpt's quant_algo '" + a + "' is not one this reads; NVFP4, "
+                              "W4A16_NVFP4 and FP8 (per tensor), alone or per layer, are";
         if (import_why_.empty()) import_ = Import::ModelOpt;
         else import_why_ = "modelopt: " + import_why_;
     } else if (qm == "paroquant") {
@@ -2970,9 +3028,17 @@ namespace {
 /* ---------------------------------------------------------------- GGUF block types
  *
  * ggml block types decodable to f32. Their geometry lives in core/text; decoding lives here, where
- * weights are read. Q4_K and Q6_K are the K-quants this HYV3 GGUF adapter needs. */
+ * weights are read. Q4_K, Q5_K and Q6_K are the K-quants the GGUF releases ship, IQ4_NL the
+ * non-linear 4-bit. */
 enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_0 = 6, GGML_Q5_1 = 7,
-       GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q6_K = 14, GGML_BF16 = 30 };
+       GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_BF16 = 30,
+       GGML_IQ4_NL = 20 };
+
+/* IQ4_NL's non-linear levels (llama.cpp's kvalues_iq4nl), one per 4-bit code. */
+static const int8_t kIq4NlLevels[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
 
 int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
     auto half = [&](const uint8_t* q) { uint16_t h; std::memcpy(&h, q, 2); return rad_f16_to_f32(h); };
@@ -3032,13 +3098,7 @@ int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
                 const uint8_t* qs = p + 16;
                 for (int j = 0; j < 8; ++j) {
                     uint32_t sc, mn;
-                    if (j < 4) {
-                        sc = scales[j] & 63u;
-                        mn = scales[j + 4] & 63u;
-                    } else {
-                        sc = (scales[j + 4] & 15u) | ((uint32_t)(scales[j - 4] >> 6) << 4);
-                        mn = (scales[j + 4] >> 4) | ((uint32_t)(scales[j] >> 6) << 4);
-                    }
+                    ggml_planes::k4_scale_min(j, scales, &sc, &mn);
                     const float ds = d * (float)sc, ms = dmin * (float)mn;
                     for (int l = 0; l < 32; ++l) {
                         const int v = j * 32 + l;
@@ -3049,7 +3109,33 @@ int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
                 }
             }
             return RAD_OK;
+        case GGML_Q5_K:
+            /* block: d, dmin, scales[12], qh[32], qs[128]. The fifth bit of value v is bit
+             * (v/64)*2 + (v%64)/32 of qh's byte (v/64)*32 + v%32. */
+            for (int64_t b = 0; b < n / 256; ++b, p += 176) {
+                const float d = half(p), dmin = half(p + 2);
+                const uint8_t* scales = p + 4;
+                const uint8_t* qh = p + 16;
+                const uint8_t* qs = p + 48;
+                for (int j = 0; j < 256; j += 64) {
+                    const int hb = j / 64;
+                    const uint32_t u1 = 1u << (2 * hb), u2 = 1u << (2 * hb + 1);
+                    uint32_t sc1, m1, sc2, m2;
+                    ggml_planes::k4_scale_min(j / 32, scales, &sc1, &m1);
+                    ggml_planes::k4_scale_min(j / 32 + 1, scales, &sc2, &m2);
+                    const float d1 = d * (float)sc1, m1f = dmin * (float)m1;
+                    const float d2 = d * (float)sc2, m2f = dmin * (float)m2;
+                    const uint8_t* ql = qs + (j / 2);
+                    /* The 32 qh bytes are shared across all four 64-blocks; only the mask moves. */
+                    for (int l = 0; l < 32; ++l)
+                        dst[b * 256 + j + l] = d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1f;
+                    for (int l = 0; l < 32; ++l)
+                        dst[b * 256 + j + 32 + l] = d2 * (float)((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2f;
+                }
+            }
+            return RAD_OK;
         case GGML_Q6_K:
+            /* block: ql[128], qh[64], scales[16], d. */
             for (int64_t b = 0; b < n / 256; ++b, p += 210) {
                 const uint8_t* ql = p;
                 const uint8_t* qh = p + 128;
@@ -3061,6 +3147,16 @@ int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
                     const int code = (int)((t < 2 ? lo & 15 : lo >> 4) |
                                            (((qh[32 * n128 + l] >> (2 * t)) & 3) << 4));
                     dst[b * 256 + k] = d * (float)scales[k / 16] * (float)(code - 32);
+                }
+            }
+            return RAD_OK;
+        case GGML_IQ4_NL:
+            for (int64_t b = 0; b < n / 32; ++b, p += 18) {
+                const float d = half(p);
+                const uint8_t* qs = p + 2;
+                for (int j = 0; j < 16; ++j) {
+                    dst[b * 32 + j]      = d * (float)kIq4NlLevels[qs[j] & 0x0F];
+                    dst[b * 32 + j + 16] = d * (float)kIq4NlLevels[qs[j] >> 4];
                 }
             }
             return RAD_OK;
@@ -3430,6 +3526,141 @@ int ckpt_import_form(CkptWeight* w, const ImportForm& f, std::string* why) {
     w->imported = true;
     w->trivial = false;
     w->why = "it is re-expressed by an import rule";
+    return RAD_OK;
+}
+
+
+int Checkpoint::bailingmoe3_layouts() {
+    /* The release GGUF keeps layouts the plugin's names cannot spell through the row and slice
+     * maps. The MLA layers' latent projections are head-last: k_b [128, 512, heads] and
+     * v_b [512, 128, heads] (a 128-row k block and a 128-row v block a head), where the plugin
+     * reads one interleaved kv_b [heads * 2 * 128, 512] -- head h's k rows [2 * 128 * h,
+     * + 128), its v rows the next 128. The MoE layers' routed stacks are expert-last (gate and
+     * up [ff, emb, E], down [emb, ff, E]); the reader's fastest-first flip orients them, and
+     * the block's split-stacked source slices one expert off the flipped [E, ...] stack, so
+     * they stay where they are. Everything the flip already hands over in the plugin's
+     * orientation (the shared expert, the KDA and the norms) needs only a name, which the
+     * plugin takes from the gguf_source meta. */
+    const int64_t n_layer = meta_.m.n_layers;
+    const char* grp_s = meta_.get("layer_group_size");
+    const int64_t group = grp_s ? std::stoll(grp_s) : 4;
+    const char* dense_s = meta_.get("first_k_dense_replace");
+    const int64_t dense = dense_s ? std::stoll(dense_s) : 1;
+    const char* heads_s = meta_.get("num_attention_heads");
+    const int64_t heads = heads_s ? std::stoll(heads_s) : 16;
+    const char* latent_s = meta_.get("kv_lora_rank");
+    const int64_t latent = latent_s ? std::stoll(latent_s) : 512;
+    const char* ff_s = meta_.get("moe_intermediate_size");
+    const int64_t ff = ff_s ? std::stoll(ff_s) : 512;
+    /* The experts' third axis is the embedding width, not the dense feed-forward's. */
+    const int64_t emb = meta_.m.n_embd;
+    const char* nexp_s = meta_.get("num_experts");
+    const int64_t n_expert = nexp_s ? std::stoll(nexp_s) : 0;
+    if (n_layer < 1 || group < 2 || heads < 1 || latent < 1 || ff < 1 || emb < 1)
+        return RAD_E_FORMAT;
+
+    /* Decode a whole source tensor to f32: a block type row by row, a plain one a copy. */
+    auto whole = [&](const SrcTensor* t, std::vector<float>& dst) -> int {
+        const int64_t n = t->numel();
+        dst.resize((size_t)n);
+        return piece_f32(*t, 0, n, dst.data());
+    };
+    auto add = [&](const std::string& name, std::vector<int64_t> shape,
+                   std::vector<float>&& v) -> int {
+        if (index_.count(name)) return RAD_OK;   /* the checkpoint already spells it */
+        SrcTensor s;
+        s.name      = name;
+        s.rad_dtype = RAD_F32;
+        s.shape     = std::move(shape);
+        s.owned     = std::move(v);
+        s.data      = s.owned.data();
+        s.bytes     = (int64_t)(s.owned.size() * sizeof(float));
+        index_.emplace(s.name, tensors_.size());
+        tensors_.push_back(std::move(s));
+        return RAD_OK;
+    };
+
+    /* The exporter's ssm_a is exp(A_log) (llama.cpp's bailingmoe3 modify_tensors); the KDA
+     * kernel exponentiates internally, so the container wants the log values back. */
+    for (int64_t l = 0; l < n_layer; ++l) {
+        if ((l + 1) % group == 0) continue;   /* the MLA layers carry no ssm_a */
+        const SrcTensor* sa = find(fmt("blk.%lld.ssm_a", (long long)l));
+        if (!sa) continue;
+        std::vector<float> a3, raw;
+        RAD_TRY(whole(sa, a3));
+        raw.resize(a3.size());
+        for (size_t i = 0; i < a3.size(); ++i)
+            raw[i] = std::logf(a3[i] > 0.0f ? a3[i] : 1.0f);
+        RAD_TRY(add(fmt("blk.%lld.ssm_a_raw", (long long)l), sa->shape, std::move(raw)));
+    }
+
+    for (int64_t l = 1; l < n_layer; ++l) {
+        if ((l + 1) % group) continue;   /* the MLA layers */
+        const std::string kn = fmt("blk.%lld.attn_k_b.weight", (long long)l);
+        const std::string vn = fmt("blk.%lld.attn_v_b.weight", (long long)l);
+        const SrcTensor* k = find(kn);
+        const SrcTensor* v = find(vn);
+        if (!k || !v) continue;
+        if (k->shape.size() != 3 || v->shape.size() != 3 || k->shape[0] != heads ||
+            k->shape[1] != latent || k->shape[2] != 128 || v->shape[0] != heads ||
+            v->shape[1] != 128 || v->shape[2] != latent)
+            return RAD_E_SHAPE;
+        std::vector<float> k3, v3, fused;
+        RAD_TRY(whole(k, k3));
+        RAD_TRY(whole(v, v3));
+        fused.assign((size_t)(heads * (2 * 128) * latent), 0.0f);
+        for (int64_t h = 0; h < heads; ++h)
+            for (int64_t d = 0; d < 128; ++d) {
+                /* k_b's head block [latent, 128] transposed into the 128 k rows. */
+                for (int64_t l2 = 0; l2 < latent; ++l2)
+                    fused[((h * 2 + 0) * 128 + d) * latent + l2] = k3[((h * latent + l2) * 128) + d];
+                /* v_b's head block [128, latent] already runs its v rows. */
+                std::memcpy(&fused[((h * 2 + 1) * 128 + d) * latent],
+                            &v3[((h * 128 + d) * latent)], (size_t)latent * sizeof(float));
+            }
+        RAD_TRY(add(fmt("blk.%lld.attn_kv_b.weight", (long long)l),
+                    { heads * 2 * 128, latent }, std::move(fused)));
+        /* q_b is one [heads * (nope + rope), q_lora] matrix the plugin row-maps; a quantised
+         * source cannot be row-mapped, so split it into the plain nope and rope blocks. The
+         * per-head boundary comes from the meta the reader republished, so the split only runs
+         * when the geometry is the one the plugin will consume. */
+        const char* nps = meta_.get("qk_nope_head_dim"), *rps = meta_.get("qk_rope_head_dim");
+        const int64_t qn = nps ? std::stoll(nps) : 0, qr = rps ? std::stoll(rps) : 0;
+        const SrcTensor* qb = find(fmt("blk.%lld.attn_q_b.weight", (long long)l));
+        if (qb && qb->shape.size() == 2 && qb->shape[1] > 0 && qn > 0 && qr > 0 &&
+            qb->shape[0] == heads * (qn + qr)) {
+            const int64_t ql = qb->shape[1], w = qn + qr;
+            std::vector<float> q3, nblk, rblk;
+            RAD_TRY(whole(qb, q3));
+            nblk.assign((size_t)(heads * qn) * ql, 0.0f);
+            rblk.assign((size_t)(heads * qr) * ql, 0.0f);
+            for (int64_t h = 0; h < heads; ++h) {
+                std::memcpy(&nblk[(h * qn) * ql], &q3[(h * w) * ql], (size_t)(qn * ql) * sizeof(float));
+                std::memcpy(&rblk[(h * qr) * ql], &q3[(h * w + qn) * ql], (size_t)(qr * ql) * sizeof(float));
+            }
+            RAD_TRY(add(fmt("blk.%lld.attn_q_b_nope.weight", (long long)l), { heads * qn, ql }, std::move(nblk)));
+            RAD_TRY(add(fmt("blk.%lld.attn_q_b_rope.weight", (long long)l), { heads * qr, ql }, std::move(rblk)));
+        }
+    }
+    for (int64_t l = dense; l < n_layer; ++l) {
+        if (n_expert < 1) continue;
+        /* The routed stacks stay where they are: the block's split-stacked source
+         * (gate, up, down per expert, a dim-0 slice each) slices the reader's flipped
+         * [E, ff, emb] / [E, emb, ff] tensors directly. Only the shared expert needs
+         * re-spelling under the block's prefix: copies, the reader's flip already
+         * orienting them. */
+        const char* sh[3] = { "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp" };
+        const char* shd[3] = { "mlp.shared_experts.gate_proj.weight",
+                               "mlp.shared_experts.up_proj.weight",
+                               "mlp.shared_experts.down_proj.weight" };
+        for (int q = 0; q < 3; ++q) {
+            const SrcTensor* t = find(fmt("blk.%lld.%s.weight", (long long)l, sh[q]));
+            if (!t) continue;
+            std::vector<float> v;
+            RAD_TRY(whole(t, v));
+            RAD_TRY(add(fmt("blk.%lld.%s", (long long)l, shd[q]), t->shape, std::move(v)));
+        }
+    }
     return RAD_OK;
 }
 

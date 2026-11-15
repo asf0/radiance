@@ -186,6 +186,7 @@ scheduler:
   load-timeout: 120s       # a request waits this long for its model, then 503
   drain-timeout: 30s       # a model being evicted gets this long to finish its requests
   keepalive: 10s           # SSE comment interval for streaming requests waiting on a load
+  stuck-exit: 60s          # a device that advances nothing this long ends the process; 0 never
   warm-up: true            # fill free VRAM, then host RAM, with models at start (§8.6)
 ```
 
@@ -196,7 +197,7 @@ scheduler:
 | `server:` | `host`, `port`, `api-key`, `api-key-env`, `allow-host`, `trusted-proxy`, `http-threads`, `read-timeout`, `write-timeout`, `keep-alive-timeout`, `max-body-mib`, `retry-after`, `no-cors`, `live`, `log` (`info`/`debug`/`trace`), `radiance-home`, `kernels`, `download-dir`, `proceed-with-incompatible-configuration`, `debug-accept-reference-kernels` |
 | `cards:` | `all` or a list of card indices |
 | `memory:` | `gpu-headroom-mib`, `gpu-memory-mib` (per card), `host-mib`, `host-headroom-mib`, `disk-tier` |
-| `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive`, `warm-up` |
+| `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive`, `stuck-exit`, `warm-up` |
 | `defaults:` / `models.<name>:` | every per-model flag: model source, TP, placement, KV, scheduler, spec decode, LoRA, request defaults and limits, media limits, offline modes, debug; plus the fleet keys `aliases`, `priority`, `pin`, `ttl`, `flex`, `park` |
 | `groups:` | `together` / `exclusive` lists |
 
@@ -208,7 +209,8 @@ adds more.
 
 A one-model YAML is the only way to run one model too. `radiance --model X ...` is refused with a
 message that prints the equivalent YAML, so a migration is copy and paste. Offline modes (KL
-recording, calibration) run from a one-model YAML with the `kld-*` / `calib-*` keys on that model;
+recording, calibration, the diagnose workload) run from a one-model YAML with the `kld-*` /
+`calib-*` / `diagnose` keys on that model;
 the process does that job and exits, as today.
 
 ### 4.5 Provenance

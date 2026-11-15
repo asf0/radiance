@@ -3592,8 +3592,11 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         return RAD_OK;
     }();
 
-    /* Release the page cache of weights never read from the file again, leaving it to the mapped
-     * tier (e.g. a mapped n-gram table, read from its mapping for the process lifetime). */
+    /* Release the page cache of weights never read from the file again. The mapped tier's pages
+     * stay (RadFile::keep_cached, named where load_weights publishes a mapped weight): an n-gram
+     * table is gathered from its mapping on every step, and with its pages dropped the first long
+     * prefill after each load or restore faults them back from the drive (a 103 GiB table: 1460
+     * against 1998 tok/s on a 24k prompt). */
     file->drop_blob_cache();
     /* Drain before freeing: a sweep that failed part-way may have copies outstanding. */
     for (int b = 0; b < kWin; ++b) pool->drain(b);
@@ -3724,6 +3727,8 @@ int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
+    /* Of the container's own bytes, what the mapped tier reads: left in the page cache. */
+    int64_t mapped_kept = 0;
 
     /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
      * refused, without touching the disk; sweep_container then reads the container once in file
@@ -3911,6 +3916,7 @@ int Engine::load_weights() {
                  * for a row of a few hundred bytes. MADV_RANDOM is per range, so the rest of the
                  * container keeps sequential readahead. The effect shows only with a cold cache. */
                 posix_madvise(w.ptr, (size_t)n, POSIX_MADV_RANDOM);
+                if (file_) mapped_kept = file_->keep_cached(w.host_ptr, n);
                 r->mover.publish_mapped((rad_weight)i, w.ptr);
                 ++n_mapped;
                 mapped_bytes += n;
@@ -4041,10 +4047,11 @@ int Engine::load_weights() {
         /* Summed over ranks, which map the same file, so under TP the resident bytes are this
          * divided by --tp; the message says so. */
         RAD_INFO("load: %lld weight(s), %s, read in place from the container's mapping -- not "
-                 "copied and charged to no pool%s", (long long)n_mapped,
-                 humanb(mapped_bytes).c_str(),
+                 "copied and charged to no pool%s; %s of the container stays page-cached for them",
+                 (long long)n_mapped, humanb(mapped_bytes).c_str(),
                  cfg_.tp > 1 ? " (summed over ranks, which map the same file: the resident bytes "
-                               "are that divided by --tp)" : "");
+                               "are that divided by --tp)" : "",
+                 humanb(mapped_kept).c_str());
     return RAD_OK;
 }
 

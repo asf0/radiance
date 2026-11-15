@@ -19,7 +19,11 @@ The factor convention is the config's, as vLLM and transformers read it: `factor
 Validated: the Qwen3.8-27B and Qwen3.6-35B-A3B containers and both Flash-Next variants at factor 2,
 with retrieval at about 500K tokens, and TP3 perplexity with `rope-scaling` within about ±1% of
 the unscaled model at factor 2. The LLaMA plugins read the same keys and declare the same ops, but
-YaRN has not been run on a LLaMA model.
+YaRN has not been run on a LLaMA model. Muse Glimmer validated at factor 8 over 131072 (a 1M
+serving window) with retrieval at 913K tokens -- and, unusually, without any scaling at all
+(mechanical window extension to 495K, also retrieval-passing): only its 2048-wide sliding layers
+carry rotary and its full-attention layers are NoPE, so the unscaled window is the family's
+default recipe (docs/ARCHITECTURES.md, museglimmer).
 
 ## Metadata
 

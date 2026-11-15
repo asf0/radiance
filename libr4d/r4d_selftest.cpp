@@ -8498,6 +8498,10 @@ static void mxfp4a8_gated_case(const Plugin& pl, int64_t M, int64_t N, int64_t K
  * libref function (libref/ref_audio.cpp, ref_elementwise.cpp, ref_attn.cpp) over the same bf16
  * inputs. Picks, ids and the history are compared exactly; a sum the kernel orders differently is
  * held to a relative L2 against the answer rounded to bf16. */
+namespace vg {
+void* stored_weight_f32(const RadKernelInfo*, const std::vector<RadParam>&,
+                        const std::vector<float>&, int64_t, int64_t, const char*);
+}
 namespace au {
 
 uint64_t g_seed = 0xa0d10ull;
@@ -8719,8 +8723,8 @@ void conv1d_cases(const Plugin& pl) {
             }
         check(nm + " numerics", down_bf16(dy, want.size()), want, 1e-2);
     }
-    /* An even kernel is causal only; a stride needs its pad and its one sequence; and the
-     * strided form refuses the f32 rows. */
+    /* An even kernel is causal only; the explicit padded stride needs one sequence and
+     * remains bf16-only (the causal strided form also supports f32). */
     std::vector<RadParam> ps = { PI("M", 4), PI("cin", 8), PI("cout", 16), PI("k", 4), PI("dil", 1),
                                  PS("dtype", "bf16") };
     const int rc = launch(r, { TA(RAD_BF16, { 4, 8 }), TA(RAD_BF16, { 16, 8, 4 }),
@@ -8744,14 +8748,14 @@ void conv1d_cases(const Plugin& pl) {
     ok("conv1d_bf16 refuses a stride over two sequences", rt == RAD_E_SHAPE,
        "rc " + std::to_string(rt));
     if (const RadKernelInfo* f = find(pl, "conv1d_f32")) {
-        /* Odd k so the refusal comes from the stride, not from the even-kernel rule. */
+        /* Odd k so the refusal comes from explicit padding, not the even-kernel rule. */
         const std::vector<RadParam> f32 = { PI("M", 8), PI("cin", 8), PI("cout", 16), PI("k", 3),
                                             PI("dil", 1), PS("dtype", "f32"), PI("stride", 2),
                                             PI("pad", 1) };
         const int rf = launch(f, { TA(RAD_F32, { 8, 8 }), TA(RAD_F32, { 16, 8, 3 }),
                                    TI32({ 2 }, { 0, 8 }), TA(RAD_F32, { 4, 16 }),
                                    TA(RAD_F32, { 4, 16 }), TA(RAD_F32, { 16 }) }, f32);
-        ok("conv1d_f32 refuses a stride", rf == RAD_E_DTYPE, "rc " + std::to_string(rf));
+        ok("conv1d_f32 refuses explicit symmetric stride padding", rf == RAD_E_DTYPE, "rc " + std::to_string(rf));
     }
 }
 
@@ -9169,6 +9173,179 @@ void rvq_embed_cases(const Plugin& pl) {
  * codes a dense row and a strided column: each code against the host's cosine argmax in double (a
  * pick within 1e-5 of the best score is a near tie, not a miss), the row after against
  * x - out_w cb[code] - out_b for the code the kernel took. */
+void breeze_reference_cases(const Plugin& pl) {
+    const auto* q = find(pl, "vq_euclidean_f32");
+    const auto* e = find(pl, "elu_f32");
+    const auto* cv = find(pl, "conv1d_f32");
+    if (!q || !e || !cv) { ok("breeze reference rows present", false); return; }
+    constexpr int n = 256, bins = 2048, xp = 259, cp = 261, cs = 3;
+    std::vector<float> x(3 * xp, 0), cb(bins * cp, 0);
+    x[0] = 4; x[xp] = 2; x[2 * xp] = -1;
+    cb[0] = 1; cb[cp] = 3; cb[2 * cp] = -1;
+    for (int k = 3; k < bins; ++k) cb[k * cp] = 100 + k;
+    for (int r = 0; r < 3; ++r) for (int j = n; j < xp; ++j) x[r * xp + j] = 77;
+    void* dx = up_f32(x);
+    void* dc = up_i32(std::vector<int32_t>(3 * cs, -7));
+    RadTensor tx = T(dx, RAD_F32, {3, n}); tx.stride[0] = xp;
+    RadTensor tc = T(up_f32(cb), RAD_F32, {bins, n}); tc.stride[0] = cp;
+    RadTensor codes = T(dc, RAD_I32, {3}); codes.stride[0] = cs;
+    const int rc = launch(q, {tx, tc, codes}, {PI("M", 3), PI("n", n), PI("bins", bins), PS("dtype", "f32")});
+    ok("breeze Euclidean RVQ launch", rc == RAD_OK, "rc " + std::to_string(rc));
+    if (rc == RAD_OK) {
+        const auto got = down_i32(dc, 3 * cs);
+        const auto residual = down_f32(dx, x.size());
+        bool valid = got[0] == 1 && got[cs] == 0 && got[2 * cs] == 2;
+        for (int i = 0; i < 3 * cs; ++i) if (i % cs) valid &= got[i] == -7;
+        for (int r = 0; r < 3; ++r) for (int j = 0; j < xp; ++j) {
+            const float want = j == 0 ? (r == 2 ? 0 : 1) : j < n ? 0 : 77;
+            valid &= residual[r * xp + j] == want;
+        }
+        ok("breeze Euclidean distance, tie order, residual and pitched guards", valid);
+    }
+    std::vector<float> v = {-1, 0, 2, -100};
+    void* dv = up_f32(v);
+    const int re = launch(e, {T(dv, RAD_F32, {4, 1}), T(dv, RAD_F32, {4, 1})},
+                           {PI("M", 4), PI("n", 1), PS("dtype", "f32")});
+    ok("breeze ELU in place launch", re == RAD_OK);
+    if (re == RAD_OK) {
+        const auto g = down_f32(dv, 4);
+        ok("breeze ELU in place values", std::abs(g[0] + 0.6321205588f) < 1e-7f &&
+            g[1] == 0 && g[2] == 2 && g[3] == -1);
+    }
+    if (const auto* g = find(pl, "gemm_f32_nt")) {
+        void* out = dalloc(6 * sizeof(float));
+        const int s = launch(g, {T(up_f32({1, 2, 3, 4, -1, 2}), RAD_F32, {3, 2}),
+            T(up_f32({2, 0, 0, 3}), RAD_F32, {2, 2}), T(out, RAD_F32, {3, 2})},
+            {PI("M", 3), PI("N", 2), PI("K", 2), PS("dtype", "f32")});
+        ok("breeze unbiased f32 GEMM", s == RAD_OK && down_f32(out, 6) == std::vector<float>({2, 6, 6, 12, -2, 6}));
+    } else ok("breeze unbiased f32 GEMM present", false);
+    if (const auto* ln = find(pl, "layernorm_f32")) {
+        void* out = dalloc(4 * sizeof(float));
+        const int s = launch(ln, {T(up_f32({-1, 1, 3, 5}), RAD_F32, {2, 2}),
+            T(up_f32({2, 2}), RAD_F32, {2}), T(up_f32({1, 1}), RAD_F32, {2}), T(out, RAD_F32, {2, 2})},
+            {PI("M", 2), PI("n", 2), PF("eps", 1e-5), PS("dtype", "f32")});
+        bool valid = s == RAD_OK;
+        if (valid) {
+            const auto got = down_f32(out, 4);
+            const float inv = 1 / std::sqrt(1.00001f);
+            for (int i = 0; i < 4; ++i) valid &= std::abs(got[i] - (1 + (i % 2 ? 2 : -2) * inv)) < 1e-6f;
+        }
+        ok("breeze f32 layer norm mean, variance, gain and bias", valid);
+    } else ok("breeze f32 layer norm present", false);
+    if (const auto* gl = find(pl, "gelu_f32")) {
+        void* out = dalloc(4 * sizeof(float));
+        const int s = launch(gl, {T(up_f32({-1, 0, 1, 2}), RAD_F32, {2, 2}), T(out, RAD_F32, {2, 2})},
+            {PI("M", 2), PI("n", 2), PS("dtype", "f32")});
+        bool valid = s == RAD_OK;
+        if (valid) {
+            const auto got = down_f32(out, 4);
+            for (int i = 0; i < 4; ++i) {
+                const float v = i - 1;
+                valid &= std::abs(got[i] - 0.5f * v * (1 + std::erf(v / std::sqrt(2.f)))) < 1e-6f;
+            }
+        }
+        ok("breeze f32 exact GELU", valid);
+    } else ok("breeze f32 GELU present", false);
+    if (const auto* rope = find(pl, "rope_bf16")) {
+        std::vector<float> x(2 * 192, 0);
+        for (int r = 0; r < 2; ++r) {
+            x[r * 192] = 1; x[r * 192 + 32] = 2;
+            x[r * 192 + 64] = 3; x[r * 192 + 96] = 4;
+            for (int d = 128; d < 192; ++d) x[r * 192 + d] = 9;
+        }
+        void* dx = up_f32(x);
+        const int s = launch(rope, {T(dx, RAD_F32, {2, 192}), TI32({2}, {0, 1})},
+            {PI("M", 2), PI("head_dim", 64), PI("n_head", 1), PI("n_head_kv", 1),
+             PF("theta", 10000), PF("scale", 1), PS("mode", "neox")});
+        bool valid = s == RAD_OK;
+        if (valid) {
+            const auto got = down_f32(dx, x.size());
+            for (int i = 0; i < 192; ++i) valid &= got[i] == x[i];
+            valid &= std::abs(got[192] - (std::cos(1.f) - 2 * std::sin(1.f))) < 1e-6f;
+            valid &= std::abs(got[224] - (std::sin(1.f) + 2 * std::cos(1.f))) < 1e-6f;
+            valid &= std::abs(got[256] - (3 * std::cos(1.f) - 4 * std::sin(1.f))) < 1e-6f;
+            for (int i = 320; i < 384; ++i) valid &= got[i] == 9;
+        }
+        ok("breeze f32 rotary turns Q/K and preserves V", valid);
+    }
+    if (const auto* attn = find(pl, "attn_dense_h64_f32")) {
+        constexpr int N = 128;
+        std::vector<float> zeros(4 * N, 0), values(4 * N);
+        for (int r = 0; r < 4; ++r) for (int d = 0; d < N; ++d) values[r * N + d] = r + 1 + 10 * (d / 64);
+        void* out = dalloc(values.size() * sizeof(float));
+        const int s = launch(attn, {T(up_f32(zeros), RAD_F32, {4, N}), T(up_f32(zeros), RAD_F32, {4, N}),
+            T(up_f32(values), RAD_F32, {4, N}), TI32({3}, {0, 4, 8}), T(out, RAD_F32, {4, N})},
+            {PI("M", 4), PI("head_dim", 64), PI("gqa", 1), PI("causal", 1), PI("window", 2),
+             PI("max_seqlen", 4), PI("cu_div", 2), PF("scale", 0.125), PS("dtype", "f32")});
+        bool valid = s == RAD_OK;
+        if (valid) {
+            const auto got = down_f32(out, values.size());
+            const float mean[] = {1, 1.5, 3, 3.5};
+            for (int r = 0; r < 4; ++r) for (int d = 0; d < N; ++d)
+                valid &= std::abs(got[r * N + d] - (mean[r] + 10 * (d / 64))) < 1e-6f;
+        }
+        ok("breeze f32 attention isolates sequences, heads and causal windows", valid);
+        constexpr int R = 7, H = 2;
+        const auto q = randv(R * N, 0.2f), k = randv(R * N, 0.2f), v = randv(R * N, 1.0f);
+        void* dy = dalloc(R * N * sizeof(float));
+        const int rc = launch(attn, {T(up_f32(q), RAD_F32, {R, N}), T(up_f32(k), RAD_F32, {R, N}),
+            T(up_f32(v), RAD_F32, {R, N}), TI32({3}, {0, 3, R}), T(dy, RAD_F32, {R, N})},
+            {PI("M", R), PI("head_dim", 64), PI("gqa", 1), PI("causal", 1), PI("window", 3),
+             PI("max_seqlen", R), PF("scale", 0.125), PS("dtype", "f32")});
+        bool matches = rc == RAD_OK;
+        if (matches) {
+            const auto got = down_f32(dy, R * N);
+            for (int r = 0; r < R; ++r) for (int h = 0; h < H; ++h) {
+                const int first = std::max(r < 3 ? 0 : 3, r - 2);
+                std::vector<double> scores;
+                double sum = 0;
+                for (int j = first; j <= r; ++j) {
+                    double dot = 0;
+                    for (int d = 0; d < 64; ++d) dot += (double)q[r * N + h * 64 + d] * k[j * N + h * 64 + d];
+                    scores.push_back(std::exp(dot * 0.125)); sum += scores.back();
+                }
+                for (int d = 0; d < 64; ++d) {
+                    double want = 0;
+                    for (int j = first; j <= r; ++j) want += scores[j - first] / sum * v[j * N + h * 64 + d];
+                    matches &= std::abs(got[r * N + h * 64 + d] - want) < 5e-6;
+                }
+            }
+        }
+        ok("breeze f32 attention agrees with double softmax/dot oracle", matches);
+    } else ok("breeze f32 attention present", false);
+    /* Exercise both the direct and tiled f32 causal strided conv, with two clips whose bounds
+     * are expressed in samples at a different rate. */
+    for (int channels : {1, 32}) {
+        constexpr int R = 12, O = 6, K = 4;
+        std::vector<float> cx(R * channels, 0), w(channels * channels * K, 0);
+        for (int r = 0; r < R; ++r) for (int c = 0; c < channels; ++c) cx[r * channels + c] = r % 8 + 1;
+        for (int c = 0; c < channels; ++c) for (int k = 0; k < K; ++k) w[(c * channels + c) * K + k] = 1;
+        std::vector<RadParam> ps = {PI("M", R), PI("cin", channels), PI("cout", channels), PI("k", K),
+            PI("dil", 1), PI("causal", 1), PI("stride", 2), PI("cu_div", 4), PS("dtype", "f32")};
+        const std::string nm = fmt("breeze f32 causal stride, %d channels", channels);
+        void* dw = vg::stored_weight_f32(cv, ps, w, channels, channels * K, nm.c_str());
+        if (!dw) continue;
+        void* dy = dalloc(O * channels * sizeof(float));
+        RadTensor nores = TA(RAD_F32, {O, channels}), nobias = TA(RAD_F32, {channels});
+        absent(nores); absent(nobias);
+        const int s = launch(cv, {T(up_f32(cx), RAD_F32, {R, channels}), T(dw, RAD_F32, {channels, channels, K}),
+            TI32({3}, {0, 32, 48}), nores, T(dy, RAD_F32, {O, channels}), nobias}, ps);
+        bool valid = s == RAD_OK;
+        if (valid) {
+            const auto got = down_f32(dy, O * channels);
+            for (int r = 0; r < O; ++r) for (int c = 0; c < channels; ++c) {
+                float want = 0;
+                for (int k = 0; k < K; ++k) {
+                    const int ir = 2 * r + k - 2, begin = r < 4 ? 0 : 8, end = r < 4 ? 8 : 12;
+                    if (ir >= begin && ir < end) want += cx[ir * channels + c];
+                }
+                valid &= got[r * channels + c] == want;
+            }
+        }
+        ok(nm.c_str(), valid, "rc " + std::to_string(s));
+    }
+}
+
 void vq_encode_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "vq_encode");
     if (!r) { ok("vq_encode", false, "row absent"); return; }
@@ -15027,7 +15204,9 @@ static void gelu_mul_quant_i8_numeric(const Plugin& pl, bool grp = false) {
  * every width r4d_act_threads answers, including 256 at head_dim 512 (two channels per thread).
  * Gemma 3's class (head_dim 128, 16 q over 8 kv heads at one rank of two) has no value norm
  * (v_norm 0), so its chain is four ops and v must come back untouched. HYV3 adds 32 q / 4 kv
- * heads, F32 norm gains widened from BF16 and positions near the 65K serving bound. */
+ * heads, F32 norm gains widened from BF16 and positions near the 65K serving bound. Flint's full
+ * layers are the same heads with no positional encoding (`rotary_dim` 0): the chain is the two
+ * norms alone, and the one dispatch copies each normed head through its rotary stage. */
 static void qkv_norm_rope_numeric(const Plugin& pl) {
     const RadKernelInfo* np  = find(pl, "rmsnorm_p_bf16");
     const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
@@ -15045,7 +15224,8 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
                            Cls{ 128, 16, 8, 128, "rotary", 10000.0, false, false },
                            Cls{ 128, 32, 4, 128, "rotary", 11158840.0, false, false, true },
                            Cls{ 256, 8, 4, 256, "rotary", 10000.0, false, false },
-                           Cls{ 256, 0, 4, 256, "rotary", 10000.0, false, false } }) {
+                           Cls{ 256, 0, 4, 256, "rotary", 10000.0, false, false },
+                           Cls{ 128, 32, 4, 0, "rotary", 10000.0, false, false, true } }) {
         /* 8 rows of the head-256 class are 8 x 32 workgroups of 8 wavefronts, a full card: the
          * launch adds an idle row past the cliff (r4d_cliff_rows), which must not change a byte. */
         for (const int64_t M : { (int64_t)1, (int64_t)4, (int64_t)8, (int64_t)40 }) {
@@ -15099,7 +15279,7 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
             if (rc == RAD_OK)
                 rc = launch_row(nrm, { T(dk[0], RAD_BF16, { M * cl.nkv, cl.hd }), T(dkw, wdt, { cl.hd }), T(dk[0], RAD_BF16, { M * cl.nkv, cl.hd }) },
                                 { PI("M", M * cl.nkv), PI("n", cl.hd), PF("eps", eps), PS("dtype", "bf16"), PF("wadd", wadd) });
-            for (int j = cl.nq ? 0 : 1; j < 2 && rc == RAD_OK; ++j)
+            for (int j = cl.nq ? 0 : 1; j < 2 && rc == RAD_OK && cl.rot; ++j)
                 rc = launch_row(rp, { T(j ? dk[0] : dq[0], RAD_BF16, { M, (j ? cl.nkv : cl.nq) * cl.hd }), T(dp, RAD_I32, { M }) },
                                 { PI("M", M), PI("head_dim", cl.hd), PI("n_head", j ? cl.nkv : cl.nq), PI("n_head_kv", 0),
                                   PF("theta", cl.theta), PF("scale", 1.0), PS("mode", "neox"), PI("rotary_dim", cl.rot),
@@ -15114,6 +15294,7 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
                                   PI("v_from_k", cl.vk ? 1 : 0), PI("v_norm", cl.vn ? 1 : 0), PS("dtype", "bf16") });
             const std::string what = std::string("qkv_norm_rope hd=") + std::to_string(cl.hd) +
                                      (cl.nq ? "" : " n_head=0") + (cl.vn ? "" : " v_norm=0") +
+                                     (cl.rot ? "" : " rotary_dim=0") +
                                      (cl.w32 ? " f32 gains" : "") + " M=" + std::to_string(M);
             if (rc != RAD_OK) { ok((what + " vs its five").c_str(), false, "rc=" + std::to_string(rc)); continue; }
             int nd = 0, moved = 0;
@@ -15126,8 +15307,9 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
                 const std::vector<uint16_t>& h0 = t == 0 ? hq : (t == 1 ? hk : hv);
                 for (size_t i = 0; i < n; ++i) { nd += a[i] != b[i]; moved += b[i] != h0[i]; }
             }
-            ok((what + (cl.nq ? " is byte-identical to rmsnorm_p + rmsnorm x2 + rope x2"
-                              : " is byte-identical to rmsnorm + rope over k")).c_str(),
+            ok((what + (!cl.rot ? " is byte-identical to its norms alone"
+                        : cl.nq ? " is byte-identical to rmsnorm_p + rmsnorm x2 + rope x2"
+                                : " is byte-identical to rmsnorm + rope over k")).c_str(),
                nd == 0 && moved > 0,
                "differs " + std::to_string(nd) + ", changed from the input " + std::to_string(moved));
 
@@ -32287,6 +32469,9 @@ static void device_phase(const Plugin& pl) {
     if (sel("ras_pick")) au::ras_pick_cases(pl);
     if (sel("rvq_embed_bf16")) au::rvq_embed_cases(pl);
     if (sel("vq_encode")) au::vq_encode_cases(pl);
+    if (sel("breeze_reference") || sel("vq_euclidean_f32") || sel("elu_f32") ||
+        sel("gemm_f32_nt") || sel("layernorm_f32") || sel("gelu_f32") || sel("attn_dense_h64_f32"))
+        au::breeze_reference_cases(pl);
     if (sel("frame_store")) au::frame_store_cases(pl);
     if (sel("iota")) au::iota_cases(pl);
     if (sel("sub_i32")) au::sub_i32_cases(pl);

@@ -104,6 +104,9 @@ struct FleetConfig {
     int64_t load_timeout_ms  = 120000;
     int64_t drain_timeout_ms = 30000;
     int64_t keepalive_ms     = 10000;
+    /* A device that has advanced nothing for this long ends the process, so a restart policy can
+     * bring the server back (dev_stuck_exit_ms); 0 never. */
+    int64_t stuck_exit_ms    = 60000;
     /* Once the listener is open and nothing waits, unpinned models load one at a time into free
      * VRAM and park to host memory and the disk tier as later ones displace them, so a first
      * request finds its model parked rather than cold (docs/MULTIMODEL.md §8.6). */

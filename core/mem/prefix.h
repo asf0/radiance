@@ -306,8 +306,17 @@ public:
     int64_t trim(int64_t n_entries);
     /* Give up every VRAM copy that costs nothing to drop: host copy landed and no running sequence
      * reading it. Used when the memory has a better use (the expert slab's loan). Entries still
-     * shared are retried after a sequence frees blocks. Returns how many entries left VRAM. */
-    int64_t drop_clean();
+     * shared are retried after a sequence frees blocks. Returns how many entries left VRAM.
+     *
+     * `loan_goal` is the loan the slab is short of, in tokens (0: none). An entry with no host
+     * copy coming (the host tier is full of context worth more) never becomes clean, and the
+     * loan reaches down only to the highest held block: a few such entries high in the pool keep
+     * the slab from everything below them for as long as the server runs. Where they are
+     * stragglers (KVManager::straggler_mark: giving them up lends at least sixteen blocks for
+     * each one lost) and stand inside `loan_goal`, they are forgotten, and their tokens are
+     * prefilled again if their conversation returns. Context that fills its part of the pool
+     * stays: there the cache is worth more than the loan it holds back. */
+    int64_t drop_clean(int64_t loan_goal = 0);
     int64_t size() const { return (int64_t)map_.size(); }
     /* Entries holding blocks in the pool, as opposed to only a copy off the card. */
     int64_t resident() const { return (int64_t)lru_.size(); }
@@ -544,6 +553,11 @@ private:
      * sequence-free count then. They are rechecked only once that count moves. */
     std::vector<BlockHash> drop_wait_;
     std::vector<BlockHash> drop_scratch_;
+    /* drop_stragglers: the marks and held tops it last walked the list for, and when. It walks
+     * again when a sequence frees blocks, or once they have moved and a second has passed. */
+    std::vector<int64_t> strag_mark_, strag_seen_;
+    uint64_t    strag_ns_ = 0;
+    int64_t drop_stragglers(int64_t loan_goal, bool recheck);
     uint64_t    frees_seen_ = 0;
     /* hold(): keys per waiting request, and holders per key. A release also triggers a recheck
      * of drop_wait_. */

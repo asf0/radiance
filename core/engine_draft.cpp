@@ -215,7 +215,7 @@ int Engine::tree_compact(int rows) {
             const int64_t row = bits > 0 ? b->shape[3] * bits / 8 : 0;
             int32_t layers = 0;
             for (int32_t s : b->layer_slot) layers += s >= 0;
-            if (row <= 0 || row % 16 || (bits != 8 && bits != 16 && bits != 32) ||
+            if (row <= 0 || row % 4 || (bits != 8 && bits != 16 && bits != 32) ||
                 (b->bytes && (int64_t)layers * b->layer_stride > b->bytes)) {
                 RAD_ERR("speculation: KV group %zu's cache (%s, %lld-byte rows) is not one a tree's "
                         "acceptance can move", g, rad_dtype_name(b->dtype), (long long)row);

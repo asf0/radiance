@@ -78,6 +78,11 @@ set(R3D_UNITS
   # split-KV) and the prefill leg (a 16-token query tile staged in LDS), over a bf16 or an E4M3
   # cache. The walk is shared; the tile is what a workgroup stages once and every wave consumes.
   "r3d_attn_paged_h128|"
+  # Absorbed MLA: the per-head projections (absorb/expand through the shared latent weight).
+  "r3d_mla_project|"
+  # Dense causal latent attention over a paged [latent | rope] cache: a wave a (row, head), the
+  # score one wave sum, split history with an f32 partial merge, the optional head gate.
+  "r3d_mla_attn_paged|"
   # The sampler's spine: the row's top-R in one scan, and the stages that turn the candidate plane
   # the top-R produces into one token -- argmax, temp, top-k, the draw, and the four narrowings.
   "r3d_sample_f32|"
@@ -124,10 +129,21 @@ set(R3D_UNITS
   "r3d_gdn_gated_rmsnorm_h128|"
   "r3d_gdn_gated_norm_had_quant_i8|"
   "r3d_gdn_conv_w4_h128|"
+  # GLM's per-channel KDA recurrence over the paged f32 state cache, with the speculative
+  # candidate snapshots (the state in registers, no LDS).
+  "r3d_kda_update|"
+  # PLE's dilated depthwise convolution (taps `dilation` apart), its silu and the residual add:
+  # one thread a channel walking a 32-token tile, with the conv window's write-back fused in.
+  "r3d_ple_conv|"
   # Mixture of experts: each routing weight times its expert's own scale, in place.
   "r3d_expert_scale_bf16|"
   # The router: softmax over the expert logits, the top_k by value, renormalised if `norm`.
   "r3d_moe_router_topk_bf16|"
+  # The router's F32 projection: a bf16 activation against an f32 weight, f32 out.
+  "r3d_gemm_nt_f32|"
+  # The group-limited sigmoid router (Ling-3.0's noaux_tc): the groups ranked by their two best
+  # p + bias, selection over the kept groups' experts, one wave a row.
+  "r3d_router_group_topk|"
   # The routed slots' stable counting sort (the small form, one workgroup).
   "r3d_moe_scatter|"
   # Fold the expert outputs back to the token (the gather, and the inverse-table form).

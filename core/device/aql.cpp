@@ -943,6 +943,36 @@ void report_running(int card) {
     }
 }
 
+int64_t stuck_ms();
+
+std::atomic<bool> g_stuck_watch{false};
+
+/* Started by a stall verdict, at most one at a time: ends the process once the verdict has stood
+ * for dev_stuck_exit_ms (`scheduler.stuck-exit`; 0 never), and ends itself when the queues move
+ * again. Its own thread, because the threads that noticed the stall are the ones parked in the
+ * wait. Without the exit a hung device left the process up for good: /health answered 503, a
+ * SIGTERM could not drain a thread blocked in the driver, and a restart policy had nothing to
+ * act on. */
+void stuck_watch() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        const int64_t ms = stuck_ms();
+        const int64_t limit = rad::dev_stuck_exit_ms.load(std::memory_order_relaxed);
+        if (limit > 0 && ms >= limit) {
+            dump_queues("the device");
+            fatal("the device has advanced nothing for %lld s (the queue dumps above name the "
+                  "packets it is stuck on); exiting so a restart can bring the server back",
+                  (long long)(ms / 1000));
+        }
+        if (ms > 0) continue;
+        g_stuck_watch.store(false, std::memory_order_release);
+        /* A verdict that landed between the read above and the store has no watcher yet. */
+        if (!g_stuck_at.load(std::memory_order_acquire) ||
+            g_stuck_watch.exchange(true, std::memory_order_acq_rel))
+            return;
+    }
+}
+
 /* Stall detector for a spin loop. tick() reads the clock every 64k iterations, a few thousand
  * times a second at most.
  *
@@ -980,7 +1010,11 @@ struct Stall {
             dump_queues(where);
             RAD_ERR("device: nothing has advanced in the %u s since: the GPU is not running the "
                     "packet named above -- a hung kernel, or a queue the driver evicted and could "
-                    "not restore (amdgpu cwsr_enable=0 is one cause)", kStallMs / 1000);
+                    "not restore (amdgpu cwsr_enable=0 is one cause). The process exits once this "
+                    "has stood for scheduler.stuck-exit (%lld s; 0 never)", kStallMs / 1000,
+                    (long long)(rad::dev_stuck_exit_ms.load(std::memory_order_relaxed) / 1000));
+            if (!g_stuck_watch.exchange(true, std::memory_order_acq_rel))
+                std::thread(stuck_watch).detach();
             return;
         }
         sampled = true;
