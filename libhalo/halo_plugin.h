@@ -508,6 +508,11 @@ void halo_rad_router_gemm_topk_scatter_fini(void*);
 int     halo_rad_router_gemm_topk_scatter(const RadArgs*, RadStream);
 int64_t halo_rad_moe_scatter_scratch(const RadArgs*);
 int     halo_rad_moe_gemm_q         (const RadArgs*, RadStream);
+/* The routed experts as IQR weights, a run's rows against each decoded tile (halo_moe_iqr.hip, from
+ * libr4d's r4d_moe_iqr.hip). */
+int     halo_rad_moe_gemm_iqr       (const RadArgs*, RadStream);
+int     halo_rad_moe_gemm_iqr_mod4  (const RadArgs*, RadStream);
+int64_t halo_rad_moe_gemm_iqr_scratch(const RadArgs*);
 /* Scratch for the run map that aligns the prefill form. Zero in the decode band and for a shape
  * whose parameters do not describe one, so a caller that never asks still gets a correct uniform
  * grid. */
@@ -520,6 +525,9 @@ int     halo_rad_moe_gemm_w4a8      (const RadArgs*, RadStream);
  * mod 4. The scratch hooks are the two-class ones. */
 int     halo_rad_moe_gemm_q_mod4    (const RadArgs*, RadStream);
 int     halo_rad_moe_gemm_w4a8_mod4 (const RadArgs*, RadStream);
+/* The w4 experts against an int8 activation (libr4d's a8i8 dtypes). */
+int     halo_rad_moe_gemm_w4a8i8     (const RadArgs*, RadStream);
+int     halo_rad_moe_gemm_w4a8i8_mod4(const RadArgs*, RadStream);
 /* `moe_gemm` at bf16: one weight table of the checkpoint's row-major planes, no scales. Same
  * grouping and three forms; its scratch hook sizes the same run map. */
 int     halo_rad_moe_gemm_bf16      (const RadArgs*, RadStream);
@@ -611,6 +619,11 @@ int halo_rad_logits_gemm_fp8 (const RadArgs*, RadStream);
                                   const void*, int64_t, const RadTensor*, int);
 HALO_HOOKS(fp8_block)
 HALO_HOOKS(i8_block)
+HALO_HOOKS(iqr)
+HALO_HOOKS(iqr_logits)
+HALO_HOOKS(iqr_vocab)
+HALO_HOOKS(moe_iqr)
+HALO_HOOKS(moe_iqr_mod4)
 HALO_HOOKS(fp8_logits)
 HALO_HOOKS(i8_logits)
 HALO_HOOKS(hc_e4m3)
@@ -622,6 +635,10 @@ HALO_HOOKS(moe_w4_mod4)
 #undef HALO_HOOKS
 int halo_rad_layout_fp8_rowmajor(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const RadTensor*, int, RadLayout*);
+int halo_rad_layout_iqr_embed(const RadParam*, int, int, const RadEncoding*, const int*,
+                             const RadTensor*, int, RadLayout*);
+int halo_rad_relayout_iqr_embed(const RadParam*, int, int, const RadEncoding*, const int*,
+                               const RadTensor*, int, void*, int64_t);
 int halo_rad_layout_embed_q(const RadParam*, int, int, const RadEncoding*, const int*,
                            const RadTensor*, int, RadLayout*);
 int halo_rad_layout_moe_fp8(const RadParam*, int, int, const RadEncoding*, const int*,

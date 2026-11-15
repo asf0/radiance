@@ -4645,6 +4645,19 @@ static const RadConstraint cMoeGemmW4[] = {
     C_GE("top_k", 1), C_EQ("group", 128),
     C_IN("dtype", "w4a8 w4a8h w4nla8h w4nl64a8h w4nl32a8h w5nl64a8h"),
 };
+/* The w4 experts against an int8 activation (libr4d's cMoeGemmW4I8; a_group 128 only here). */
+static const RadConstraint cMoeGemmW4I8[] = {
+    C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536),
+    C_GE("top_k", 1), C_EQ("group", 128),
+    C_IN("dtype", "w4a8i8 w4a8i8h w4nl64a8i8h w4nl32a8i8h"), C_IN("a_group", "128"),
+};
+/* The op over experts stored as IQR weights (halo_iqr.h's computed trellis under one f32 scale a
+ * row), against the rotated int8 activation: `i8a8h`, the layout hook telling the encodings apart.
+ * A class's rows are whole 16-row tiles a part. From libr4d's cMoeGemmIqr. */
+static const RadConstraint cMoeGemmIqr[] = {
+    C_GE("M", 1), C_DIV("N", 16), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 512),
+    C_GE("top_k", 1), C_EQ("group", 128), C_IN("dtype", "i8a8h"), C_IN("a_group", "128 256"),
+};
 /* The bf16 expert GEMM: 64-wide column tiles and 64-deep K passes, one table, no group. */
 static const RadConstraint cMoeGemmBf16[] = {
     C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 64), C_GE("n_expert", 1), C_LE("n_expert", 65536),
@@ -8069,6 +8082,58 @@ HALO_WIN_PAIR(512, 1) HALO_WIN_PAIR(512, 2) HALO_WIN_PAIR(512, 4) HALO_WIN_PAIR(
   nullptr, nullptr, halo_rad_moe_gemm_q, halo_rad_moe_gemm_q_scratch,
   halo_rad_layout_moe_fp8, nullptr,
   halo_shape_moe_gemm_q },
+
+{ "moe_gemm_w4a8i8", "moe_gemm_q", "moe",
+  "moe_gemm_w4a8 against an INT8 activation: the same stored planes and kernels, the activation "
+  "staged as f16 at 2^-8 its value (exact, the scale the E4M3 staging gives) so every fold is "
+  "moe_gemm_w4a8's. libhalo port of libr4d's row (which runs iu8 WMMA over the levels' int8 set)",
+  "as moe_gemm_w4a8; a_group 128",
+  "i8 activation with an f32 scale per (row, 128 of K), bf16 out. dtype w4a8i8: symmetric int4 "
+  "with a bf16 scale per (row, 128 of K); w4a8i8h the same plane rotated by a 128-wide Hadamard "
+  "along K; w4nl64a8i8h and w4nl32a8i8h the rotated plane with codes indexing libquant's w4nl "
+  "levels (exact here) and an E4M3 scale per (row, 64 or 32 of K) under a fixed 2^-13",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cMoeGemmW4I8), NOTUNE,
+  nullptr, nullptr, halo_rad_moe_gemm_w4a8i8, halo_rad_moe_gemm_w4a8_scratch,
+  halo_rad_layout_moe_w4, halo_rad_relayout_moe_w4, nullptr, halo_rad_unrelayout_moe_w4 },
+
+{ "moe_gemm_w4a8i8_mod4", "moe_gemm_q_mod4", "moe",
+  "moe_gemm_w4a8i8 over four classes of experts by number mod 4: the same kernel, each run "
+  "reading its class's table",
+  "as moe_gemm_w4a8i8, every class",
+  "as moe_gemm_w4a8i8",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cMoeGemmW4I8), NOTUNE,
+  nullptr, nullptr, halo_rad_moe_gemm_w4a8i8_mod4, halo_rad_moe_gemm_w4a8_scratch,
+  halo_rad_layout_moe_w4_mod4, halo_rad_relayout_moe_w4_mod4, nullptr, halo_rad_unrelayout_moe_w4_mod4 },
+
+{ "moe_gemm_iqr", "moe_gemm_q", "moe",
+  "moe_gemm_q over experts stored as IQR weights, each at its codes' width: a block serves one run "
+  "of up to sixteen sorted rows against a group of the expert's 16-row tiles, a wave decoding each "
+  "128-K unit into gfx11 int8 fragments through its own LDS just before the unit's WMMA steps (a "
+  "run of one or two rows dots each decoded value's hash with its activation byte instead); the "
+  "(tile, run) grid inside the decode band, the run map in the op's scratch above it. Ported from "
+  "libr4d (halo_moe_iqr.hip)",
+  "N a multiple of 16 a part and of the trellis's run, K a multiple of 128, group 128, at most "
+  "512 experts; a computed trellis (tcq_code=mad) of two to six bits under one f32 scale a row",
+  "i8 activation with an f32 scale per (row, 128 or 256 of K), each expert an IQR weight (codes, "
+  "the code's constants) and its scales (f32 a row, f32 a 128-K block), /fwht128 against "
+  "had_quant_act_i8g's activation; bf16 out, the product within f32 rounding",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cMoeGemmIqr), NOTUNE,
+  nullptr, nullptr, halo_rad_moe_gemm_iqr, halo_rad_moe_gemm_iqr_scratch,
+  halo_rad_layout_moe_iqr, halo_rad_relayout_moe_iqr, nullptr, halo_rad_unrelayout_moe_iqr },
+
+{ "moe_gemm_iqr_mod4", "moe_gemm_q_mod4", "moe",
+  "moe_gemm_iqr over four classes of experts by number mod 4: the same kernel, each run reading "
+  "its class's table",
+  "as moe_gemm_iqr, every class",
+  "as moe_gemm_iqr",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cMoeGemmIqr), NOTUNE,
+  nullptr, nullptr, halo_rad_moe_gemm_iqr_mod4, halo_rad_moe_gemm_iqr_scratch,
+  halo_rad_layout_moe_iqr_mod4, halo_rad_relayout_moe_iqr_mod4, nullptr,
+  halo_rad_unrelayout_moe_iqr_mod4 },
 
 { "moe_gemm_w4a8", "moe_gemm_q", "moe",
   "the same grouped GEMM with the expert weight at FOUR BITS: row-major packed nibbles expanded to "

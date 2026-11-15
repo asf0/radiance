@@ -133,6 +133,10 @@ constexpr float kMoeF16Fix = 65536.0f;
 /* `mode` bit 4: the code table is the w4nl table, staged by moeq_stage_nl from MoeTab's f16 bytes
  * (moeq_nl_tab) rather than expanded to E4M3. */
 constexpr uint32_t kModeNl = 1u << 4;
+/* `mode` bit 5: the activation is int8 (libr4d's `a8i8` dtypes, moe_gemm_w4a8i8), staged by
+ * moeq_stage_i8 as f16 at 2^-8 times its value, the scale E4M3 staging gives, so every fold is the
+ * E4M3 path's. libhalo port, 2026-11-15: libr4d reads such levels through its iu8 WMMA instead. */
+constexpr uint32_t kModeI8A = 1u << 5;
 
 using halo_moesort::kMaxExpert;
 using halo_moesort::wave_incl_scan_i32;
@@ -259,6 +263,35 @@ __device__ __forceinline__ void moeq_stage(uint16_t* __restrict__ lds, uint32_t 
     }
 }
 
+/* An int8 activation's 16 or 32 K elements as f16 at (row, k0), 2^-8 times their values, exactly:
+ * a byte b biased to u = b + 128 makes the f16 0x6400 | u, which is 1024 + u; times 2^-8 less 4.5
+ * that is b * 2^-8 (4 + u/256 is exact at f16's 2^-8 step there, and |b| 2^-8 <= 0.5 is too). */
+template <uint32_t PITCH, uint32_t ND>
+__device__ __forceinline__ void moeq_stage_i8(uint16_t* __restrict__ lds, uint32_t row, uint32_t k0,
+                                              const uint32_t (&w)[ND]) {
+    static_assert(ND == 4 || ND == 8, "sixteen or thirty-two elements");
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    uint16_t* p = lds + (size_t)row * (PITCH / 2u) + k0;
+    const h2 mul = { (_Float16)0.00390625f, (_Float16)0.00390625f };
+    const h2 add = { (_Float16)-4.5f, (_Float16)-4.5f };
+#pragma unroll
+    for (uint32_t i = 0; i < ND / 4u; ++i) {
+        uint32_t d[8];
+#pragma unroll
+        for (uint32_t x = 0; x < 4; ++x) {
+            const uint32_t u = w[i * 4 + x] ^ 0x80808080u;           /* b + 128, each byte */
+            const uint32_t lo = __builtin_amdgcn_perm(0x64646464u, u, 0x05010400u);   /* bytes 0,1 */
+            const uint32_t hi = __builtin_amdgcn_perm(0x64646464u, u, 0x05030402u);   /* bytes 2,3 */
+            const h2 vlo = __builtin_bit_cast(h2, lo) * mul + add;
+            const h2 vhi = __builtin_bit_cast(h2, hi) * mul + add;
+            d[2 * x] = __builtin_bit_cast(uint32_t, vlo);
+            d[2 * x + 1] = __builtin_bit_cast(uint32_t, vhi);
+        }
+        *(v4u*)(p + i * 16)     = v4u{ d[0], d[1], d[2], d[3] };
+        *(v4u*)(p + i * 16 + 8) = v4u{ d[4], d[5], d[6], d[7] };
+    }
+}
+
 /* The w4nl codes of 32 K elements (four packed dwords, moeq_w4_expand's order: dword i holds
  * elements 8i..8i+3 in its low nibbles and 8i+4..8i+7 in its high ones) straight to f16 at (row,
  * k0). `tab` is moeq_nl_tab's: the eight magnitudes' f16 high bytes in v[0..1] and low bytes in
@@ -329,6 +362,7 @@ void moe_gemm_q_kernel(
      * kModeNl, bits 8+ `parts`. */
     const uint32_t a_sorted = mode & 1u, cshift = (mode >> 1) & 3u, parts = mode >> 8;
     const bool nl = (mode & kModeNl) != 0u;
+    const bool i8a = (mode & kModeI8A) != 0u;
     constexpr uint32_t MT = ES ? 1u : MTP, WGM = ES ? 1u : MTP / WMP;
     constexpr uint32_t FM = MT * 16u, FN = NTL * 16u, NTHR = WGM * WGN * kWave;
     constexpr uint32_t WM = MT / WGM, WN = NTL / WGN;
@@ -783,7 +817,8 @@ void moe_gemm_q_kernel(
                     uint32_t w[kSeg / 4u];
 #pragma unroll
                     for (uint32_t x = 0; x < kSeg / 4u; ++x) w[x] = aok[p] ? apre[sl][p].d[x] : 0u;
-                    moeq_stage<kPitch>(s_a, r, sk, w);
+                    if (i8a) moeq_stage_i8<kPitch>(s_a, r, sk, w);
+                    else     moeq_stage<kPitch>(s_a, r, sk, w);
                 }
 #pragma unroll
                 for (uint32_t p = 0; p < kBP; ++p) {
@@ -1166,7 +1201,7 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
 /* One body for the fp8 and w4 launchers, which differ only in the weight dtype and its pitches, so
  * their shape checks cannot drift apart. `ncls` is 2 for the two-class op (the odd class at N_odd /
  * K_odd) or 4 for the four-class one (classes 1..3 at N_1/K_1..N_3/K_3, `y` at operand 12). */
-template <int W4>
+template <int W4, bool I8A = false>
 int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     if (ncls != 2 && ncls != 4) return HALO_NO(RAD_E_INVAL);
     const RadTensor* Aq     = halo_opt(a, 0);
@@ -1211,9 +1246,11 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         if (Nc[q] > N) N = Nc[q];
         if (Kc[q] > K) K = Kc[q];
     }
-    if (Aq->dtype != RAD_F8E4M3 || As->dtype != RAD_F32 || Y->dtype != RAD_BF16)
+    if (Aq->dtype != (I8A ? RAD_I8 : RAD_F8E4M3) || As->dtype != RAD_F32 || Y->dtype != RAD_BF16)
         return HALO_NO(RAD_E_DTYPE);
     if (sorted->dtype != RAD_I32 || off->dtype != RAD_I32) return HALO_NO(RAD_E_DTYPE);
+    /* The int8 activation's scales: one per (row, 128 of K) only (a_group 256 is libr4d's alone). */
+    if (I8A && halo_geti_or(a, "a_group", kBlock) != (long long)kBlock) return HALO_NO(RAD_E_SHAPE);
 
     long long T = 0;
     const long long y_ld = halo_rows_pitch(Y, N, &T);
@@ -1239,7 +1276,9 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     const uint32_t* tab = W4 == 4 ? kW5nlMagPerm
                         : (W4 && wdt && (!std::strcmp(wdt, "w4nla8h") ||
                                          !std::strcmp(wdt, "w4nl64a8h") ||
-                                         !std::strcmp(wdt, "w4nl32a8h"))) ? kW4nlPerm
+                                         !std::strcmp(wdt, "w4nl32a8h") ||
+                                         !std::strcmp(wdt, "w4nl64a8i8h") ||
+                                         !std::strcmp(wdt, "w4nl32a8i8h"))) ? kW4nlPerm
                                                                         : kW4IntPerm;
 
     /* One class's tables. The kernel wants the weight pitch in bytes: half the element count for a
@@ -1325,7 +1364,7 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     if constexpr (W4 >= 1 && W4 <= 3)
         if (moeq_nl_tab(tab, &tabv)) mode_nl = kModeNl;
     const uint32_t mode = (a_sorted ? 1u : 0u) | (cshift << 1) | ((uint32_t)parts << 8) |
-                          mode_nl;
+                          mode_nl | (I8A ? kModeI8A : 0u);
 
     const unsigned ny = (unsigned)(N / 64);
     /* The run map: the caller's scratch, when it is roomy enough for the bound above and the map's
@@ -1507,6 +1546,7 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
     static_assert(FM + FN <= NTHR, "a thread stages each row's and each column's scale");
     const uint32_t cshift = (mode >> 1) & 3u, parts = mode >> 8;
     const bool nl = (mode & kModeNl) != 0u;
+    const bool i8a = (mode & kModeI8A) != 0u;
 
     __shared__ uint16_t s_a[FM * (kPitch / 2u)];
     __shared__ uint16_t s_b[FN * (kPitch / 2u)];
@@ -1711,7 +1751,8 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
         for (uint32_t q = 0; q < kAP; ++q) {
             const uint32_t r = sn + q * kRPP;
             if (r >= FM) continue;
-            moeq_stage<kPitch>(s_a, r, sk, apre[q].d);
+            if (i8a) moeq_stage_i8<kPitch>(s_a, r, sk, apre[q].d);
+            else     moeq_stage<kPitch>(s_a, r, sk, apre[q].d);
         }
 #pragma unroll
         for (uint32_t q = 0; q < kBP; ++q) {
@@ -1845,6 +1886,17 @@ extern "C" int halo_rad_moe_gemm_w4a8(const RadArgs* a, RadStream stream) {
     return moe_gemm_launch<1>(a, stream);
 }
 
+/* The same stored planes against an int8 activation (libr4d's moe_gemm_w4a8i8 dtypes: w4a8i8,
+ * w4a8i8h, w4nl64a8i8h, w4nl32a8i8h), the activation staged by moeq_stage_i8. */
+static int moe_gemm_w4a8i8(const RadArgs* a, RadStream stream, int ncls) {
+    const char* wdt = halo_gets(a, "dtype");
+    if (wdt && !std::strcmp(wdt, "w4nl64a8i8h")) return moe_gemm_launch<2, true>(a, stream, ncls);
+    if (wdt && !std::strcmp(wdt, "w4nl32a8i8h")) return moe_gemm_launch<3, true>(a, stream, ncls);
+    return moe_gemm_launch<1, true>(a, stream, ncls);
+}
+extern "C" int halo_rad_moe_gemm_w4a8i8(const RadArgs* a, RadStream s) { return moe_gemm_w4a8i8(a, s, 2); }
+extern "C" int halo_rad_moe_gemm_w4a8i8_mod4(const RadArgs* a, RadStream s) { return moe_gemm_w4a8i8(a, s, 4); }
+
 extern "C" int halo_rad_moe_gemm_w4a8_mod4(const RadArgs* a, RadStream stream) {
     const char* wdt = halo_gets(a, "dtype");
     if (wdt && !std::strcmp(wdt, "w4nl64a8h")) return moe_gemm_launch<2>(a, stream, 4);
@@ -1878,3 +1930,16 @@ extern "C" void halo_moe_gemm_pin_down_tile(int pin) { g_moe_down_tile_pin = pin
 extern "C" void halo_moe_gemm_pin_down_dec(int pin) {
     g_moe_down_dec_pin = pin < (int)kMoeDownDecMaxG ? pin : (int)kMoeDownDecMaxG;
 }
+
+/* The run map and the decode band for another unit's grouped GEMM over the same sort
+ * (halo_moe_iqr.hip): the map's entry bound and bytes at `fm` rows a block, and its one launch.
+ * As libr4d's r4d_moe.hip exports. */
+long long halo_moe_blockmap_cap(long long T, long long n_expert, long long fm) {
+    return moeq_blockmap_cap(T, n_expert, fm);
+}
+long long halo_moe_blockmap_bytes(long long cap) { return moeq_blockmap_bytes(cap); }
+int halo_moe_blockmap_emit(RadStream s, const int32_t* off, uint32_t n_expert, uint32_t T,
+                           uint32_t fm, uint32_t cap, uint32_t* map) {
+    return HALO_EMIT(s, moe_blockmap_kernel, dim3(1), dim3(256), 0, off, n_expert, T, fm, cap, map);
+}
+bool halo_moe_in_decode_band(long long T, long long n_expert) { return moeq_decode_band(T, n_expert); }

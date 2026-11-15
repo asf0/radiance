@@ -22750,6 +22750,16 @@ static void moe_aligned_down_tile(const Plugin& pl, const RadKernelInfo* row, Ra
     }
 }
 
+/* f(i) for i in [0, n), spread over a few threads (libr4d's st_par_for). */
+template <class F>
+static void st_par_for(int64_t n, F f) {
+    const int64_t nt = std::max<int64_t>(1, std::min<int64_t>(8, n / 4));
+    std::vector<std::thread> th;
+    for (int64_t t = 0; t < nt; ++t)
+        th.emplace_back([&, t] { for (int64_t i = n * t / nt; i < n * (t + 1) / nt; ++i) f(i); });
+    for (auto& x : th) x.join();
+}
+
 /* The 4-bit grouped MoE GEMM against a host product over the same planes (the check the
  * `moe_gemm_w4a8` row promises instead of a kbench case). The relayout reorders each dword's
  * nibbles and the kernel expands them with V_PERM_B32 into LDS; they must agree on nibble order,
@@ -22768,27 +22778,41 @@ static void moe_aligned_down_tile(const Plugin& pl, const RadKernelInfo* row, Ra
  * whose stored row is its nibbles then its signs. `four` also runs `moe_gemm_w4a8_mod4` over the
  * same experts and holds it to the two-class op's bytes. */
 static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int sub = 0,
-                        bool w5 = false, bool four = false) {
-    const bool g64 = sub > 1;
+                        bool w5 = false, bool four = false, int64_t top_k = 2, int act8 = 0,
+                        int64_t ag = 128) {
+    const bool g64 = sub > 1, w8 = act8 == 2;
+    /* libhalo stages the codebook's exact levels against an int8 activation too (moeq_stage_i8);
+     * libr4d reads its int8 set (kW4nlI8) there. */
     const float* tab = w5 ? kW5nlTable : kW4nlTable;
-    static const char* const kForm[] = { "rule", "aligned prefill form", "decode form",
-                                         "uniform prefill grid" };
-    const RadKernelInfo* r = find(pl, "moe_gemm_w4a8");
-    if (!r || !r->layout || !r->relayout) {
-        ok((std::string("moe_gemm_w4a8 (") + sh.name + ")").c_str(), false, "row or hooks absent");
+    const char* const rname = w8 ? "moe_gemm_i8a8" : act8 ? "moe_gemm_w4a8i8" : "moe_gemm_w4a8";
+    if (act8 && (w5 || (w8 && sub))) {
+        ok((std::string(rname) + " (" + sh.name + ")").c_str(), false, "no such int8 form");
         return;
     }
-    const std::string what = std::string("moe_gemm_w4a8 vs a host decode (T=") +
+    static const char* const kForm[] = { "rule", "aligned prefill form", "decode form",
+                                         "uniform prefill grid" };
+    const RadKernelInfo* r = find(pl, rname);
+    if (!r || !r->layout || (!w8 && !r->relayout)) {
+        ok((std::string(rname) + " (" + sh.name + ")").c_str(), false, "row or hooks absent");
+        return;
+    }
+    const char* dt = w8 ? "i8a8"
+                   : act8 ? (sub == 4 ? "w4nl32a8i8h" : g64 ? "w4nl64a8i8h" : "w4a8i8")
+                   : w5 ? "w5nl64a8h" : sub == 4 ? "w4nl32a8h" : g64 ? "w4nl64a8h" : "w4a8";
+    const std::string what = std::string(rname) + " vs a host decode (T=" +
                              std::to_string(Tr) + ", " + sh.name +
-                             (w5 ? ", w5nl64a8h" : sub == 4 ? ", w4nl32a8h"
-                              : g64 ? ", w4nl64a8h" : "") + ")";
-    const char* dt = w5 ? "w5nl64a8h" : sub == 4 ? "w4nl32a8h" : g64 ? "w4nl64a8h" : "w4a8";
+                             (g64 || act8 ? std::string(", ") + dt : std::string()) +
+                             (ag != 128 ? ", an activation scale a " + std::to_string(ag) : "") + ")";
 
-    const int64_t ne = sh.ne, group = 128, top_k = 2;
+    const int64_t ne = sh.ne, group = 128;
     const int64_t Nc[2] = { sh.N0, sh.N1 }, Kc[2] = { sh.K0, sh.K1 };
     const int64_t nec[2] = { (ne + 1) / 2, ne / 2 };
     const int64_t N = std::max(sh.N0, sh.N1), K = std::max(sh.K0, sh.K1);
-    const int64_t kb = K / group, M = sh.sorted_a ? Tr : Tr / top_k;
+    /* `ag`: the K one activation scale covers (`a_group`), whole 128-wide blocks. */
+    const int64_t kb = K / ag, M = sh.sorted_a ? Tr : Tr / top_k;
+    auto ascale = [&](int64_t tok, int64_t g, const std::vector<float>& v) {
+        return v[(size_t)(tok * kb + g * group / ag)];
+    };
     const char* aord = sh.sorted_a ? "sorted" : "token";
     const int64_t fy = N / sh.parts;
     std::vector<RadParam> lp = { PI("N", sh.N0), PI("K", sh.K0), PI("N_odd", sh.N1),
@@ -22803,7 +22827,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     for (int c = 0; c < 2; ++c) {
         const int ow = c ? 6 : 2, os = c ? 7 : 3;
         const int64_t kbc = Kc[c] / group;
-        const int64_t wbytes = w5 ? Nc[c] * Kc[c] / 8 * 5 : Nc[c] * Kc[c] / 2;
+        const int64_t wbytes = w8 ? Nc[c] * Kc[c] : w5 ? Nc[c] * Kc[c] / 8 * 5 : Nc[c] * Kc[c] / 2;
         wq[c].assign((size_t)(nec[c] * wbytes), 0);
         ws[c].assign((size_t)(nec[c] * Nc[c] * kbc * (sub == 4 ? 2 : 1)), 0);
         std::vector<float> wsrc((size_t)(Nc[c] * Kc[c]));
@@ -22820,15 +22844,17 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                                : stored(r, lp, ow, cp[c].back(), { "codes" }, &w);
             const int rs = g64 ? stored(r, lp, os, cp[c].back(), { "scale", "scale.1" }, &sc)
                                : stored(r, lp, os, cp[c].back(), { "scale" }, &sc);
-            if (rw != RAD_OK || rs != (g64 ? RAD_OK : RAD_E_UNSUPPORTED)) {
+            /* The int8 experts' two planes are served as stored. */
+            if (rw != (w8 ? RAD_E_UNSUPPORTED : RAD_OK) ||
+                rs != (g64 ? RAD_OK : RAD_E_UNSUPPORTED)) {
                 ok(what.c_str(), false, "relayout rc " + std::to_string(rw) + "/" +
                                         std::to_string(rs));
                 return;
             }
             if ((int64_t)w.size() != wbytes ||
                 (int64_t)sc.size() != Nc[c] * kbc * (sub == 4 ? 4 : 2)) {
-                ok(what.c_str(), false, "stored byte counts are not N*K/2 (5/8 at five bits) and "
-                                        "N*(K/group)*2 (*4 at a 32)");
+                ok(what.c_str(), false, "stored byte counts are not N*K/2 (5/8 at five bits, N*K at "
+                                        "eight) and N*(K/group)*2 (*4 at a 32)");
                 return;
             }
             std::memcpy(wq[c].data() + (size_t)(x * wbytes), w.data(), w.size());
@@ -22836,9 +22862,9 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
         }
     }
 
-    /* The activation as E4M3 bytes and a per-(row, group) f32 scale, so host and device read the
-     * same numbers. The scale varies along rows and groups, so reading another row's scale
-     * shows. */
+    /* The activation as E4M3 bytes (int8 codes at `act8`) and a per-(row, group) f32 scale, so
+     * host and device read the same numbers. The scale varies along rows and groups, so reading
+     * another row's scale shows. */
     std::vector<uint8_t> aq((size_t)(M * K));
     std::vector<float>   as((size_t)(M * kb));
     for (int64_t m = 0; m < M; ++m) {
@@ -22848,8 +22874,14 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
             /* 8..126: no subnormal and no 0x7F (E4M3's NaN). */
             const uint32_t c = (uint32_t)((m * 13 + k * 5) % 119) + 8;
             aq[(size_t)(m * K + k)] = (uint8_t)(((m + k) & 1) ? (c | 0x80u) : c);
+            /* -127..127, both signs along a row. */
+            if (act8) aq[(size_t)(m * K + k)] = (uint8_t)(int8_t)(((m * 13 + k * 29) % 255) - 127);
         }
     }
+    auto aval = [&](int64_t tok, int64_t k) {
+        const uint8_t b = aq[(size_t)(tok * K + k)];
+        return act8 ? (double)(int8_t)b : (double)h_e4m3(b);
+    };
 
     /* Uneven runs per expert and a dropped tail, for the run loop and dropped-slot zeroing. */
     std::vector<int32_t> off((size_t)(ne + 1), 0), sorted((size_t)Tr, -1);
@@ -22882,14 +22914,16 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     /* The stacked weight-table form (a non-zero leading stride); the engine passes a pointer
      * array, and the kernel reads both. */
     std::vector<RadTensor> ts = {
-        T(d_a,     RAD_F8E4M3,   { M, K }),
+        T(d_a,     act8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3, { M, K }),
         T(d_as,    RAD_F32,      { M, kb }),
-        T(d_w[0],  w5 ? HALO_DT_MOEW5 : HALO_DT_MOEW4, { nec[0], sh.N0, sh.K0 }),
+        T(d_w[0],  w8 ? (uint32_t)RAD_I8 : w5 ? (uint32_t)HALO_DT_MOEW5 : (uint32_t)HALO_DT_MOEW4,
+          { nec[0], sh.N0, sh.K0 }),
         g64 ? T(d_ws[0], RAD_F8E4M3, { nec[0], sh.N0, sub * sh.K0 / group })
             : T(d_ws[0], RAD_BF16,   { nec[0], sh.N0, sh.K0 / group }),
         T(d_s,     RAD_I32,      { Tr }),
         T(d_o,     RAD_I32,      { ne + 1 }),
-        T(d_w[1],  w5 ? HALO_DT_MOEW5 : HALO_DT_MOEW4, { nec[1], sh.N1, sh.K1 }),
+        T(d_w[1],  w8 ? (uint32_t)RAD_I8 : w5 ? (uint32_t)HALO_DT_MOEW5 : (uint32_t)HALO_DT_MOEW4,
+          { nec[1], sh.N1, sh.K1 }),
         g64 ? T(d_ws[1], RAD_F8E4M3, { nec[1], sh.N1, sub * sh.K1 / group })
             : T(d_ws[1], RAD_BF16,   { nec[1], sh.N1, sh.K1 / group }),
         T(d_y,     RAD_BF16,     { Tr, N }),
@@ -22897,7 +22931,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     std::vector<RadParam> ps = {
         PI("M", M), PI("N", sh.N0), PI("K", sh.K0), PI("N_odd", sh.N1), PI("K_odd", sh.K1),
         PI("parts", sh.parts), PI("n_expert", ne), PI("top_k", top_k), PI("group", group),
-        PS("a_order", aord), PS("dtype", dt),
+        PS("a_order", aord), PS("dtype", dt), PI("a_group", ag),
     };
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
@@ -22908,9 +22942,9 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     const int64_t map_bytes = (1 + 2 * (ne + Tr / 16 + 2)) * 4;
     void* d_map = dalloc((size_t)map_bytes);
 
-    /* The reference, once: every form must reproduce it. */
+    /* The reference, once: every form must reproduce it. Rows are independent. */
     std::vector<double> ref((size_t)(Tr * N), 0.0);
-    for (int64_t i = 0; i < Tr; ++i) {
+    st_par_for(Tr, [&](int64_t i) {
         const int32_t f = sorted[(size_t)i];
         int64_t e = 0;
         while (e + 1 < ne && off[(size_t)(e + 1)] <= i) ++e;
@@ -22929,29 +22963,28 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                         for (int64_t h = 0; h < sub; ++h) {
                             double part = 0.0;
                             for (int64_t k = g * group + h * gw; k < g * group + (h + 1) * gw; ++k)
-                                part += (double)tab[code_at(q, wr, k)] *
-                                        (double)h_e4m3(aq[(size_t)(tok * K + k)]);
+                                part += (double)tab[code_at(q, wr, k)] * aval(tok, k);
                             const double sf = (double)h_e4m3(q.data[1][(size_t)(wr * q.row_bytes(1) +
                                                                                  sub * g + h)]) *
                                               (double)kW4G64Scale;
-                            want += part * sf * (double)as[(size_t)(tok * kb + g)];
+                            want += part * sf * (double)ascale(tok, g, as);
                         }
                         continue;
                     }
                     double sub = 0.0;
                     for (int64_t k = g * group; k < (g + 1) * group; ++k)
-                        sub += (double)code_at(cp[c][(size_t)x], wr, k) *
-                               (double)h_e4m3(aq[(size_t)(tok * K + k)]);
+                        sub += (double)code_at(cp[c][(size_t)x], wr, k) * aval(tok, k);
                     const float sf = rad_load_f32(cp[c][(size_t)x].data[1].data(), RAD_BF16,
                                                   wr * kbc + g);
-                    want += sub * (double)sf * (double)as[(size_t)(tok * kb + g)];
+                    want += sub * (double)sf * (double)ascale(tok, g, as);
                 }
             }
             ref[(size_t)(i * N + n)] = want;
         }
-    }
+    });
 
-    const int f_lo = pl.pin_moe ? 1 : 0, f_hi = pl.pin_moe ? 3 : 0;
+    const bool small_i4 = Tr <= top_k && Tr <= 32 && !g64 && !w5 && !w8;
+    const int f_lo = pl.pin_moe && !small_i4 ? 1 : 0, f_hi = pl.pin_moe ? 3 : 0;
     std::vector<uint16_t> two_cls[4];      /* each form's bytes, for the four-class pass below */
     for (int form = f_lo; form <= f_hi; ++form) {
         const std::string label = what + " " + kForm[form];
@@ -23019,10 +23052,11 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
      * at twice its stride from its first and second entries gives two classes, so classes 0 and 2
      * are the even table's halves and 1 and 3 the odd one's. Every form must reproduce the
      * two-class op's bytes, checking the class and entry each run resolves to. */
-    const RadKernelInfo* r4 = find(pl, "moe_gemm_w4a8_mod4");
+    const RadKernelInfo* r4 = find(pl, w8 ? "moe_gemm_i8a8_mod4"
+                                       : act8 ? "moe_gemm_w4a8i8_mod4" : "moe_gemm_w4a8_mod4");
     const std::string what4 = what + ", four classes";
     if (!r4) {
-        ok(what4.c_str(), false, "row moe_gemm_w4a8_mod4 absent");
+        ok(what4.c_str(), false, "the row's four-class twin is absent");
         return;
     }
     auto halves = [](const RadTensor& t, int bits, RadTensor* lo, RadTensor* hi) {
@@ -23035,7 +23069,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
         hi->stride[0] = t.stride[0] * 2;
         hi->data = (char*)t.data + t.stride[0] * bits / 8;
     };
-    const int wbits = w5 ? 5 : 4, sbits = g64 ? 8 : 16;
+    const int wbits = w8 ? 8 : w5 ? 5 : 4, sbits = g64 ? 8 : 16;
     RadTensor c4w[4], c4s[4];
     halves(ts[2], wbits, &c4w[0], &c4w[2]);
     halves(ts[3], sbits, &c4s[0], &c4s[2]);
@@ -23047,7 +23081,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
         PI("M", M), PI("N", sh.N0), PI("K", sh.K0), PI("N_1", sh.N1), PI("K_1", sh.K1),
         PI("N_2", sh.N0), PI("K_2", sh.K0), PI("N_3", sh.N1), PI("K_3", sh.K1),
         PI("parts", sh.parts), PI("n_expert", ne), PI("top_k", top_k), PI("group", group),
-        PS("a_order", aord), PS("dtype", dt),
+        PS("a_order", aord), PS("dtype", dt), PI("a_group", ag),
     };
     RadArgs a4;
     std::memset(&a4, 0, sizeof(a4));
@@ -23399,6 +23433,444 @@ static void moe_route(int64_t M, int64_t top_k, int64_t ne, uint64_t seed, bool 
  * Also an output naming fewer rows than its buffer while the offsets name the whole routing: both
  * decode forms must write those rows as the full launch did and nothing past them. */
 struct MoeDnShape { const char* name; int64_t N[4], K[4], ne, top_k; };
+
+/* libhalo --perfiqr: moe_gemm_iqr at Qwen3.8-Flash-Next IQR-V4's whole-expert (tp1) gate_up, 1280
+ * rows by 2560 in two parts, runs of 128, gathered by token (the down projection is w4nl64, not
+ * IQR), every expert its own buffer of random codes, at four bits. From libr4d's moe_iqr_perf. `iters` launches queued behind
+ * one another and synced once: the time a launch adds to a step. */
+static void moe_iqr_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_t top_k,
+                         int64_t draw = 0, int64_t rot = 1) {
+    const RadKernelInfo* r = find(pl, "moe_gemm_iqr");
+    if (!r || !r->layout || !r->relayout) { std::printf("--perfmoe: row moe_gemm_iqr absent\n"); return; }
+    if (iters <= 0) iters = 20;
+    if (draw < top_k || draw > E) draw = E;
+    if (rot < 1) rot = 1;
+    if (rot > 64) rot = 64;
+    const int64_t Tr = Mtok * top_k;
+    uint64_t z = 0x9E3779B97F4A7C15ull * (uint64_t)(Mtok * 31 + E);
+    auto rnd = [&]() {
+        z += 0x9E3779B97F4A7C15ull;
+        uint64_t x = z;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    };
+    /* `rot` routings, taken in turn by the launches: one keeps a step's experts in the card's
+     * cache, as a benchmark loop does and a decode step does not; several read them cold. */
+    std::vector<std::vector<int32_t>> sortedR((size_t)rot), offR((size_t)rot);
+    int64_t runs = 0, runs1 = 0, runs2 = 0;
+    for (int64_t ri = 0; ri < rot; ++ri) {
+        std::vector<std::vector<int32_t>> rows_of((size_t)E);
+        for (int64_t t = 0; t < Mtok; ++t) {
+            std::vector<int64_t> used;
+            for (int64_t k = 0; k < top_k; ++k) {
+                int64_t e;
+                /* `draw` experts spread over the E take the routing: fewer make longer runs */
+                do { e = (int64_t)(rnd() % (uint64_t)draw) * E / draw; }
+                while (std::find(used.begin(), used.end(), e) != used.end());
+                used.push_back(e);
+                rows_of[(size_t)e].push_back((int32_t)(t * top_k + k));
+            }
+        }
+        std::vector<int32_t>& sorted = sortedR[(size_t)ri];
+        std::vector<int32_t>& off = offR[(size_t)ri];
+        off.assign((size_t)E + 1, 0);
+        for (int64_t e = 0; e < E; ++e) {
+            off[(size_t)e] = (int32_t)sorted.size();
+            sorted.insert(sorted.end(), rows_of[(size_t)e].begin(), rows_of[(size_t)e].end());
+            const size_t n = rows_of[(size_t)e].size();
+            if (ri == 0) {
+                runs += n ? 1 : 0;
+                runs1 += n == 1 ? 1 : 0;
+                runs2 += n == 2 ? 1 : 0;
+            }
+        }
+        off[(size_t)E] = (int32_t)sorted.size();
+    }
+    std::printf("moe_gemm_iqr at a %lld-token step: %lld routed rows over %lld experts (%lld used: %lld "
+                "of one row, %lld of two), %lld routing(s) in turn, %d launches\n",
+                (long long)Mtok, (long long)Tr, (long long)E, (long long)runs, (long long)runs1,
+                (long long)runs2, (long long)rot, iters);
+    struct Proj { const char* what; int64_t n0, n1, k0, k1, parts, run; bool srt; };
+    static const Proj kProj[] = { { "gate_up 1280 x 2560 (tp1)", 1280, 1280, 2560, 2560, 2, 128, false } };
+    static const uint32_t kU[] = { 0, RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6, RAD_U7 };
+    for (const int B : { 4 })
+        for (const Proj& P : kProj) {
+            const int64_t Nc[2] = { P.n0, P.n1 }, Kc[2] = { P.k0, P.k1 };
+            const int64_t N = std::max(P.n0, P.n1), K = std::max(P.k0, P.k1), nkb = K / 128;
+            std::vector<RadParam> lp = { PI("N", Nc[0]), PI("K", Kc[0]), PI("N_odd", Nc[1]),
+                                         PI("K_odd", Kc[1]), PI("group", 128), PS("dtype", "i8a8h"),
+                                         PI("parts", P.parts) };
+            void* wt[2];
+            void* stb[2];
+            RadLayout lw[2], ls[2];
+            bool good = true;
+            for (int q = 0; q < 2 && good; ++q) {
+                const int64_t n = Nc[q], k = Kc[q], cnt = (E + 1 - q) / 2;
+                Planes p;
+                rad_enc_clear(&p.enc);
+                rad_enc_copy_str(p.enc.scheme, "trellis");
+                rad_enc_add_plane(&p.enc, "codes", kU[B], 1, 1);
+                rad_enc_add_plane(&p.enc, "scale", RAD_F32, 1, 0);
+                const int t = rad_enc_add_table(&p.enc, "trellis", RAD_I8, (int64_t)1 << 16, 1);
+                p.enc.plane[t].block[0] = P.run;
+                p.enc.plane[t].block[1] = 0;
+                rad_enc_add_table(&p.enc, "trellis.mad", RAD_U32, 2, 1);
+                rad_enc_add_plane(&p.enc, "scale.col", RAD_F32, 0, 128);
+                rad_enc_copy_str(p.enc.transform, "fwht128");
+                p.size(n, k);
+                for (auto& v : p.data[(size_t)p.find("codes")]) v = (uint8_t)rnd();
+                const uint32_t A = 0xB5297Bu, Bc = 0x2545F491u;
+                uint32_t* ab = (uint32_t*)p.data[(size_t)p.find("trellis.mad")].data();
+                ab[0] = A;
+                ab[1] = Bc;
+                const int ia = p.find("trellis");
+                for (uint32_t st = 0; st < (1u << 16); ++st) {
+                    const uint32_t h = ((st & 0xFFFFFFu) * A + Bc) & 0x3F3F3F3Fu;
+                    p.data[(size_t)ia][st] = (uint8_t)(int8_t)((int)((h & 0xFFu) + ((h >> 8) & 0xFFu) +
+                                                                     ((h >> 16) & 0xFFu) + (h >> 24)) - 126);
+                }
+                for (int64_t i = 0; i < n; ++i) ((float*)p.data[(size_t)p.find("scale")].data())[i] = 0.002f;
+                float* cfp = (float*)p.data[(size_t)p.find("scale.col")].data();
+                for (int64_t g = 0; g < k / 128; ++g) cfp[g] = 1.0f;
+                std::vector<uint8_t> wq, wsc;
+                if (stored(r, lp, q ? 6 : 2, p, { "codes", "trellis", "trellis.mad" }, &wq, &lw[q]) != RAD_OK ||
+                    stored(r, lp, q ? 7 : 3, p, { "scale", "scale.col" }, &wsc, &ls[q]) != RAD_OK) {
+                    good = false;
+                    break;
+                }
+                /* every expert its own bytes: one plane a class, an entry a 256-aligned stride */
+                const size_t wb = (wq.size() + 255) / 256 * 256, sb = (wsc.size() + 255) / 256 * 256;
+                uint8_t* dw = (uint8_t*)dalloc(wb * (size_t)cnt);
+                uint8_t* dsc = (uint8_t*)dalloc(sb * (size_t)cnt);
+                if (!dw || !dsc) { good = false; break; }
+                std::vector<const void*> wp((size_t)cnt), sp((size_t)cnt);
+                for (int64_t j = 0; j < cnt; ++j) {
+                    st_memcpy(dw + (size_t)j * wb, wq.data(), wq.size(), hipMemcpyHostToDevice);
+                    st_memcpy(dsc + (size_t)j * sb, wsc.data(), wsc.size(), hipMemcpyHostToDevice);
+                    wp[(size_t)j] = dw + (size_t)j * wb;
+                    sp[(size_t)j] = dsc + (size_t)j * sb;
+                }
+                wt[q] = dalloc(wp.size() * sizeof(void*));
+                stb[q] = dalloc(sp.size() * sizeof(void*));
+                st_memcpy(wt[q], wp.data(), wp.size() * sizeof(void*), hipMemcpyHostToDevice);
+                st_memcpy(stb[q], sp.data(), sp.size() * sizeof(void*), hipMemcpyHostToDevice);
+            }
+            if (!good) { std::printf("  %s B=%d: layout or allocation failed\n", P.what, B); dfree_all(); return; }
+            const int64_t Ma = P.srt ? Tr : Mtok;
+            std::vector<int8_t> ha((size_t)(Ma * K));
+            std::vector<float> has((size_t)(Ma * nkb), 0.01f);
+            for (auto& v : ha) v = (int8_t)((int)(rnd() % 255) - 127);
+            void* d_a = dalloc(ha.size());
+            void* d_as = dalloc(has.size() * 4);
+            void* d_y = dalloc((size_t)(Tr * N) * 2);
+            st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+            st_memcpy(d_as, has.data(), has.size() * 4, hipMemcpyHostToDevice);
+            std::vector<void*> d_soR((size_t)rot), d_ofR((size_t)rot);
+            for (int64_t ri = 0; ri < rot; ++ri) {
+                d_soR[(size_t)ri] = dalloc((size_t)Tr * 4);
+                d_ofR[(size_t)ri] = dalloc((size_t)(E + 1) * 4);
+                st_memcpy(d_soR[(size_t)ri], sortedR[(size_t)ri].data(), (size_t)Tr * 4, hipMemcpyHostToDevice);
+                st_memcpy(d_ofR[(size_t)ri], offR[(size_t)ri].data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
+            }
+            void* const d_so = d_soR[0];
+            void* const d_of = d_ofR[0];
+            std::vector<RadTensor> ts = {
+                T(d_a, RAD_I8, { Ma, K }), T(d_as, RAD_F32, { Ma, nkb }),
+                T(wt[0], lw[0].dtype, { (E + 1) / 2, Nc[0], Kc[0] }),
+                T(stb[0], ls[0].dtype, { (E + 1) / 2, Nc[0], Kc[0] / 128 }),
+                T(d_so, RAD_I32, { Tr }), T(d_of, RAD_I32, { E + 1 }),
+                T(wt[1], lw[1].dtype, { E / 2, Nc[1], Kc[1] }),
+                T(stb[1], ls[1].dtype, { E / 2, Nc[1], Kc[1] / 128 }), T(d_y, RAD_BF16, { Tr, N }) };
+            for (int i : { 2, 3, 6, 7 }) ts[(size_t)i].stride[0] = 0;
+            std::vector<RadParam> ps = { PI("M", Mtok), PI("N", Nc[0]), PI("K", Kc[0]),
+                PI("n_expert", E), PI("top_k", top_k), PI("group", 128),
+                PS("a_order", P.srt ? "sorted" : "token"), PS("dtype", "i8a8h"),
+                PI("N_odd", Nc[1]), PI("K_odd", Kc[1]), PI("parts", P.parts), PI("a_group", 128) };
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.t = ts.data(); a.n_t = (int)ts.size();
+            a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1;
+            if (r->scratch) {
+                const int64_t need = r->scratch(&a);
+                if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+            }
+            /* a launch's operands for each routing: the same but the sorted rows and offsets */
+            std::vector<std::vector<RadTensor>> tsR((size_t)rot, ts);
+            std::vector<RadArgs> aR((size_t)rot, a);
+            for (int64_t ri = 0; ri < rot; ++ri) {
+                tsR[(size_t)ri][4] = T(d_soR[(size_t)ri], RAD_I32, { Tr });
+                tsR[(size_t)ri][5] = T(d_ofR[(size_t)ri], RAD_I32, { E + 1 });
+                aR[(size_t)ri].t = tsR[(size_t)ri].data();
+            }
+            int rc = RAD_OK;
+            for (int i = 0; i < 3 * (int)rot && rc == RAD_OK; ++i)
+                rc = r->launch(&aR[(size_t)(i % rot)], (RadStream) nullptr);
+            if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+                std::printf("  %s B=%d: launch rc %d\n", P.what, B, rc);
+                dfree_all();
+                return;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; ++i) (void)r->launch(&aR[(size_t)(i % rot)], (RadStream) nullptr);
+            (void)st_stream_sync(nullptr);
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+            /* the bytes the used experts' codes are (each read once a launch) and the int8 products */
+            const double gb = (double)runs * (double)P.n0 * (double)P.k0 * B / 8.0 / 1e9;
+            const double tops = 2.0 * (double)Tr * (double)P.n0 * (double)P.k0 / 1e12;
+            std::printf("  moe_gemm_iqr %-24s B=%d  %8.1f us a launch  %6.1f GB/s of codes  %5.1f TOPS\n",
+                        P.what, B, us, gb / (us * 1e-6), tops / (us * 1e-6));
+            dfree_all();
+        }
+    dfree_all();
+}
+
+/* libhalo: moe_gemm_iqr (halo_moe_iqr.hip) against a host reference over the experts decoded on
+ * the host. From libr4d's moe_iqr_case, whose reference row (gemm_iqr_nt_m64) libhalo does not have. */
+struct MoeIqrShape {
+    const char* what;
+    int B, L;
+    int64_t run, E, top_k, Mtok, n0, n1, k0, k1, parts;
+    bool sorted;
+    int64_t drop;
+};
+
+static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
+    if (!sel("moe_gemm_iqr")) return;
+    char nm[240];
+    std::snprintf(nm, sizeof nm, "moe_gemm_iqr %s B=%d L=%d run=%lld E=%lld T=%lld N=%lld:%lld "
+                  "K=%lld:%lld", sh.what, sh.B, sh.L, (long long)sh.run, (long long)sh.E,
+                  (long long)(sh.Mtok * sh.top_k), (long long)sh.n0, (long long)sh.n1,
+                  (long long)sh.k0, (long long)sh.k1);
+    const RadKernelInfo* r = find(pl, "moe_gemm_iqr");
+    if (!r || !r->layout || !r->relayout) { ok(nm, false, "rows or hooks absent"); return; }
+    uint64_t z = 0x9E3779B97F4A7C15ull * (uint64_t)(sh.B * 131 + sh.L * 7 + sh.E + sh.Mtok * 977 + sh.k1);
+    auto rnd = [&]() {
+        z += 0x9E3779B97F4A7C15ull;
+        uint64_t x = z;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    };
+    static const uint32_t kU[] = { 0, RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6, RAD_U7 };
+    const int64_t E = sh.E, top_k = sh.top_k, Tr = sh.Mtok * top_k;
+    const int64_t Nc[2] = { sh.n0, sh.n1 }, Kc[2] = { sh.k0, sh.k1 };
+    const int64_t N = std::max(sh.n0, sh.n1), K = std::max(sh.k0, sh.k1), nkb = K / 128;
+
+    /* The routing: top_k distinct experts a token, the last `drop` slots dropped. */
+    std::vector<std::vector<int32_t>> rows_of((size_t)E);
+    for (int64_t t = 0; t < sh.Mtok; ++t) {
+        std::vector<int64_t> used;
+        for (int64_t k = 0; k < top_k; ++k) {
+            const int64_t flat = t * top_k + k;
+            if (flat >= Tr - sh.drop) continue;
+            int64_t e;
+            do { e = (int64_t)(rnd() % (uint64_t)E); }
+            while (std::find(used.begin(), used.end(), e) != used.end());
+            used.push_back(e);
+            rows_of[(size_t)e].push_back((int32_t)flat);
+        }
+    }
+    std::vector<int32_t> sorted((size_t)Tr, -1), off((size_t)E + 1, 0);
+    {
+        int64_t o = 0;
+        for (int64_t e = 0; e < E; ++e) {
+            off[(size_t)e] = (int32_t)o;
+            for (int32_t f : rows_of[(size_t)e]) sorted[(size_t)o++] = f;
+        }
+        off[(size_t)E] = (int32_t)o;
+    }
+
+    /* The experts: planes, the row's layout of each, and the device tables. */
+    std::vector<RadParam> lp = { PI("N", Nc[0]), PI("K", Kc[0]), PI("N_odd", Nc[1]),
+                                 PI("K_odd", Kc[1]), PI("group", 128), PS("dtype", "i8a8h"),
+                                 PI("parts", sh.parts) };
+    std::vector<void*> d_w((size_t)E), d_s((size_t)E);
+    std::vector<std::vector<int8_t>> hw((size_t)E);   /* host decode: each expert's int8 values */
+    std::vector<std::vector<float>> hrs((size_t)E), hcf((size_t)E);
+    RadLayout lw[2], ls[2];
+    for (int64_t e = 0; e < E; ++e) {
+        const int q = (int)(e & 1);
+        const int64_t n = Nc[q], k = Kc[q];
+        Planes p;
+        rad_enc_clear(&p.enc);
+        rad_enc_copy_str(p.enc.scheme, "trellis");
+        rad_enc_add_plane(&p.enc, "codes", kU[sh.B], 1, 1);
+        rad_enc_add_plane(&p.enc, "scale", RAD_F32, 1, 0);
+        const int t = rad_enc_add_table(&p.enc, "trellis", RAD_I8, (int64_t)1 << sh.L, 1);
+        p.enc.plane[t].block[0] = sh.run;
+        p.enc.plane[t].block[1] = 0;
+        rad_enc_add_table(&p.enc, "trellis.mad", RAD_U32, 2, 1);
+        rad_enc_add_plane(&p.enc, "scale.col", RAD_F32, 0, 128);
+        rad_enc_copy_str(p.enc.transform, "fwht128");
+        p.size(n, k);
+        const int ic = p.find("codes"), is = p.find("scale"), ia = p.find("trellis");
+        for (int64_t i = 0; i < n; ++i)
+            for (int64_t c = 0; c < k; ++c)
+                rad_store_bits(p.data[(size_t)ic].data() + i * p.row_bytes(ic), sh.B, c,
+                               (uint32_t)(rnd() & ((1ull << sh.B) - 1)));
+        const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
+        uint32_t* ab = (uint32_t*)p.data[(size_t)p.find("trellis.mad")].data();
+        ab[0] = A;
+        ab[1] = Bc;
+        for (uint32_t st = 0; st < (1u << sh.L); ++st) {
+            const uint32_t h = ((st & 0xFFFFFFu) * A + Bc) & 0x3F3F3F3Fu;
+            p.data[(size_t)ia][st] = (uint8_t)(int8_t)((int)((h & 0xFFu) + ((h >> 8) & 0xFFu) +
+                                                             ((h >> 16) & 0xFFu) + (h >> 24)) - 126);
+        }
+        for (int64_t i = 0; i < n; ++i)
+            ((float*)p.data[(size_t)is].data())[i] =
+                std::ldexp(1.0f + (float)(rnd() % 64) / 64.0f, -9 - (int)(rnd() % 4));
+        float* cfp = (float*)p.data[(size_t)p.find("scale.col")].data();
+        for (int64_t g = 0; g < k / 128; ++g) cfp[g] = std::ldexp(1.0f, (int)(rnd() % 4) - 1);
+        {   /* the host decode (r4d_selftest's iqr_gemm_case): row i's state of column c is the L
+             * low bits of the codes of rows i, i-1, ..., i-C+1 (wrapping in the run), its value the
+             * computed table's entry; the scales stay f32 (row) and f32 (128-K block) */
+            const int C = (sh.L + sh.B - 1) / sh.B;
+            const int8_t* tab = (const int8_t*)p.data[(size_t)ia].data();
+            hw[(size_t)e].assign((size_t)(n * k), 0);
+            for (int64_t i = 0; i < n; ++i)
+                for (int64_t c = 0; c < k; ++c) {
+                    uint32_t st = 0;
+                    for (int qq = C - 1; qq >= 0; --qq) {
+                        const int64_t rr = i / sh.run * sh.run + (i % sh.run - qq + sh.run) % sh.run;
+                        st = ((st << sh.B) | rad_load_bits(p.data[(size_t)ic].data() + rr * p.row_bytes(ic), sh.B, c)) &
+                             ((1u << sh.L) - 1u);
+                    }
+                    hw[(size_t)e][(size_t)(i * k + c)] = tab[st];
+                }
+            hrs[(size_t)e].assign((const float*)p.data[(size_t)is].data(), (const float*)p.data[(size_t)is].data() + n);
+            hcf[(size_t)e].assign(cfp, cfp + k / 128);
+        }
+        std::vector<uint8_t> wq, wsc;
+        const int rw = stored(r, lp, q ? 6 : 2, p, { "codes", "trellis", "trellis.mad" }, &wq, &lw[q]);
+        const int rs = stored(r, lp, q ? 7 : 3, p, { "scale", "scale.col" }, &wsc, &ls[q]);
+        if (rw != RAD_OK || rs != RAD_OK) {
+            ok(nm, false, "relayout rc " + std::to_string(rw) + "/" + std::to_string(rs));
+            dfree_all();
+            return;
+        }
+        if (e < 2) {
+            std::string why;
+            const bool back = restores(r, lp, q ? 6 : 2, p, { "codes", "trellis", "trellis.mad" }, wq, &why) &&
+                              restores(r, lp, q ? 7 : 3, p, { "scale", "scale.col" }, wsc, &why);
+            ok((std::string(nm) + ": class " + std::to_string(q) + "'s stored planes invert").c_str(), back, why);
+        }
+        d_w[(size_t)e] = dalloc(wq.size());
+        d_s[(size_t)e] = dalloc(wsc.size());
+        if (!d_w[(size_t)e] || !d_s[(size_t)e]) { ok(nm, false, "hipMalloc failed"); dfree_all(); return; }
+        st_memcpy(d_w[(size_t)e], wq.data(), wq.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_s[(size_t)e], wsc.data(), wsc.size(), hipMemcpyHostToDevice);
+    }
+    void* wt[2];
+    void* stb[2];
+    for (int q = 0; q < 2; ++q) {
+        std::vector<const void*> wp, sp;
+        for (int64_t e = q; e < E; e += 2) { wp.push_back(d_w[(size_t)e]); sp.push_back(d_s[(size_t)e]); }
+        wt[q] = dalloc(std::max<size_t>(1, wp.size()) * sizeof(void*));
+        stb[q] = dalloc(std::max<size_t>(1, sp.size()) * sizeof(void*));
+        if (!wt[q] || !stb[q]) { ok(nm, false, "pointer table allocation failed"); dfree_all(); return; }
+        st_memcpy(wt[q], wp.data(), wp.size() * sizeof(void*), hipMemcpyHostToDevice);
+        st_memcpy(stb[q], sp.data(), sp.size() * sizeof(void*), hipMemcpyHostToDevice);
+    }
+
+    /* The activation: a row a token (gate_up gathers) or a row a sorted slot (down). */
+    const int64_t Ma = sh.sorted ? Tr : sh.Mtok;
+    std::vector<int8_t> ha((size_t)(Ma * K));
+    std::vector<float> has((size_t)(Ma * nkb));
+    for (auto& v : ha) v = (int8_t)((int)(rnd() % 255) - 127);
+    for (auto& v : has) v = std::ldexp(1.0f + (float)(rnd() % 256) / 256.0f, -7);
+    void* d_a = dalloc(ha.size());
+    void* d_as = dalloc(has.size() * 4);
+    void* d_so = dalloc((size_t)Tr * 4);
+    void* d_of = dalloc((size_t)(E + 1) * 4);
+    void* d_y = dalloc((size_t)(Tr * N) * 2);
+    if (!d_a || !d_as || !d_so || !d_of || !d_y) { ok(nm, false, "hipMalloc failed"); dfree_all(); return; }
+    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_as, has.data(), has.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_so, sorted.data(), (size_t)Tr * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_of, off.data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
+    {
+        std::vector<uint16_t> poison((size_t)(Tr * N), h_to_bf16(123.0f));
+        st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+    }
+    auto launch = [&](const RadKernelInfo* k, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        if (k->scratch) {
+            const int64_t need = k->scratch(&a);
+            if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        }
+        const int rc = k->launch(&a, (RadStream) nullptr);
+        return rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess ? RAD_OK : (rc ? rc : -1);
+    };
+    std::vector<RadTensor> ts = {
+        T(d_a, RAD_I8, { Ma, K }), T(d_as, RAD_F32, { Ma, nkb }),
+        T(wt[0], lw[0].dtype, { (E + 1) / 2, Nc[0], Kc[0] }),
+        T(stb[0], ls[0].dtype, { (E + 1) / 2, Nc[0], Kc[0] / 128 }),
+        T(d_so, RAD_I32, { Tr }), T(d_of, RAD_I32, { E + 1 }),
+        T(wt[1], lw[1].dtype, { E / 2, Nc[1], Kc[1] }),
+        T(stb[1], ls[1].dtype, { E / 2, Nc[1], Kc[1] / 128 }), T(d_y, RAD_BF16, { Tr, N }) };
+    for (int i : { 2, 3, 6, 7 }) ts[(size_t)i].stride[0] = 0;
+    std::vector<RadParam> ps = { PI("M", sh.Mtok), PI("N", Nc[0]), PI("K", Kc[0]),
+        PI("n_expert", E), PI("top_k", top_k), PI("group", 128),
+        PS("a_order", sh.sorted ? "sorted" : "token"), PS("dtype", "i8a8h"),
+        PI("N_odd", Nc[1]), PI("K_odd", Kc[1]), PI("parts", sh.parts), PI("a_group", 128) };
+    const int rq = launch(r, ts, ps);
+    if (rq != RAD_OK) { ok(nm, false, "rc " + std::to_string(rq)); dfree_all(); return; }
+    std::vector<uint16_t> y((size_t)(Tr * N));
+    st_memcpy(y.data(), d_y, y.size() * 2, hipMemcpyDeviceToHost);
+
+    /* The reference on the host, in double: a slot's row is its expert's int8 values against the
+     * activation, each 128-K block folded by the block factor times the activation's scale, the row's
+     * scale at the end (what the kernel computes, within f32 rounding). */
+    std::vector<float> want((size_t)(Tr * N), 0.0f);
+    std::vector<uint8_t> live((size_t)(Tr * N), 0);   /* 0: a padding column or a dropped row */
+    for (int64_t e = 0; e < E; ++e) {
+        const int q = (int)(e & 1);
+        const int64_t n = Nc[q], k = Kc[q], kb = k / 128, fy = N / sh.parts, fc = n / sh.parts;
+        for (int64_t i = off[(size_t)e]; i < off[(size_t)e + 1]; ++i) {
+            const int64_t row = sh.sorted ? i : sorted[(size_t)i] / top_k;
+            for (int64_t pp = 0; pp < sh.parts; ++pp)
+                for (int64_t c = 0; c < fc; ++c) {
+                    const int64_t wr = pp * fc + c;
+                    double acc = 0.0;
+                    for (int64_t g = 0; g < kb; ++g) {
+                        int64_t s = 0;
+                        for (int64_t kk = g * 128; kk < g * 128 + 128; ++kk)
+                            s += (int64_t)hw[(size_t)e][(size_t)(wr * k + kk)] * ha[(size_t)(row * K + kk)];
+                        acc += (double)s * hcf[(size_t)e][(size_t)g] * has[(size_t)(row * nkb + g)];
+                    }
+                    want[(size_t)(i * N + pp * fy + c)] = (float)(acc * hrs[(size_t)e][(size_t)wr]);
+                    live[(size_t)(i * N + pp * fy + c)] = 1;
+                }
+        }
+    }
+    double r2 = 0.0, e2 = 0.0;
+    for (size_t i = 0; i < y.size(); ++i) r2 += (double)want[i] * want[i];
+    const float rms = (float)std::sqrt(r2 / (double)std::max<size_t>(1, y.size()));
+    int64_t bad = 0, first = -1;
+    for (size_t i = 0; i < y.size(); ++i) {
+        const float a = h_bf16(y[i]), b = want[i];
+        e2 += (double)(a - b) * (a - b);
+        /* a padding column and a dropped row are exactly zero */
+        const bool offv = !live[i] ? y[i] != 0
+                                   : !(std::fabs(a - b) <= std::ldexp(std::fabs(b), -7) + std::ldexp(rms, -8));
+        if (offv) { if (first < 0) first = (int64_t)i; ++bad; }
+    }
+    const double rel = std::sqrt(e2 / (r2 > 0 ? r2 : 1.0));
+    ok(nm, bad == 0, bad ? std::to_string(bad) + " of " + std::to_string(y.size()) +
+                               " outputs differ from the host reference's, first [" +
+                               std::to_string(first / N) + "][" + std::to_string(first % N) + "] " +
+                               std::to_string(h_bf16(y[(size_t)first])) + " vs " +
+                               std::to_string(want[(size_t)first]) + ", rms " + std::to_string(rms)
+                         : "the host reference to a rounding, rel_l2 " + std::to_string(rel));
+    dfree_all();
+}
 
 static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char* dt,
                               std::initializer_list<int64_t> Ts) {
@@ -32685,6 +33157,50 @@ static void device_phase(const Plugin& pl) {
         router_gemm_fused_case(pl);
         scatter_protect_case(pl);
         moe_gather_case(pl);
+        {
+            static const MoeIqrShape kIqr[] = {
+                /* the (tile, run) grid: a decode step's rows */
+                { "decode gate/up", 4, 16, 128, 64, 4, 3, 768, 512, 2560, 2560, 2, false, 0 },
+                { "decode gate/up, a dropped slot", 4, 16, 128, 64, 4, 3, 768, 512, 2560, 2560, 2, false, 1 },
+                { "decode down", 4, 16, 256, 64, 4, 3, 2560, 2560, 512, 256, 1, true, 0 },
+                { "verify gate/up, runs of several rows", 4, 16, 128, 16, 4, 6, 768, 512, 2560, 2560, 2, false, 2 },
+                { "verify down", 3, 16, 256, 16, 4, 6, 2560, 2560, 512, 256, 1, true, 2 },
+                /* the run map: a prefill chunk's rows */
+                { "prefill gate/up", 4, 16, 128, 32, 4, 64, 768, 512, 2560, 2560, 2, false, 0 },
+                { "prefill gate/up, dropped slots", 3, 16, 128, 32, 4, 64, 768, 512, 2560, 2560, 2, false, 37 },
+                { "prefill down", 4, 16, 256, 32, 4, 64, 2560, 2560, 512, 256, 1, true, 5 },
+                /* runs past one token tile, and past one block's four */
+                { "prefill gate/up, long runs", 4, 16, 128, 8, 2, 200, 768, 512, 2560, 2560, 2, false, 3 },
+                { "prefill down, long runs", 4, 16, 256, 8, 2, 200, 2560, 2560, 512, 256, 1, true, 3 },
+                /* every width */
+                { "decode gate/up", 2, 15, 128, 32, 4, 2, 256, 256, 1280, 1280, 2, false, 0 },
+                { "decode gate/up", 2, 16, 128, 32, 4, 2, 256, 256, 1280, 1280, 2, false, 0 },
+                { "decode gate/up", 3, 16, 128, 32, 4, 2, 256, 256, 1280, 1280, 2, false, 0 },
+                { "decode gate/up", 5, 16, 128, 32, 4, 2, 256, 256, 1280, 1280, 2, false, 0 },
+                { "decode gate/up", 6, 16, 128, 32, 4, 2, 256, 256, 1280, 1280, 2, false, 0 },
+                { "prefill down", 6, 16, 256, 8, 2, 96, 512, 512, 256, 256, 1, true, 0 },
+                { "prefill down", 2, 15, 256, 8, 2, 96, 512, 512, 256, 256, 1, true, 0 },
+            };
+            for (const MoeIqrShape& sh : kIqr) moe_iqr_case(pl, sh);
+        }
+        {   /* moe_gemm_w4a8i8 (libhalo port): the w4 experts against an int8 activation, a host decode */
+            static const MoeW4Shape kShapes8[] = {
+                { "one class",   64, 256,  64, 256, 1, 5 },
+                { "gate/up 2:1", 256, 256, 128, 256, 2, 5 },
+                { "down 2:1",    64, 256,  64, 128, 1, 5 },
+                { "300 experts, gate/up 2:1", 256, 128, 128, 128, 2, 300 },
+                { "40 experts, gate/up 2:1, K 768", 256, 768, 128, 768, 2, 40 },
+                { "down, sorted rows, 512 x K 256:128", 512, 256, 512, 128, 1, 10, true },
+                { "512 experts, down, sorted rows, 256 x K 128", 256, 128, 256, 128, 1, 512, true },
+                { "Flash-Next IQR-V4 down, sorted rows, 2560 x K 640", 2560, 640, 2560, 640, 1, 512, true },
+            };
+            const bool w4 = sel("moe_gemm_w4a8i8"), w4m = sel("moe_gemm_w4a8i8_mod4");
+            if (w4 || w4m)
+                for (const MoeW4Shape& sh : kShapes8)
+                    for (const int64_t t : { (int64_t)8, (int64_t)40, (int64_t)200, (int64_t)600 })
+                        for (const int sub : { 0, 2, 4 })
+                            moe_w4_gemm(pl, t, sh, sub, false, w4m, 2, 1, 128);
+        }
         if (sel("rowtopk_bf16")) {
             const RadKernelInfo* r = find(pl, "rowtopk_bf16");
             if (!r) ok("rowtopk_bf16", false, "row absent");
@@ -33909,6 +34425,8 @@ int main(int argc, char** argv) {
     long long qsaattn_rows = 0;
     int qsaattn_it = 10;
     long long moe_m = 0, moe_e = 512, moe_k = 10;
+    long long iqr_m = 0, iqr_e = 512, iqr_k = 10, iqr_rot = 1;
+    int iqr_it = 20;
     int moe_pool = 0;
     int moe_it = 20;
     long long m16_m = 0, m16_e = 256, m16_k = 10, m16_d = 0;
@@ -34037,6 +34555,14 @@ int main(int argc, char** argv) {
             g_dumpdir = argv[++i];
         } else if (!std::strcmp(argv[i], "--moetp1")) {
             g_moe_tp1 = true;
+        } else if (!std::strcmp(argv[i], "--perfiqr")) {
+            /* moe_gemm_iqr at Flash-Next IQR-V4's tp1 gate_up: M tokens [iters] [experts] [top_k] [routings] */
+            if (i + 1 >= argc) { usage(); return 2; }
+            iqr_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) iqr_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) iqr_e = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) iqr_k = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) iqr_rot = std::strtoll(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfmoe")) {
             /* The routed-expert GEMM at a prefill chunk of M tokens, every prefill form. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -34292,6 +34818,12 @@ int main(int argc, char** argv) {
 #else
         skip("runtime LoRA timing", "built without HIP");
 #endif
+        return 0;
+    }
+    if (iqr_m) {
+        if (!load(&pl, path)) return 1;
+        moe_iqr_perf(pl, iqr_m, iqr_it, iqr_e, iqr_k, 0, iqr_rot);
+        dfree_all();
         return 0;
     }
     if (moe_m) {
