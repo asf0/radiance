@@ -332,6 +332,10 @@ struct MoeFP8 {
         rad_buf edn     = 0;   /* [rows * top_k, n_embd]       bf16, in sorted order */
         /* back in token order, and the shared expert, one row per token */
         rad_buf moe     = 0;   /* [max_tok, n_embd]           bf16; separate routed output if needed */
+        /* Local (aux split): a copy of `moe` in the rank's VRAM, filled by DMA on lane 1 once the
+         * aux card's gather lands (pass_aux), so the partner's combine reads local memory instead
+         * of pulling host memory across the link inside the kernel on lane 0. 0 for none. */
+        rad_buf moe_d   = 0;
         rad_buf sgu     = 0;   /* [max_tok, 2 * n_ff_shared]  bf16 */
         ActFP8  sff{};         /* [max_tok, n_ff_shared] */
         rad_buf sout    = 0;   /* [max_tok, n_embd]           bf16 */
@@ -564,6 +568,16 @@ struct MoeFP8 {
     }
     const MoeFP8* rpart = nullptr;
     rad_op op_aux_add = 0;
+    /* Whether a pass of `rows` takes the lane-1 copy of the aux output (Wire::moe_d): split, a
+     * device copy declared, and wide enough that a DMA beats reading the rows over the link in
+     * the add (RADIANCE_AUX_DMA_ROWS, default 64; 0 turns it off). */
+    bool aux_dma(int64_t rows) const {
+        static const long long th = [] {
+            const char* e = std::getenv("RADIANCE_AUX_DMA_ROWS");
+            return e ? std::atoll(e) : 64LL;
+        }();
+        return rpart && w.moe_d && th > 0 && rows >= th;
+    }
     int    declare_split_combine(RadBuilder* b);
     rad_buf b_hx = 0;            /* aux: a host copy of the pass's normed rows, for the protected pair */
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
@@ -2226,6 +2240,17 @@ inline void MoeFP8::pass_aux(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bo
                 brows(gather_inv ? w.inv : srt, rows * k), RAD_NONE, RAD_NONE,
                 brow_slice(w.moe, r0, rows, g.n_embd));
     rad_lane_mark(c_, par);
+    /* Split, a wide pass: lane 1 copies the aux card's output into VRAM as soon as it lands, beside
+     * lane 0's work; pass_aux_end waits for the copy (mark par + 2) instead of the gather. */
+    if (aux_dma(rows)) {
+        const int64_t eb = (int64_t)rad_dtype_bits(g.act_dtype) / 8;
+        rad_lane(c_, 1);
+        rad_lane_wait_mark(c_, par);
+        (void)rad_memcpy_async((char*)rad_buf_ptr(c_, w.moe_d) + r0 * g.n_embd * eb,
+                               (char*)rad_buf_ptr(c_, w.moe) + r0 * g.n_embd * eb,
+                               rows * g.n_embd * eb, rad_lane_stream(c_));
+        rad_lane_mark(c_, par + 2);
+    }
     rad_lane(c_, 0);
 
     /* Split: the partner's experts, shared arm and folded gather, beside the aux card's. */
@@ -2240,10 +2265,12 @@ inline void MoeFP8::pass_aux(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bo
 
 inline void MoeFP8::pass_aux_end(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
                                  int par) const {
-    rad_lane_wait_mark(c_, par);
+    const bool dma = aux_dma(rows);
+    rad_lane_wait_mark(c_, dma ? par + 2 : par);
     if (rpart)
         RAD_ISSUE_N(c_, op_aux_add, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
-                    brow_slice(w.moe, r0, rows, g.n_embd), brow_slice(w.h.x, r0, rows, g.n_embd));
+                    brow_slice(dma ? w.moe_d : w.moe, r0, rows, g.n_embd),
+                    brow_slice(w.h.x, r0, rows, g.n_embd));
     else
     RAD_ISSUE_N(c_, op_aux_combine, rows, brow_slice(w.sout, r0, rows, g.n_embd),
                 brow_slice(w.sgate, r0, rows, 1), brow_slice(w.moe, r0, rows, g.n_embd),

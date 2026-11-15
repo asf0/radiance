@@ -505,6 +505,7 @@ extern "C" int rad_lane(RadCtx* c, int lane) {
 }
 extern "C" int rad_lane_mark(RadCtx*, int) { return RAD_OK; }
 extern "C" int rad_lane_wait_mark(RadCtx*, int) { return RAD_OK; }
+extern "C" RadStream rad_lane_stream(RadCtx*) { return nullptr; }
 extern "C" int rad_lane_join(RadCtx* c, int from, int to) {
     if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
     c->joins.push_back({ c->issues.size(), from, to });
