@@ -1181,6 +1181,7 @@ static char* align_down_ptr(char* p) {
 }
 
 int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
+    if (no_loans_) return RAD_OK;
     if (!plan_ || !plan_->dynamic) return RAD_OK;      /* a static plan never moves a unit */
     if (lender < 0 || lender >= kLenders) return RAD_E_INVAL;
     for (const ClassPools& cp : pools_)

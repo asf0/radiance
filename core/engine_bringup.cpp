@@ -3750,6 +3750,7 @@ int Engine::load_weights() {
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
+        if (cfg_.aux_device >= 0) r->mover.set_no_loans(true);   /* local: Mover::set_no_loans */
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
          * a loader one. */

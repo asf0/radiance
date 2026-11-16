@@ -514,6 +514,11 @@ public:
     /* Registers the stretches a lender may ever lend; once per lender, after its memory is
      * carved. Each stretch is cut into slots of each class's stride from the top down, so a small
      * loan covers a prefix of a large loan's slots and the deepest slot is given back first. */
+    /* Local (aux device): register no loans. A recall drops the units in lent slots, which needs a
+     * host copy of each; the rank card's resident experts have none beside an aux card (the host
+     * pool is sized to the aux units), and a dropped one was promoted back from an address no pool
+     * holds (a GPU memory fault once 2.1's expert-loan fix let the loan fill). */
+    void set_no_loans(bool on) { no_loans_ = on; }
     int     lend_from(int lender, const std::vector<LoanStrip>& strips);
 
     /* How much a lender lends, in its own measure. A target, not a transaction: newly covered
@@ -803,6 +808,7 @@ private:
     /* balance()'s drop candidates, (heat, unit), kept between calls so a step allocates nothing. */
     std::vector<std::pair<float, int32_t>> drop_cand_;
     bool hold_turnover_ = false;
+    bool no_loans_ = false;   /* local: set_no_loans */
     /* donor_slot()'s candidates per class, by layer, each layer sorted coldest first (hottest at
      * the back). Ranked once per dispatch; `at` is that dispatch. */
     struct DonorRank { int at = -1; std::vector<std::vector<std::pair<float, int32_t>>> by_layer; };
