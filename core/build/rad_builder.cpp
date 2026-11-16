@@ -250,7 +250,13 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
         const bool reshape = w.n_sel == 1 && whole && pk.kind == RAD_PLANE_TILED &&
                              pk.block[0] == 1 && pk.block[1] == 1 &&
                              rad_dtype_bits(pk.dtype) >= 8 && fr * fc == vr * vc;
-        if (w.enc_known && whole && !reshape && (k == 0 || w.n_sel == 1) &&
+        /* Local: at one rank a sharded weight may still take a slice (rad_weight_shard_span right
+         * after this, e.g. a feed-forward split between the rank's card and an aux device), so a
+         * declaration no larger than the plane waits for the loader, which cuts the span or, with
+         * none, reads the whole entry and refuses a byte-count mismatch. */
+        const bool may_span = prog_.ctx.world_size <= 1 && d->shard != RAD_SHARD_NONE &&
+                              (w.n_sel == 1 ? (vr <= fr && vc <= fc) : (vr <= sr && vc <= sc));
+        if (w.enc_known && whole && !reshape && !may_span && (k == 0 || w.n_sel == 1) &&
             (w.n_sel == 1 ? (fr != vr || fc != vc) : (sr != vr || sc != vc)))
             return err(RAD_E_SHAPE, "weight '%s' is declared [%lld, %lld], and %s of '%s' is "
                                     "[%lld, %lld]", n.c_str(), (long long)vr, (long long)vc,

@@ -132,6 +132,11 @@ struct Layer {
     AttnGatedFP8 attn;
     GdnFP8       gdn;
     Ffn          mlp;
+#if !QWEN35_MOE
+    /* Local (aux device): the feed-forward's slice on the aux card (MlpFP8::part), driven by
+     * `mlp` (MlpFP8::ax); unused without RADIANCE_AUX_FF. */
+    Ffn          mlp_a;
+#endif
     /* gate_up's leading bytes beside the mixer's reduction, the next layer's first projection's
      * beside the feed-forward's; 0 where none is declared. */
     rad_op       op_pf_gu = 0, op_pf_next = 0;
@@ -172,6 +177,15 @@ struct Model {
     /* feed-forward */
     rad_buf b_gate_up = 0;
     ActFP8  a_ffn{};
+    /* Local (aux device, RADIANCE_AUX_FF): channels of each feed-forward on the aux card, the
+     * slice's wire (pinned host buffers) and the VRAM copy of its output. */
+    int64_t ax_ff = 0;
+    MlpFP8::Wire ax_w{};
+    rad_buf b_ax_out_d = 0;
+    /* The rank's slice's own gate_up and ffn planes, at its narrower width (a row view takes its
+     * width from the buffer); the MTP head and drafter keep the full ones. */
+    rad_buf b_gate_up_r = 0;
+    ActFP8  a_ffn_r{};
 #if QWEN35_MOE
     /* The routed expert path's intermediates. `moe_rows` tall, not max_tok, because expert planes
      * are top_k times as tall as the step (rad_block_moe_fp8.h). */
@@ -255,6 +269,8 @@ static Model g_model[MAX_SLOTS];
  * to 64 rows, so both pieces sit in one bucket band (core/runtime/ctx.h) and the second is never
  * wider than the first. */
 static const int64_t kPipeMinRows = 1024;
+/* Local: the shortest prefill step the aux split pipelines (step_auxpipe). */
+static const int64_t kAuxPipeMinRows = 256;
 static int64_t pipe_rows(int64_t T) { return ((T + 1) / 2 + 63) / 64 * 64; }
 #endif
 
@@ -917,6 +933,58 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (rad_op_declared(b, "gate_had_quant_i8g") && rad_op_declared(b, "had_quant_act_i8g"))
         m.a_attn.q8_fed = m.a_attn.q8_rot = true;
 #endif
+#if !QWEN35_MOE
+    /* Local (aux device): the last RADIANCE_AUX_FF channels (whole 128-column groups) of every
+     * feed-forward run on the aux card beside the rank's slice (MlpFP8::ax). The slice reads the
+     * norm's rotated int8 codes from a host copy and returns its down projection's partial sum,
+     * which the rank adds to its own; its weights are views of the same stored tensors, pinned in
+     * the host pool. Needs the fed int8 pairs on both sides (the int8 trunk's quantising norm and
+     * gated product). */
+    m.ax_ff = 0;
+    if (rad_aux_device(b) >= 0 && m.trunk_i8) {
+        const char* e = std::getenv("RADIANCE_AUX_FF");
+        long long v = e ? std::atoll(e) : 0;
+        /* Whole scale groups of the trunk's int8 pairs on both slices (256 on an IQ8R trunk). */
+        const long long gq = m.trunk_g8 > RAD_FP8_BLOCK ? m.trunk_g8 : RAD_FP8_BLOCK;
+        v = v / gq * gq;
+        if (v > 0 && v < g.n_ff && m.a_h.q8_fed && m.a_ffn.q8_fed && g.world == 1) m.ax_ff = v;
+        else if (v > 0)
+            fprintf(stderr, "radiance: qwen35: RADIANCE_AUX_FF=%s ignored (needs one rank and the fed "
+                            "int8 trunk, and fewer channels than %lld)\n", e, (long long)g.n_ff);
+    }
+    if (m.ax_ff) {
+        const int64_t A = m.ax_ff;
+        const int H = RAD_DOMAIN_HOST;
+        RAD_ARCH_TRY(m.ax_w.h.declare_qs(b, nm, g, "ax_h", g.n_embd, 0, true, false, m.trunk_g8, H));
+        m.ax_w.h.q8_fed = m.a_h.q8_fed; m.ax_w.h.q8_rot = m.a_h.q8_rot;
+        m.ax_w.h.x = decl_b(b, nm.f("ax_out"), g.act_dtype, {g.max_tok, g.n_embd},
+                            RAD_BUF_TRANSIENT, H);
+        m.ax_w.gate_up = decl_b(b, nm.f("ax_gate_up"), g.act_dtype, {g.max_tok, 2 * A},
+                                RAD_BUF_TRANSIENT, H);
+        /* The gated quantiser takes the bf16 plane as an operand even where it writes only codes. */
+        m.ax_w.ffn.x = decl_b(b, nm.f("ax_ffn"), g.act_dtype, {g.max_tok, A}, RAD_BUF_TRANSIENT, H);
+        RAD_ARCH_TRY(m.ax_w.ffn.declare_qs(b, nm, g, "ax_ffn", A, 0, true, false, m.trunk_g8, H));
+        m.ax_w.ffn.q8_fed = m.a_ffn.q8_fed; m.ax_w.ffn.q8_rot = m.a_ffn.q8_rot;
+        m.b_ax_out_d = decl_b(b, nm.f("ax_out_d"), g.act_dtype, {g.max_tok, g.n_embd},
+                              RAD_BUF_PERSIST);
+        const int64_t Rw = g.n_ff - A;
+        m.b_gate_up_r = decl_b(b, nm.f("gate_up_r"), g.act_dtype, {g.max_tok, 2 * Rw});
+        m.a_ffn_r.x   = decl_b(b, nm.f("ffn_r"), g.act_dtype, {g.max_tok, Rw});
+        RAD_ARCH_TRY(m.a_ffn_r.declare_qs(b, nm, g, "ffn_r", Rw, 0, m.trunk_i8, true, m.trunk_g8));
+        m.a_ffn_r.q8_fed = m.a_ffn.q8_fed; m.a_ffn_r.q8_rot = m.a_ffn.q8_rot;
+        if (!m.b_gate_up_r || !m.a_ffn_r.x) return RAD_E_INVAL;
+        if (!m.ax_w.h.x || !m.ax_w.gate_up || !m.b_ax_out_d) return RAD_E_INVAL;
+        for (rad_buf x : { m.ax_w.gate_up, m.ax_w.ffn.x, m.ax_w.ffn.q8, m.ax_w.ffn.s8 })
+            RAD_ARCH_TRY(rad_buf_aux_local(b, x));
+        /* Lane 1 copies into the codes and out of the output (MlpFP8::body). */
+        for (rad_buf x : { m.ax_w.h.x, m.ax_w.h.q8, m.ax_w.h.s8 })
+            RAD_ARCH_TRY(rad_buf_concurrent(b, x));
+        if (g.rank == 0)
+            fprintf(stderr, "radiance: qwen35: feed-forward split -- channels %lld..%lld of %lld on "
+                            "the aux device, the rest on the rank's card\n",
+                    (long long)(g.n_ff - A), (long long)g.n_ff - 1, (long long)g.n_ff);
+    }
+#endif
 
     m.b_hout    = decl_b(b, nm.f("h_out"),    g.act_dtype, {g.max_logit_rows, g.n_embd});
 
@@ -1059,6 +1127,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     } else {
         m.pipe_on = g.world == 2 && g.max_tok >= kPipeMinRows;
     }
+    /* Local: the aux split's pipelined prefill (step_auxpipe) takes the same piece bounds. */
+    if (!m.pipe_on && m.ax_ff && g.max_tok >= kAuxPipeMinRows) {
+        m.b_pipe_cu = decl_b(b, nm.f("pipe_cu"), RAD_I32, {4});
+        if (!m.b_pipe_cu) return RAD_E_INVAL;
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_h.q8));
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_h.s8));
+    }
     if (m.pipe_on) {
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_x));
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_h.x));
@@ -1180,8 +1255,38 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ms.up   = nm.ckpt("%s.%lld.mlp.up_proj.weight",              pre, (long long)l);
         ms.down = nm.ckpt("%s.%lld.mlp.down_proj.weight",            pre, (long long)l);
 #endif
+#if !QWEN35_MOE
+        if (m.ax_ff) {
+            lay.mlp.ff = g.n_ff - m.ax_ff;
+            lay.mlp.ff_lo = 0;
+            lay.mlp.ax = &lay.mlp_a;
+            lay.mlp.ax_out_d = m.b_ax_out_d;
+            lay.mlp_a.w = m.ax_w;   /* the combine's declaration reads the slice's output buffer */
+        }
+#endif
+#if !QWEN35_MOE
+        Ffn::Wire mw_l = mw;
+        if (m.ax_ff) { mw_l.gate_up = m.b_gate_up_r; mw_l.ffn = m.a_ffn_r; }
+        RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw_l, ms, true, f.mlp_add,
+                                     f.mlp_ar_in, f.mlp_ar_out));
+#else
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms, true, f.mlp_add,
                                      f.mlp_ar_in, f.mlp_ar_out));
+#endif
+#if !QWEN35_MOE
+        if (m.ax_ff) {
+            lay.mlp_a.ff = m.ax_ff;
+            lay.mlp_a.ff_lo = g.n_ff - m.ax_ff;
+            lay.mlp_a.part = true;
+            lay.mlp_a.stored_gu = nm.f("blk.%lld.ffn_gate_up.weight", (long long)l);
+            lay.mlp_a.stored_dn = nm.f("blk.%lld.ffn_down.weight", (long long)l);
+            lay.mlp_a.probe_from = &lay.mlp;
+            RAD_ARCH_TRY(rad_aux_window(b, 1));
+            const int arc = lay.mlp_a.declare(b, nm, g, (int)l, m.ax_w, ms, false, false);
+            RAD_ARCH_TRY(rad_aux_window(b, 0));
+            RAD_ARCH_TRY(arc);
+        }
+#endif
 #if !QWEN35_MOE
         if (m.calib.records(l)) {
             /* The codes each int8 GEMM reads, in the domain its weight is stored in (i8_rot). */
@@ -1673,6 +1778,134 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
 }
 #endif
 
+#if !QWEN35_MOE
+/* Local (aux split): a prefill step of one sequence in two pieces, so each piece's feed-forward
+ * slice on the aux card runs beside the rank's card's work on the other piece. Per layer: the
+ * mixer's first piece; at its hand-off the previous layer's second piece is finished (its slice's
+ * output added, its tail, the next norm) and this layer's first feed-forward piece begun (norm,
+ * the aux slice issued, the rank's slice); the mixer's second piece; the second feed-forward
+ * piece begun; the first finished. Every op is the serial step's on a piece's rows. */
+struct AuxPipe {
+    RadCtx* c = nullptr;
+    const Model* m = nullptr;
+    int64_t T = 0, R = 0, li = 0;
+    bool pending = false;     /* the previous layer's second feed-forward piece is unfinished */
+    int64_t r0(int p) const { return p ? R : 0; }
+    int64_t rn(int p) const { return p ? T - R : R; }
+};
+/* Finish layer `li`'s feed-forward piece `p`: the slice's output, the tail, the taps, then the
+ * next block's norm over the piece (the final norm waits for the whole step). */
+static void auxpipe_fin(AuxPipe& a, int64_t li, int p) {
+    const Model& m = *a.m;
+    const Layer& l = m.layers[(size_t)li];
+    l.mlp.ax_end(a.c, a.r0(p), a.rn(p), p);
+    l.mlp.tail(a.c, a.r0(p), a.rn(p));
+    pipe_taps(a.c, m, li, a.r0(p), a.rn(p));
+    if (li + 1 < (int64_t)m.layers.size()) {
+        const Layer& nx = m.layers[(size_t)li + 1];
+        (nx.full ? nx.attn.nq_h : nx.gdn.nq_h).step(a.c, a.T, a.r0(p), a.rn(p));
+    }
+}
+static void auxpipe_begin(AuxPipe& a, int64_t li, int p) {
+    const Layer& l = a.m->layers[(size_t)li];
+    l.mlp.nq_h.step(a.c, a.T, a.r0(p), a.rn(p));
+    l.mlp.ax_begin(a.c, a.T, a.r0(p), a.rn(p), p);
+    l.mlp.body_own(a.c, a.T, a.r0(p), a.rn(p));
+}
+static void auxpipe_hand(void* u, int64_t, int64_t) {
+    AuxPipe& a = *(AuxPipe*)u;
+    if (a.pending) { auxpipe_fin(a, a.li - 1, 1); a.pending = false; }
+    auxpipe_begin(a, a.li, 0);
+}
+
+/* The piece bounds {0, R, T} on the card when the step can run this way, else null (once said
+ * why). */
+static const int32_t* auxpipe_ready(RadCtx* c, const RadBatch* batch, Model& m) {
+    const int64_t T = batch->n_tok;
+    static const bool off = std::getenv("RADIANCE_AUXPIPE_OFF") != nullptr;
+    if (off || !m.ax_ff || !m.b_pipe_cu || T < kAuxPipeMinRows || T > m.g.max_tok ||
+        batch->phase != RAD_PHASE_PREFILL || batch->n_seq != 1 || batch->n_seq_decode != 0 ||
+        !batch->positions || rope_mixed(batch) || batch->n_mm_rows > 0 || dbg_resid_on())
+        return nullptr;
+    int32_t* d = (int32_t*)rad_buf_ptr(c, m.b_pipe_cu);
+    const int64_t R = pipe_rows(T);
+    ArPieces pc{};
+    pc.rows = R; pc.done = auxpipe_hand; pc.cu = d; pc.in_ready = true;
+    for (const Layer& l : m.layers)
+        if (!(l.full ? l.attn.takes_pieces(batch, &pc) : l.gdn.takes_pieces(batch, &pc))) {
+            if (!m.pipe_serial_noted && m.g.rank == 0)
+                fprintf(stderr, "radiance: qwen35: a %lld-row prefill step runs the aux split "
+                                "unpipelined: %s cannot run in pieces\n", (long long)T,
+                        l.full ? "an attention block" : "a delta-net block");
+            m.pipe_serial_noted = true;
+            return nullptr;
+        }
+    if (!m.pipe_tbl_tried) {
+        m.pipe_tbl_tried = true;
+        const int64_t n = m.g.max_tok + 1;
+        m.pipe_tbl = (int32_t*)rad_dev_alloc(3 * n * (int64_t)sizeof(int32_t), RAD_MEM_HOST_PINNED);
+        if (m.pipe_tbl)
+            for (int64_t t = 0; t < n; ++t) {
+                m.pipe_tbl[3 * t] = 0;
+                m.pipe_tbl[3 * t + 1] = (int32_t)pipe_rows(t);
+                m.pipe_tbl[3 * t + 2] = (int32_t)t;
+            }
+    }
+    if (!m.pipe_tbl ||
+        rad_memcpy_async(d, m.pipe_tbl + 3 * T, 3 * (int64_t)sizeof(int32_t), rad_stream(c)) != RAD_OK)
+        return nullptr;
+    return d;
+}
+
+static void step_auxpipe(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
+    const Geom& g = m.g;
+    const int64_t T = batch->n_tok, R = pipe_rows(T);
+    const int64_t L = (int64_t)m.layers.size();
+    if (!m.pipe_noted) {
+        m.pipe_noted = true;
+        if (g.rank == 0)
+            fprintf(stderr, "radiance: qwen35: prefill steps of one sequence from %lld rows run two "
+                            "pieces, each piece's aux feed-forward slice beside the other's work\n",
+                    (long long)kAuxPipeMinRows);
+    }
+    RAD_ISSUE(c, m.op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.b_x, T));
+    m.mrows.step(c, batch, m.b_x, T);
+    if (L > 0) (m.layers[0].full ? m.layers[0].attn.nq_h : m.layers[0].gdn.nq_h).step(c, T);
+    if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
+        RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
+
+    AuxPipe a{c, &m, T, R, 0, false};
+    for (int64_t li = 0; li < L; ++li) {
+        const Layer& l = m.layers[(size_t)li];
+        a.li = li;
+        ArPieces pc{};
+        pc.rows = R; pc.done = auxpipe_hand; pc.u = &a; pc.cu = pcu; pc.in_ready = true;
+        if (l.full) l.attn.step(c, batch, false, &pc);
+        else        l.gdn.step(c, batch, false, &pc);
+        if (pc.handed != 1) {
+            rad_step_fail(c, "qwen35: a mixer did not run its two pieces in the aux pipe "
+                             "(auxpipe_ready and the block's takes_pieces disagree)");
+            return;
+        }
+        auxpipe_begin(a, li, 1);
+        auxpipe_fin(a, li, 0);
+        a.pending = true;
+    }
+    if (a.pending) auxpipe_fin(a, L - 1, 1);
+
+    RAD_ISSUE(c, m.op_final_norm, brows(m.b_x, T), RAD_W(m.w_out_norm), brows(m.a_h.x, T));
+    if (batch->n_out > 0) {
+        if (m.op_logits_fill && plugin_words_cover_rows(batch)) {
+            RAD_ISSUE_N(c, m.op_logits_fill, batch->n_out, brows(m.b_logits, batch->n_out));
+            return;
+        }
+        RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.a_h.x, T),
+                    praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.b_hout, batch->n_out));
+        issue_logits(c, m, batch->n_out);
+    }
+}
+#endif
+
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_slot(c)];
 
@@ -1712,6 +1945,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 
 #if !QWEN35_MOE
+    if (const int32_t* apcu = auxpipe_ready(c, batch, m)) {
+        step_auxpipe(c, batch, m, apcu);
+        return;
+    }
     bool pipe_failed = false;
     if (const int32_t* pcu = pipe_ready(c, batch, m, &pipe_failed)) {
         step_pipelined(c, batch, m, pcu);

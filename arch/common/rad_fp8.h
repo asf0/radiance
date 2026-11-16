@@ -1382,11 +1382,9 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     i8 = known && (linear_is_w8(enc) || rot8);
     i8_rot = i8 && rot8;
     if (i8) {
-        if (stored) {
-            fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
-                            "may\n", wn, stored);
-            return RAD_E_INVAL;
-        }
+        /* Local: an int8 linear may view another declaration's stored tensor (`stored`), its codes
+         * and scales sliced by the span like any shard: a dense FFN split between the rank's card
+         * and an aux device declares the aux slice as such a view (MlpFP8::part). */
         if (a.q8_fed && rot8 != a.q8_rot) {
             fprintf(stderr, "radiance: '%s' is a%s int8 weight and its input is fed codes its "
                             "producer wrote %s\n", wn, rot8 ? " rotated" : " plain",
@@ -1431,19 +1429,20 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                                                 : "codes";
         /* Declared at the stored codes' dtype; the kernel's layout keeps them at that width
          * (libr4d's r4d_iqr_layout.cpp). */
-        w  = decl_view(b, wn, nullptr, cv, enc.plane[0].dtype, { N, K }, access, shard, grp,
+        w  = decl_view(b, wn, stored, cv, enc.plane[0].dtype, { N, K }, access, shard, grp,
                        rp.w, rp.n);
+        const char* wsrc = stored ? stored : wn;   /* the scale views' source tensor */
         /* A view of two planes is declared at the weight's logical extents and sliced in its
          * columns, the stored planes left to the layout hook. */
         const bool iq8r = linear_is_iq8r(enc);
         const bool two = linear_w8h_scale2(enc) || linear_w8h_rowf(enc) || iq8r;
-        ws = asym ? decl_view(b, sn, wn, "scale,zero", RAD_F16, { N, K }, access, shard, grp,
+        ws = asym ? decl_view(b, sn, wsrc, "scale,zero", RAD_F16, { N, K }, access, shard, grp,
                               rp.w, rp.n)
-             : linear_w8h_rowf(enc) ? decl_view(b, sn, wn, "scale,scale.col", RAD_F32, { N, K },
+             : linear_w8h_rowf(enc) ? decl_view(b, sn, wsrc, "scale,scale.col", RAD_F32, { N, K },
                                                 access, shard, grp, rp.w, rp.n)
-             : two ? decl_view(b, sn, wn, "scale,scale.1", iq8r ? RAD_U8 : RAD_F8E4M3, { N, K },
+             : two ? decl_view(b, sn, wsrc, "scale,scale.1", iq8r ? RAD_U8 : RAD_F8E4M3, { N, K },
                                access, shard, grp, rp.w, rp.n)
-                   : decl_view(b, sn, wn, "scale", RAD_BF16, { N, K / wg }, access,
+                   : decl_view(b, sn, wsrc, "scale", RAD_BF16, { N, K / wg }, access,
                                shard, grp, rp.w, rp.n);
         if (!w || !ws) return RAD_E_INVAL;
         if (span_hi > 0) {

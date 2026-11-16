@@ -76,6 +76,27 @@ int  rad_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spi
                          int64_t width, int64_t height, RadStream s);
 int  rad_memset_async(void* dst, int value, int64_t bytes, RadStream s);
 
+/* One copy of a list: `bytes` from `src` to `dst`, both absolute addresses. */
+typedef struct RadCopySeg {
+    const void* src;
+    void*       dst;
+    int64_t     bytes;
+} RadCopySeg;
+/* Many unrelated copies, in list order on the stream, on the card's DMA engine where the backend
+ * has one (otherwise segment by segment). The list itself is read at the call; the bytes it names
+ * must live until the copy runs. An empty list enqueues nothing but performs the card's first-list
+ * setup, so a caller can pay that cost at bring-up.
+ *
+ * For bulk link copies while the card computes (e.g. a layer's pooled experts in the prefill
+ * stager). A copy kernel holds a CU slot for the link's duration and waits for a free one at
+ * launch: beside busy kernels, 1.3 MB pinned-host copies run at 2.3 GB/s as kernels versus
+ * 28.7 GB/s (link rate) on the DMA engine, at no cost to the kernels (aql.cpp, "the DMA lane").
+ *
+ * RAD_COPY_YIELD makes the list yield to the card's collectives: between ~1 MB pieces it waits
+ * while a stream of that card holds the link (rad_link_hold). */
+#define RAD_COPY_YIELD 1u
+int rad_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream s);
+
 /* The last device error, cleared by reading it. A device fault is not recoverable in-process;
  * the engine exits non-zero rather than serving from a wedged queue (spec §17). */
 const char* rad_dev_last_error(void);
