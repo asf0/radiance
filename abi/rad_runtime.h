@@ -950,6 +950,11 @@ int             rad_rank(RadCtx* c);
 /* The instance's slot, rad_build_slot() of the declare that built it: what a plugin indexes its
  * per-instance state by. */
 int             rad_slot(RadCtx* c);
+/* Local: the instance's weights epoch. It moves whenever the engine has read its weights pool back
+ * from the container (a fleet restore, docs/MULTIMODEL.md §7.3), which lays every weight out as
+ * the load did: a plugin that rewrote a weight in place after the load (a reordered router) does
+ * it again when the value it last saw changes. 0 until the first restore. */
+uint64_t        rad_weights_epoch(RadCtx* c);
 int             rad_world_size(RadCtx* c);
 /* Workgroups the current rank's card can run concurrently (HIP multiProcessorCount on RDNA;
  * 32 on the host backend or when the backend has no positive count). */

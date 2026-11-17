@@ -10,6 +10,7 @@
  * the host. See ctx.h for the cost budget (spec §3.2).
  */
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <chrono>
 #include <functional>
@@ -1479,6 +1480,16 @@ int rad_kv_layer_index(RadCtx* c, rad_kvgroup group, int layer) {
 }
 int             rad_rank(RadCtx* c)       { return c ? static_cast<rad::Ctx*>(c)->rank() : 0; }
 int             rad_slot(RadCtx* c)       { return c ? static_cast<rad::Ctx*>(c)->slot() : 0; }
+
+/* Local: per instance slot, bumped by Engine::page_back_in (rad_weights_epoch_bump). */
+static std::atomic<uint64_t> g_weights_epoch[RAD_MAX_SLOTS];
+uint64_t        rad_weights_epoch(RadCtx* c) {
+    const int s = rad_slot(c);
+    return s >= 0 && s < RAD_MAX_SLOTS ? g_weights_epoch[s].load(std::memory_order_acquire) : 0;
+}
+void rad_weights_epoch_bump(int slot) {
+    if (slot >= 0 && slot < RAD_MAX_SLOTS) g_weights_epoch[slot].fetch_add(1, std::memory_order_acq_rel);
+}
 int             rad_world_size(RadCtx* c) { return c ? static_cast<rad::Ctx*>(c)->world_size() : 1; }
 int             rad_ctx_wgp_count(RadCtx* c) {
     return c ? static_cast<rad::Ctx*>(c)->wgp_count() : 32;

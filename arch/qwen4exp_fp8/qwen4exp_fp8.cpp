@@ -204,6 +204,7 @@ struct Model {
      * The router's rows are put in slot order once, before the first step (perm_router). */
     std::vector<std::vector<int32_t>> perm;
     bool    perm_done = false;
+    uint64_t perm_epoch = 0;   /* rad_weights_epoch when the routers were reordered */
     rad_buf b_sorted_r = 0, b_eoff_r = 0, b_ecnt_r = 0, b_egu_r = 0, b_edn_r = 0;
     ActFP8  a_eff_r{};
 
@@ -2126,6 +2127,7 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
  * holds), once, before anything reads them: the router then ranks slots. */
 static void perm_router(RadCtx* c, Model& m) {
     m.perm_done = true;
+    m.perm_epoch = rad_weights_epoch(c);
     const int64_t ne = m.moecfg.n_expert, ncol = m.g.n_embd;
     std::vector<uint16_t> a((size_t)(ne * ncol)), o((size_t)(ne * ncol));
     const RadStream s = rad_stream(c);
@@ -2151,7 +2153,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_slot(c)];
     const Geom& g = m.g;
     const int64_t T = batch->n_tok;
-    if (!m.perm.empty() && !m.perm_done) perm_router(c, m);
+    /* Again after a restore: it read the routers back from the container in checkpoint order. */
+    if (!m.perm.empty() && (!m.perm_done || m.perm_epoch != rad_weights_epoch(c))) perm_router(c, m);
 
     /* An encoder pass runs only the vision tower (RadBatch::enc). */
     if (batch->enc) {

@@ -543,6 +543,7 @@ extern "C" const RadBatch* rad_batch(RadCtx* c)      { return c->batch; }
 extern "C" int             rad_rank(RadCtx* c)       { return c->rank; }
 /* One engine: the slot is the rank (RadBuildCtx::slot_base zero). */
 extern "C" int             rad_slot(RadCtx* c)       { return c->rank; }
+extern "C" uint64_t        rad_weights_epoch(RadCtx*) { return 0; }
 extern "C" int             rad_world_size(RadCtx* c) { return c->world; }
 extern "C" int             rad_ctx_wgp_count(RadCtx*) { return 32; }
 /* The context itself, so a copy issued on the step's stream is recorded in it (rad_memcpy_async). */

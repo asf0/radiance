@@ -49,6 +49,8 @@
 #include <string>
 #endif
 
+extern "C" void rad_weights_epoch_bump(int slot);   /* core/runtime/issue.cpp (local: rad_weights_epoch) */
+
 namespace rad {
 
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -672,6 +674,9 @@ int Engine::page_back_in(int64_t* left) {
     if (erc < 0)
         device_set_error("the KV cache and expert ranges could not be backed again: %s",
                          elastic_why.c_str());
+    /* Local: the weights are as the container lays them out again (rad_weights_epoch). */
+    if (erc >= 0 && slot_base_ >= 0)
+        for (int i = 0; i < (int)ranks_.size(); ++i) rad_weights_epoch_bump(slot_base_ + i);
     return erc;
 }
 
