@@ -256,6 +256,7 @@ struct TransportOptions {
      * per-request cap. */
     size_t      max_inflight_body_bytes = 0;
     std::string api_key;                  /* "" disables the check */
+    bool        api_key_remote_only = false;   /* local: a loopback socket passes the key gate */
     bool        cors = true;
     /* --trusted-proxy, repeatable: CIDRs whose sockets may vouch for their caller through
      * X-Forwarded-For. Empty: no socket vouches for anything and peer always equals raw_peer.

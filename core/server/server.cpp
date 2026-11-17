@@ -269,6 +269,7 @@ int Server::run() {
     t.max_threads = queue_depth_ + kSpareWorkers;
     t.max_queued = kSpareWorkers;
     t.api_key = opt_.api_key;
+    t.api_key_remote_only = opt_.api_key_remote_only;
     t.cors = opt_.cors;
     t.read_timeout_s = opt_.read_timeout_s;
     t.write_timeout_s = opt_.write_timeout_s;
@@ -2332,7 +2333,7 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
      * filesystem, and /v1/models is the first route a keyless scanner reaches. Keyless, it
      * belongs to the operator alone, the rule /diagnostics and the LoRA admin follow; with a
      * key, everyone who can pay the key already owns this model's card. */
-    if (!opt_.api_key.empty() || local_operator(req)) c.root = opt_.model_path;
+    if (keyed(req) || local_operator(req)) c.root = opt_.model_path;
     /* No capabilities member to strip here: capabilities() carries no expert_stats. The engine
      * reports that path in its own info blob, and the splice at /server_info screens it for
      * keyless strangers (admin.cpp, handle_server_info) -- the live guard, this is the map. */
@@ -2387,7 +2388,7 @@ HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     if (!opt_.lora_load || !opt_.lora_unload)
         return fail(404, "not_found_error", "this server was started without runtime LoRA (--lora or "
                                             "--max-loras)");
-    if (opt_.api_key.empty() && !local_operator(req))
+    if (!keyed(req) && !local_operator(req))
         /* A cross-origin browser counts as neither loopback nor local: the victim's own browser
          * is loopback to this port, and that is exactly how a hostile page would reach here —
          * under DNS rebinding it even arrives with a matching Host unless the Host names the

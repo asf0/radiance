@@ -227,6 +227,8 @@ static const Flag g_flags[] = {
     "                                    /v1/health, /ping and the dashboard page" },
     { "--api-key-env",        "NAME",   "read the API key from the named environment variable; keeps it off the\n"
     "                                    command line, where every process on the machine can read it" },
+    { "--api-key-remote-only", nullptr, "local: ask the --api-key of other machines only; a loopback socket passes\n"
+    "                                    keyless and meets the loopback-only routes' local-operator rule" },
     { "--allow-host",         "NAME",   "a Host name the keyless loopback-only routes (/diagnostics,\n"
     "                                    /admin/control-vector, the LoRA and session admin) accept besides\n"
     "                                    localhost; repeatable" },
@@ -1117,6 +1119,7 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--max-body-mib"))          { if (!num(1, (int64_t)1 << 20, &c->http_max_body_mib)) return RAD_E_INVAL; }
         else if (S("--no-cors"))               c->cors = false;
+        else if (S("--api-key-remote-only"))   c->api_key_remote_only = true;
         else if (S("--image-min-pixels") || S("--image-max-pixels") || S("--video-min-pixels") ||
                  S("--video-max-pixels") || S("--max-source-pixels")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1618,6 +1621,7 @@ const ShowRow kShow[] = {
     { "--keep-alive-timeout", [](const Config& c) { return num(c.http_keep_alive_timeout_s) + " s"; } },
     { "--max-body-mib",       [](const Config& c) { return num(c.http_max_body_mib); } },
     { "--retry-after",        [](const Config& c) { return num(c.retry_after_s) + " s"; } },
+    { "--api-key-remote-only", [](const Config& c) { return onoff(c.api_key_remote_only); } },
     { "--no-cors",            [](const Config& c) {
           return std::string(c.cors ? "not given: CORS headers sent" : "no CORS headers"); } },
     { "--image-min-pixels",   [](const Config& c) { return opt(c.image_min_pixels, "the container's"); } },

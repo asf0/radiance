@@ -705,6 +705,13 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
 
     const std::string api_key = o.api_key;
     const bool cors = o.cors;
+    /* Local (--api-key-remote-only): the socket, never the attributed caller, decides. */
+    const bool remote_only = o.api_key_remote_only;
+    auto loopback_socket = [](const httplib::Request& q) {
+        HttpRequest r;
+        r.raw_peer = q.remote_addr + ":" + std::to_string(q.remote_port);
+        return r.peer_is_loopback();
+    };
     const std::vector<std::string> trusted = o.trusted_proxies;
     /* The two addresses every bridged request carries: the socket as the kernel saw it, and
      * the caller the vouched chain names. Only the first is ever read for authority. The
@@ -746,7 +753,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     };
 
     /* What a request must pass before its body is read, so a refused one never has it buffered. */
-    auto gate = [api_key, cors, key_ok, who](const httplib::Request& hreq,
+    auto gate = [api_key, cors, key_ok, who, remote_only, loopback_socket](const httplib::Request& hreq,
                                              httplib::Response& hres) -> bool {
         if (cors) {
             hres.set_header("Access-Control-Allow-Origin", "*");
@@ -766,7 +773,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         const bool reads  = m == "GET" || m == "HEAD";
         const bool probe  = p == "/health" || p == "/v1/health" || p == "/" || p == "/dashboard";
         const bool exempt = (reads && (probe || p == "/ping")) || (p == "/ping" && m == "POST");
-        if (!api_key.empty() && !exempt) {
+        if (!api_key.empty() && !exempt && !(remote_only && loopback_socket(hreq))) {
             if (!key_ok(hreq)) {
                 /* Logged in Server::error_response's format; the gate answers before the router. */
                 RAD_INFO("req refused from %s -> 401 authentication_error: invalid api key",
@@ -931,7 +938,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
      * ways a socket client can carry it, and, with CORS off, by its Origin: a browser lets any
      * page open a socket to any host, and CORS is what would otherwise keep another site's page
      * out. True when the upgrade may proceed; false with the refusal in `s`. */
-    auto socket_gate = [api_key, cors, key_ok, who](const httplib::Request& q,
+    auto socket_gate = [api_key, cors, key_ok, who, remote_only, loopback_socket](const httplib::Request& q,
                                                     httplib::Response& s) -> bool {
         auto refuse = [&](int status, const char* type, const std::string& why) {
             RAD_INFO("req refused from %s -> %d %s: %s", who(q).c_str(),
@@ -948,7 +955,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
                 return refuse(403, "permission_error",
                               "a page on another origin may not open this socket (--no-cors)");
         }
-        if (!api_key.empty() && !key_ok(q) &&
+        if (!api_key.empty() && !(remote_only && loopback_socket(q)) && !key_ok(q) &&
             !offers_key(q.get_header_value("Sec-WebSocket-Protocol"), api_key))
             return refuse(401, "authentication_error", "invalid api key");
         return true;

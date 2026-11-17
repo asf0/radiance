@@ -69,7 +69,7 @@ HttpResponse Server::handle_control_vector(const HttpRequest& req) {
     /* Keyless, the vector and its switch belong to the machine: a rebinding page, a page on
      * any origin a localhost proxy fronts, or a plain remote client reads neither the state
      * nor the 404-that-means-no-vector. With --api-key both verbs are behind the key anyway. */
-    if (opt_.api_key.empty() && !local_operator(req)) {
+    if (!keyed(req) && !local_operator(req)) {
         ApiError e;
         e.status  = 403;
         e.type    = "permission_error";
@@ -218,7 +218,7 @@ HttpResponse Server::handle_session_release(const HttpRequest& req) {
 
     /* Releasing a session destroys another client's cached conversation: keyless, that is an
      * operator act, not something any page or client that reaches the port may do. */
-    if (opt_.api_key.empty() && !local_operator(req))
+    if (!keyed(req) && !local_operator(req))
         return error_response(
             err_forbidden("without --api-key, sessions are released only from a loopback client "
                           "naming this machine; start the server with --api-key to do it from "

@@ -65,6 +65,7 @@ server::TransportOptions transport_options(const FleetConfig& fc) {
     t.port = c.port;
     t.n_threads = server::idle_workers(c.http_threads);
     t.api_key = c.api_key;
+    t.api_key_remote_only = c.api_key_remote_only;
     t.cors = c.cors;
     t.read_timeout_s = c.http_read_timeout_s;
     t.write_timeout_s = c.http_write_timeout_s;
@@ -2275,7 +2276,7 @@ std::string Fleet::reload() {
         return "this build does not act on " + u + " yet";
     const Config& a = fc_.models.front().cfg;
     const Config& b = nf.models.front().cfg;
-    if (a.host != b.host || a.port != b.port || a.api_key != b.api_key ||
+    if (a.host != b.host || a.port != b.port || a.api_key != b.api_key || a.api_key_remote_only != b.api_key_remote_only ||
         a.http_threads != b.http_threads || a.cors != b.cors || nf.cards != fc_.cards)
         return "server: and cards: changes need a restart";
     if (nf.log_set) log_set_level(nf.log);
@@ -2586,7 +2587,9 @@ json Fleet::status() {
 
 bool Fleet::operator_ok(const server::HttpRequest& q) const {
     const Config& c = fc_.models.front().cfg;
-    return !c.api_key.empty() || server::local_operator(q, c.host, c.allow_hosts);
+    /* Keyed: it passed the key gate. A loopback caller under --api-key-remote-only did not. */
+    const bool keyed = !c.api_key.empty() && (!c.api_key_remote_only || !q.peer_is_loopback());
+    return keyed || server::local_operator(q, c.host, c.allow_hosts);
 }
 
 void Fleet::add_routes() {

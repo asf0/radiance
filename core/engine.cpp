@@ -3474,6 +3474,7 @@ int Engine::run_server() {
     o.host     = cfg_.host;
     o.port     = cfg_.port;
     o.api_key  = cfg_.api_key;
+    o.api_key_remote_only = cfg_.api_key_remote_only;
     o.local_hosts = cfg_.allow_hosts;
     o.trusted_proxies = cfg_.trusted_proxies;
     o.max_seqs = cfg_.max_seqs;

@@ -336,7 +336,7 @@ HttpResponse Server::handle_props(const HttpRequest& req) {
     /* A path on this machine: it travels the way /v1/models' `root` does -- keyless it belongs
      * to the operator alone, with a key it rides with the key. The compatibility shape keeps
      * the field; a stranger sees it empty, which is also what a --model stdin read is. */
-    o["model_path"] = (!opt_.api_key.empty() || local_operator(req)) ? opt_.model_path
+    o["model_path"] = (keyed(req) || local_operator(req)) ? opt_.model_path
                                                                      : std::string();
     o["modalities"]  = std::move(modal);
     o["endpoint_slots"]   = false;
@@ -345,7 +345,7 @@ HttpResponse Server::handle_props(const HttpRequest& req) {
     /* The template's source text is the container's own bytes, gated like model_path above;
      * a keyless stranger has no reader for it anyway. The capability flags stay -- a client
      * needs them to build a request, and they name no path and quote no source. */
-    o["chat_template"]      = (deps_.chat && (!opt_.api_key.empty() || local_operator(req)))
+    o["chat_template"]      = (deps_.chat && (keyed(req) || local_operator(req)))
                                   ? deps_.chat->source()
                                   : std::string();
     o["chat_template_caps"] = json::parse(deps_.chat ? deps_.chat->caps() : std::string("{}"),
@@ -513,7 +513,7 @@ HttpResponse Server::handle_server_info(const HttpRequest& req) {
              * the same path the model card strips for strangers (server.cpp). /server_info
              * answers keyless by the dashboard-data posture, but a filesystem path is not
              * dashboard data: a stranger gets the interval, never the path. */
-            if (opt_.api_key.empty() && !local_operator(req) && e.contains("expert_stats") &&
+            if (!keyed(req) && !local_operator(req) && e.contains("expert_stats") &&
                 e["expert_stats"].is_object())
                 e["expert_stats"].erase("file");
             o["engine"] = std::move(e);
@@ -533,7 +533,7 @@ HttpResponse Server::handle_diagnostics(const HttpRequest& req) {
         return error_response(err_not_implemented(
             "the server was not given a diagnostics provider; this build has no engine attached"),
                 req.peer);
-    if (opt_.api_key.empty() && !local_operator(req)) {
+    if (!keyed(req) && !local_operator(req)) {
         /* A cross-origin browser is not a loopback client even when the victim's own machine
          * serves this port, and under rebinding or a localhost proxy the socket alone says
          * loopback for anyone: the Host is what still names who the client asked. */
@@ -557,7 +557,7 @@ HttpResponse Server::handle_reset_prefix_cache(const HttpRequest& req) {
 
     /* Wiping every client's cached prefix is an operator act: keyless, it belongs to the
      * machine, not to whichever browser or page can reach the port. */
-    if (opt_.api_key.empty() && !local_operator(req))
+    if (!keyed(req) && !local_operator(req))
         return error_response(
             err_forbidden("without --api-key, /reset_prefix_cache runs only from a loopback "
                           "client naming this machine; start the server with --api-key to run "

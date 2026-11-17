@@ -31,7 +31,7 @@ namespace {
  * while one process holds one listener (§5.1), so each engine reads the same values. */
 const char* const kServerKeys[] = {
     "host", "port", "api-key", "api-key-env", "allow-host", "trusted-proxy", "http-threads",
-    "read-timeout", "write-timeout", "keep-alive-timeout", "max-body-mib", "retry-after", "no-cors",
+    "read-timeout", "write-timeout", "keep-alive-timeout", "max-body-mib", "retry-after", "no-cors", "api-key-remote-only",
     "live", "radiance-home", "kernels", "download-dir", "proceed-with-incompatible-configuration",
     "debug-accept-reference-kernels",
 };

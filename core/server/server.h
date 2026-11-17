@@ -204,6 +204,7 @@ struct ServerOptions {
     std::function<std::vector<std::string>()>                                gen_lora_names;
 
     std::string api_key;
+    bool        api_key_remote_only = false;   /* local: --api-key-remote-only */
     /* Extra Host authorities the keyless "loopback only" guards accept (--allow-host): names an
      * operator reaches the box by that the loopback IP check cannot know. Case-insensitive. */
     std::vector<std::string> local_hosts;
@@ -264,6 +265,11 @@ public:
     /* The identity the keyless "loopback only" guards accept: loopback socket, no foreign
      * Origin, and a Host that names this box (server::local_operator, http.cpp). */
     bool local_operator(const HttpRequest& req) const;
+    /* Local: the request passed the key gate -- a key is set, and it is not a loopback caller let
+     * through keyless by --api-key-remote-only. The guards that open up "with a key" read this. */
+    bool keyed(const HttpRequest& req) const {
+        return !opt_.api_key.empty() && (!opt_.api_key_remote_only || !req.peer_is_loopback());
+    }
     void stop();
     /* stop() without the transport: for a server behind a Front (front.h), which owns the socket.
      * Ends video and shape jobs and drains finished generations. */

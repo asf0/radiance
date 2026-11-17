@@ -1202,6 +1202,10 @@ struct Config {
     int64_t http_max_body_mib = 512;
     int     retry_after_s = 1;
     bool    cors = true;
+    /* Local: --api-key-remote-only. The key is asked of other machines only: a loopback socket
+     * (lmswap on this box, which cannot send a key to a local model) passes the gate keyless and
+     * meets the loopback-only guards' local-operator rule as it would with no key at all. */
+    bool    api_key_remote_only = false;
 
     /* ---------------- MEDIA PREPROCESSING ----------------
      * Each one replaces what the container's preprocessor configuration states (mm::VisionConfig).
