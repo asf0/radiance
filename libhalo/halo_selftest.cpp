@@ -6935,6 +6935,70 @@ static void scale_case(const Plugin& pl) {
 /* rope_bf16 against an f32 mirror of rope_kernel at each ladder width. `den` is the ladder's
  * width (`rot` for `rotary`/absent, `head_dim` for `head`). The V head must stay untouched. rel_l2
  * catches a wrong angle, which magnitude alone would not (rotation preserves length). */
+/* The row-form names (rope_rows, rmsnorm_rows) against rope and rmsnorm: the same launch on this
+ * part, so the same bytes. LFM3's shapes: a per-head norm over head_dim-wide rows with a bf16
+ * gain, and its full layers' rotary, half of each 128-wide head at theta 1e6 on the head
+ * ladder, over 16 query heads. Each row must also have changed its input. */
+static void row_form_name_case(const Plugin& pl, bool rope) {
+    const char* base = rope ? "rope_bf16" : "rmsnorm_bf16";
+    const char* rows = rope ? "rope_rows_bf16" : "rmsnorm_rows_bf16";
+    const std::string what = std::string(rows) + " gives " + base + "'s bytes";
+    const RadKernelInfo* r0 = find(pl, base);
+    const RadKernelInfo* r1 = find(pl, rows);
+    if (!r0 || !r1) { ok(what.c_str(), false, "row absent"); return; }
+    const int64_t M = rope ? 96 : 96 * 16, hd = 128, n_head = 16, n = rope ? n_head * hd : hd;
+    std::vector<uint16_t> x((size_t)(M * n));
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = h_to_bf16((float)((int)((i * 2654435761u >> 7) % 401) - 200) * 0.01f);
+    std::vector<uint16_t> w((size_t)hd);
+    for (size_t i = 0; i < w.size(); ++i) w[i] = h_to_bf16(0.5f + (float)(i % 7) * 0.25f);
+    std::vector<int32_t> pos((size_t)M);
+    for (size_t i = 0; i < pos.size(); ++i) pos[i] = (int32_t)(i * 2731 + (i % 3 ? 0 : 250000));
+    void* d_x = dalloc(x.size() * 2);
+    void* d_w = dalloc(w.size() * 2);
+    void* d_pos = dalloc(pos.size() * 4);
+    void* d_y = dalloc(x.size() * 2);
+    if (!d_x || !d_w || !d_pos || !d_y) { ok(what.c_str(), false, "hipMalloc failed"); return; }
+    st_memcpy(d_w, w.data(), w.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_pos, pos.data(), pos.size() * 4, hipMemcpyHostToDevice);
+    auto run = [&](const RadKernelInfo* r, std::vector<uint16_t>& out) {
+        std::vector<RadTensor> ts;
+        std::vector<RadParam> ps;
+        if (rope) {
+            st_memcpy(d_y, x.data(), x.size() * 2, hipMemcpyHostToDevice);    /* in place */
+            ts = { T(d_y, RAD_BF16, { M, n }), T(d_pos, RAD_I32, { M }) };
+            ps = { PI("M", M), PI("head_dim", hd), PI("n_head", n_head), PI("n_head_kv", 0),
+                   PF("theta", 1e6), PF("scale", 1.0), PS("mode", "neox"), PI("rotary_dim", 64),
+                   PS("ladder", "head") };
+        } else {
+            st_memcpy(d_x, x.data(), x.size() * 2, hipMemcpyHostToDevice);
+            ts = { T(d_x, RAD_BF16, { M, n }), T(d_w, RAD_BF16, { n }), T(d_y, RAD_BF16, { M, n }) };
+            ps = { PI("M", M), PI("n", n), PF("eps", 1e-5), PS("dtype", "bf16") };
+        }
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        const int rc = r->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        if (rc != RAD_OK) return rc;
+        out.assign(x.size(), 0);
+        st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
+        return 0;
+    };
+    std::vector<uint16_t> a, b;
+    const int rc0 = run(r0, a), rc1 = run(r1, b);
+    if (rc0 || rc1) {
+        ok(what.c_str(), false, "launch rc " + std::to_string(rc0) + " / " + std::to_string(rc1));
+        return;
+    }
+    size_t diff = 0, moved = 0;
+    for (size_t i = 0; i < a.size(); ++i) { diff += a[i] != b[i]; moved += b[i] != x[i]; }
+    ok(what.c_str(), diff == 0 && moved > a.size() / 8,
+       std::to_string(diff) + " of " + std::to_string(a.size()) + " differ, " +
+           std::to_string(moved) + " changed from the input");
+}
+
 static void rope_ladder_case(const Plugin& pl) {
     const char* what = "rope ladder vs an f32 mirror of rope_kernel at each width";
     const RadKernelInfo* r = find(pl, "rope_bf16");
@@ -31386,6 +31450,17 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8, 32, "bf16",     0);
     attn_numeric_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8,  1, "fp8_e4m3", 0);
     attn_numeric_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8,  1, "bf16",     0);
+    /* LFM3: 16 query heads over 4 kv heads at head_dim 128, full and with its 256-token window; the
+     * rows take what the decode leg's band (q_len <= 16) leaves. Launches, then numeric checks, the
+     * last two with a context past the window. */
+    attn_case(pl, "attn_window_h128_gqa4_fp8kv",  128, 4, 32, "fp8_e4m3", 1);
+    attn_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 32, "bf16",     1);
+    attn_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 32, "bf16",     1, 256);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_fp8kv",  128, 4, 32, "fp8_e4m3", 0);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 32, "bf16",     0);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 17, "bf16",     0, 300);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 64, "bf16",     256, 700);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_fp8kv",  128, 4, 64, "fp8_e4m3", 256, 700);
     /* The h256/gqa2 prefill numeric check with ctx 2048 > window 1024, so the window applies: for
      * query row 0, pos = 2048-64 = 1984 and the visible keys are [961..1984], so wlo0 = 961 and
      * tstart = 961/48 = 20. This exercises the window mask and the below-window tile skip (tiles
@@ -33343,6 +33418,8 @@ static void device_phase(const Plugin& pl) {
         if (!g_case) std::printf("\nthe rotary ladder, against an f32 mirror of the kernel at each width\n");
         rope_ladder_case(pl);
     }
+    if (sel("rope_rows_bf16")) row_form_name_case(pl, true);
+    if (sel("rmsnorm_rows_bf16")) row_form_name_case(pl, false);
 
     /* The audio generator's ops and the optional forms a speech model adds, each against libref's
      * arithmetic. */

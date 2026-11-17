@@ -945,10 +945,13 @@ the count from `tail`, as a GEMM takes its M from its operands.
 
 | op | params | operands |
 |---|---|---|
-| `prefetch` | `bytes` | `w`w |
+| `prefetch` | `bytes` `blocks`/opt | `w`w |
 
 Reads the first `bytes` of a weight's stored form and writes nothing, so a kernel that streams the
-weight next finds those bytes in the on-die cache (64 MB on gfx1201). It is issued beside a
+weight next finds those bytes in the on-die cache (64 MB on gfx1201). `blocks` is the number of
+workgroups reading where the architecture measured its own (the read holds wave slots and queues
+its loads in front of the kernels it runs beside, so the best count depends on them); absent or 0
+it is the kernel's `nb` axis. It is issued beside a
 collective that leaves the card's memory idle: on the second lane (`rad_lane`), or, where launches
 chain (`rad_chain_on`), as its chained form on the same lane right behind the GEMM before the
 collective, which waits for that GEMM only and does not hold the collective. A plain read on the

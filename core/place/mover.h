@@ -307,6 +307,23 @@ struct MoverConfig {
      * gets proportionally fewer, so a small loan is not left emptier than it is filled. */
     int turnover_slots = RAD_PLACE_TURNOVER_SLOTS;
 
+    /* Whether the turnover slots a class keeps free follow the swaps the engine lately asked for
+     * (Mover::swap_demand) instead of always being all of them, and the fewest it keeps then.
+     *
+     * The count above is three steps of the full move budget, what a placement that changes
+     * every step needs (the planner.h figures are for a rank with 40% of its experts on the
+     * card). A rank that holds nearly all its experts swaps a few units a step once it has
+     * warmed up, and the 160 free slots a class are then experts left in the pool for nothing:
+     * Qwen3.8-Flash-Next at tp 2 keeps 640 slots a rank free (0.8 GiB) beside ~1000 units read
+     * over the link. Following demand, a class keeps three steps of the swaps a step the engine
+     * has lately proposed (a running mean, so one step's burst lands in the slots already free
+     * and moves nothing), never fewer than `turnover_floor`; the rest is filled like any other
+     * lent slot. A promotion that finds no free slot takes all of them back for a while, by
+     * dropping the coldest lent units, an address change (balance). Off by default, so a caller
+     * that sizes the turnover itself gets what it set. */
+    bool turnover_adaptive = false;
+    int  turnover_floor = RAD_PLACE_SHADOW_SLOTS;
+
     /* The container, for the file tier. Empty means no file tier; a unit planned there is then
      * an error. */
     std::string container_path;
@@ -582,6 +599,17 @@ public:
     /* Whether idle ticks keep the turnover slots filled; the engine holds them through a prompt
      * and the few steps after it (Engine::tiering_dispatch). */
     void hold_turnover(bool held) { hold_turnover_ = held; }
+    /* The swaps the heat engine proposed this step (all classes), once a step before they are
+     * issued: what the kept-free turnover follows under MoverConfig::turnover_adaptive, as a
+     * running mean over about kTurnMean steps. */
+    void swap_demand(int64_t proposed);
+    /* The turnover slots kept free now, summed over the slab classes: turnover_slots(), or under
+     * MoverConfig::turnover_adaptive what the demand asks for. */
+    int64_t turnover_now() const {
+        int64_t n = 0;
+        for (const ClassPools& cp : pools_) n += cp.turn_now;
+        return n;
+    }
     /* Each class's pinned pool as the card addresses it: [lo, hi) and the unit stride. At most `max`. */
     int pool_ranges(uint64_t* lo, uint64_t* hi, uint64_t* stride, int max) const {
         int n = 0;
@@ -751,6 +779,8 @@ private:
         int64_t  n_turn = 0;           /* lent slots kept free past those: the fill stops short
                                         * of them and balance() drops lent units to rebuild them
                                         * (MoverConfig::turnover_slots) */
+        int64_t  turn_now = 0;         /* of n_turn, the slots kept free now: all of them, or
+                                        * what the recent swaps ask for (swap_demand) */
         int64_t  n_donated = 0;        /* units in lent slots that gave their host copy away
                                         * (Mover::donor_slot); at most n_turn of them */
         std::vector<char*>   flex_ptr;
@@ -809,6 +839,16 @@ private:
     std::vector<std::pair<float, int32_t>> drop_cand_;
     bool hold_turnover_ = false;
     bool no_loans_ = false;   /* local: set_no_loans */
+    /* The running mean of swaps proposed a step (swap_demand), and the steps left for which a
+     * promotion that found no free slab slot keeps every turnover slot free. */
+    float   demand_mean_ = 0.0f;
+    int64_t turn_boost_ = 0;
+    static constexpr float   kTurnMean = 64.0f;
+    static constexpr int64_t kTurnBoost = 512;
+    /* The most slots a class's kept-free count falls by in one balance(): each slot given up is
+     * a unit copied in over the link, and all of them at once would be hundreds of copies behind
+     * one step. Growing is immediate (drops cost nothing). */
+    static constexpr int64_t kTurnShrink = 8;
     /* donor_slot()'s candidates per class, by layer, each layer sorted coldest first (hottest at
      * the back). Ranked once per dispatch; `at` is that dispatch. */
     struct DonorRank { int at = -1; std::vector<std::vector<std::pair<float, int32_t>>> by_layer; };

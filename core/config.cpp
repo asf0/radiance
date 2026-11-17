@@ -237,8 +237,9 @@ static const Flag g_flags[] = {
     "                                    never access; repeatable" },
     { "--served-model-name",  "NAME",   "the model id /v1/models lists and responses carry; default the container's name" },
     { "--mm-max-patches",     "N",      "patches one encoder pass carries, and so the largest image (a patch is 16x16\n"
-                                        "pixels). Default `auto`: 16384 when the container carries a vision tower. 0\n"
-                                        "serves text only and keeps the tower off the card" },
+                                        "pixels). Default `auto`: 16384 when the container carries a vision tower (0 in a build\n"
+                                        "without a media decoder, which would refuse every media part). 0 serves text\n"
+                                        "only and keeps the tower off the card" },
     { "--image-gen-max-pixels", "N",    "an image generator's largest image, in pixels (1048576: 1024 x 1024).\n"
       "                              Default: the model's. Its per-image buffers, and the activation\n"
       "                              arena with them, are sized for it; larger requests are refused" },

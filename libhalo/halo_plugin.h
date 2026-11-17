@@ -171,6 +171,8 @@ int64_t halo_rad_attn_qrow_h128_gqa8_scratch(const RadArgs*);
  * row pitch, so they serve both attn_paged and attn_paged_qrow. */
 int     halo_rad_attn_window_h128_gqa1_bf16(const RadArgs*, RadStream);
 int     halo_rad_attn_window_h128_gqa1_fp8 (const RadArgs*, RadStream);
+int     halo_rad_attn_window_h128_gqa4_bf16(const RadArgs*, RadStream);
+int     halo_rad_attn_window_h128_gqa4_fp8 (const RadArgs*, RadStream);
 int     halo_rad_attn_window_h256_gqa1_bf16(const RadArgs*, RadStream);
 int     halo_rad_attn_window_h256_gqa1_fp8 (const RadArgs*, RadStream);
 int     halo_rad_attn_window_h256_gqa2_bf16(const RadArgs*, RadStream);

@@ -357,7 +357,7 @@ __device__ __forceinline__ void r4d_ar_twoshot_coded_body(
     int4* __restrict__ out4, unsigned int* __restrict__ seq_ctrs, int n16,
     int slot_stride16, int rank, int drain, int acq, int pub,
     long long* gate, unsigned int* gate_ctr) {
-  if (CHAIN) r4d_chain_wait();
+  if (CHAIN) r4d_chain_wait_vec();
   constexpr int NPEERS = WS - 1;
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;

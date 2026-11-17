@@ -43,8 +43,18 @@ extern "C" void rad_dev_host_wrote(void);
  * lets a chained kernel (named r4dchain*) wait in its prologue instead of behind the barrier bit.
  * Only on the AQL backend, whose queues keep the completion counter, and only where the model's
  * plugin measured a gain (RadArchProbe::chain_pays): with its drafter decoding speculatively, or
- * with and without one (rad_dev_chain_infer, from the engine before any row resolves). */
+ * with and without one (rad_dev_chain_infer, from the engine before any row resolves).
+ *
+ * rad_dev_chain_infer(2) says more: every chained form this engine can launch fences itself
+ * (RadKernelChainFn saying 2, abi/rad_abi.h). rad_dev_chain_unfenced then answers 1, and the
+ * backend issues a chained launch that has lost its barrier bit without the packet processor's
+ * acquire as well (aql.cpp, "the acquire of a chained launch"). */
 extern "C" int  rad_dev_chain_enabled(void);
+/* VRAM the runtime keeps resident as queue scratch on `props`' card once a kernel with a private
+ * segment has run (0 on the host backend and on unified memory). Charged to the VRAM budget with
+ * the hardware queues. */
+extern "C" int64_t rad_dev_resident_scratch_bytes(const RadDeviceProps* props);
+extern "C" int  rad_dev_chain_unfenced(void);
 extern "C" void rad_dev_chain_infer(int pays);
 
 /* One range of a ranged copy: `bytes` from source offset `src` to destination offset `dst`, all

@@ -54,6 +54,8 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Stable Diffusion XL bf16 and its finetunes (Illustrious, NoobAI, Pony): text to image, one card | `illustrious-xl-v2.0-bf16.rad` (6.4 GiB), from any single-file SDXL checkpoint | [convert](#convert-a-checkpoint) | — |
 | EmbeddingGemma 2 bf16: text, image, video and audio embeddings, one card | `embeddinggemma2-bf16.rad` (1.4 GiB) | [convert](#convert-a-checkpoint) | `tp1.yaml`, `tp2.yaml` |
 | nomic-embed-text-v2-moe bf16: text embeddings, one card | `nomic-embed-v2-moe-bf16.rad` (959 MB) | [convert](#convert-a-checkpoint) | — |
+| LiquidAI LFM3-1.7B IQ8R: rotated int8 trunk, bf16 head; text, tool calls and reasoning, one card | `lfm3-1.7b-iq8r.rad` (2.5 GiB) | [convert](#convert-a-checkpoint) with `data/recipes/lfm3-1.7b-iq8r.recipe` | — |
+| LiquidAI LFM3-1.7B bf16: text, tool calls and reasoning, one card | `lfm3-1.7b-bf16.rad` (3.8 GiB) | [convert](#convert-a-checkpoint) | — |
 | Meta Muse Glimmer 30B bf16: text, images and video; sliding-window rotary layers between NoPE full ones, a windowed ViT | `muse-glimmer-30b-bf16.rad` (56 GiB) | [convert](#convert-a-checkpoint) | — |
 | Meta Muse Glimmer 30B w4a8: int4 trunk, images and video, one card | `muse-glimmer-30b-w4a8.rad` (16 GiB) | [convert](#convert-a-checkpoint) | — |
 | Meta Muse Glimmer 30B IQ8R: rotated int8 trunk, int8 head, DFlash drafter, images and video | `muse-glimmer-30b-iq8r-dflash.rad` (36 GiB) | [download](https://huggingface.co/StillDeadcode/muse-glimmer-30b-iq8r-dflash) | — |

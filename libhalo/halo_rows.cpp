@@ -804,6 +804,9 @@ static const RadOperandSpec oKvLenTrim[] = {
 /* `prefetch` reads a weight's leading `bytes` into the cache and writes nothing (docs/OPS.md). */
 static const RadParamSpec pPrefetch[] = {
     { "bytes", RAD_P_INT, RAD_REQUIRED },
+    /* The workgroups reading, where the architecture measured its own count; absent or 0, the
+     * kernel's (its `nb` axis). */
+    { "blocks", RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oPrefetch[] = {
     { "w", RAD_OPD_WEIGHT, 0 },
@@ -2887,6 +2890,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,
            "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). `wadd` is GemmaRMSNorm's `1 +`, added in "
            "f32 after the load because forming it in bf16 first costs 0.3% per channel."),
+    SCHEMA("rmsnorm_rows", pRmsNorm, oRmsNorm,
+           "the same norm under its row-form name: a plugin written for libr4d's short-row launch "
+           "resolves here, and libhalo launches it as `rmsnorm` (byte-identical)."),
     SCHEMA("rmsnorm_p", pLayernorm, oUnary,
            "y = x * rsqrt(mean(x^2) + eps); an rmsnorm with NO gain tensor at all. Gemma's "
            "attention normalises the value with a bare RMS (a weightless ggml_rms_norm) and the "
@@ -3009,6 +3015,9 @@ static const RadOpSchema kSchemas[] = {
            "that follow are untouched. The multi-component modes (`mrope`, `imrope`, `axial`) "
            "take [C, M] component-major positions and `sections`; with [M] positions every "
            "component is that one, so mrope and imrope over a text batch are neox exactly."),
+    SCHEMA("rope_rows", pRope, oRope,
+           "the same rotation under its row-form name: a plugin written for libr4d's one-angle-a-"
+           "(token, pair) launch resolves here, and libhalo launches it as `rope` (byte-identical)."),
     SCHEMA("layernorm", pLayernorm, oLayernorm,
            "y = (x - mean) * rsqrt(var + eps) * w + b, biased variance, two passes. `b` optional."),
     SCHEMA("grid_embed", pGridEmbed, oGridEmbed,
@@ -3997,7 +4006,9 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
 /* The windowed kernels (halo_attn_paged_window.hip): head_dim 128, 256 and 512, 1/2/4/8 queries per
  * KV head, any window, causal or not. Gemma 4's sliding layers are h256/gqa2 with a 1024-token
  * window, its full layers h512 at gqa 8 (TP1/TP2), 4 (TP4) or 2 (TP8); h128/gqa1 is Unlimited-OCR's
- * MHA decoder. One kernel serves every q_len (splitting the key range when there are too few tiles
+ * MHA decoder; h128/gqa4 is LFM3 (full layers, and sliding ones with a 256-token window), whose
+ * decode band (q_len <= 16) stays on the h128/gqa4 decode leg, which ranks above these rows. One
+ * kernel serves every q_len (splitting the key range when there are too few tiles
  * to fill the card), so `q_len` cuts no band. `causal` and `window` are runtime fields; block_size
  * is derived: 16.
  *
@@ -4010,6 +4021,7 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
         C_GE("window", WMIN), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),                       \
     };
 HALO_WIN_C(cWinH128G1Bf16, 128, 1, "bf16", 0) HALO_WIN_C(cWinH128G1Fp8, 128, 1, "fp8_e4m3", 0)
+HALO_WIN_C(cWinH128G4Bf16, 128, 4, "bf16", 0) HALO_WIN_C(cWinH128G4Fp8, 128, 4, "fp8_e4m3", 0)
 HALO_WIN_C(cWinH256G1Bf16, 256, 1, "bf16", 0) HALO_WIN_C(cWinH256G1Fp8, 256, 1, "fp8_e4m3", 0)
 HALO_WIN_C(cWinH256G2Bf16, 256, 2, "bf16", 0) HALO_WIN_C(cWinH256G2Fp8, 256, 2, "fp8_e4m3", 0)
 HALO_WIN_C(cWinH256G4Bf16, 256, 4, "bf16", 1) HALO_WIN_C(cWinH256G4Fp8, 256, 4, "fp8_e4m3", 1)
@@ -5781,6 +5793,18 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, halo_rad_rmsnorm, nullptr, nullptr, nullptr,
   halo_shape_rmsnorm },
 
+/* rmsnorm under its row-form name (libr4d's rmsnorm_rows): the same launch, so a per-head q/k
+ * norm declared for the rows form has a device row on this part too. */
+{ "rmsnorm_rows_bf16", "rmsnorm_rows", "norm",
+  "root-mean-square norm with a gain, two passes over the row, under its row-form name",
+  "any n; the sum of squares accumulates in f32 and only the store narrows; byte-identical to "
+  "rmsnorm",
+  "bf16 y, x bf16 or (with a gain) f32, bf16 or f32 gain, fp32 reduction",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, halo_rad_rmsnorm, nullptr, nullptr, nullptr,
+  halo_shape_rmsnorm },
+
 { "rmsnorm_p_bf16", "rmsnorm_p", "norm",
   "weightless root-mean-square norm (no gain), two passes over the row",
   "any n; the sum of squares accumulates in f32 and only the store narrows",
@@ -6030,6 +6054,18 @@ static const RadKernelInfo kKernels[] = {
 
 { "rope_bf16", "rope", "attn",
   "rotary embedding in place, one thread a rotated pair",
+  "any head_dim; rotary_dim even and no wider than head_dim -- the frequency exponent divides by "
+  "rotary_dim, so a partial rotary is a complete rotation of its own width; neox, mrope (which is "
+  "neox over one position component) and gptj pairings",
+  "bf16 qkv, i32 positions, fp32 angles through the accurate sincosf",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cRopeRow), NOTUNE,
+  nullptr, nullptr, halo_rad_rope, nullptr, nullptr, nullptr,
+  halo_shape_rope },
+
+/* rope under its row-form name (libr4d's rope_rows): the same launch. */
+{ "rope_rows_bf16", "rope_rows", "attn",
+  "rotary embedding in place, one thread a rotated pair, under its row-form name",
   "any head_dim; rotary_dim even and no wider than head_dim -- the frequency exponent divides by "
   "rotary_dim, so a partial rotary is a complete rotation of its own width; neox, mrope (which is "
   "neox over one position component) and gptj pairings",
@@ -6788,7 +6824,7 @@ static const RadKernelInfo kKernels[] = {
 #define HALO_WIN_PAIR(HD, GQ)                                                                       \
     HALO_WIN_ROW(HD, GQ, bf16kv, bf16, cWinH##HD##G##GQ##Bf16, "bf16")                              \
     HALO_WIN_ROW(HD, GQ, fp8kv, fp8, cWinH##HD##G##GQ##Fp8, "fp8-e4m3 (per-(seq,head) descales)")
-HALO_WIN_PAIR(128, 1)
+HALO_WIN_PAIR(128, 1) HALO_WIN_PAIR(128, 4)
 HALO_WIN_PAIR(256, 1) HALO_WIN_PAIR(256, 2) HALO_WIN_PAIR(256, 4) HALO_WIN_PAIR(256, 8)
 HALO_WIN_PAIR(512, 1) HALO_WIN_PAIR(512, 2) HALO_WIN_PAIR(512, 4) HALO_WIN_PAIR(512, 8)
 #undef HALO_WIN_PAIR

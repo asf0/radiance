@@ -64,9 +64,68 @@ With `pos + 1 <= budget + ratio - 1 = 2051` visible tokens there are at most 512
 the top-k keeps all of them and the tail is always attended, so QSA equals dense causal attention
 bit for bit. Below the bound, a step with more than one query per sequence (prefill, mixed or
 speculative) issues dense attention, which reads each key once per query tile where the sparse
-path reads a table per query. Plain decode (one query per sequence) takes the sparse path at every
-context: there is no tile to amortise, and the sparse path stays exercised. The bound is the test
-for every change here (see "Checking").
+path reads a table per query. Plain decode (one query per sequence) takes the sparse row's launch
+at every context: there is no tile to amortise, and the sparse kernel stays exercised. The bound is
+the test for every change here (see "Checking").
+
+## Below the bound
+
+At or below the bound the selection does not depend on the scores: every complete block, in
+block order, then the partial page. So a step that is *entirely* at or below it scores and selects
+at most once for the whole pass, and where nothing reads a selection not at all. The attention
+block decides (`AttnGatedFP8::qsa_use`, `arch/common/rad_block_attn_gated_fp8.h`) and hands the
+answer to the indexer, which runs first (`QsaIndexer::step`'s `use`):
+
+| the step, at or below the bound | attention (unchanged) | the indexer issues |
+|---|---|---|
+| several rows a sequence, rounded bound within the budget (a chain verify, a head's history pass, prefill, mixed) | dense, over the block table | per layer: the projection, `qsa_work`, `qsa_block_key`, `qsa_tail_store` |
+| one row a sequence (plain decode, a serial head's round) | the sparse row's launch over the sequence's **block table** and `seqused` | the same four |
+| several rows a sequence, rounded bound past the budget (the same steps between 1025 and 2047 tokens) | the sparse row a query, over the selection | the first full-attention layer of the pass: everything, as before; every other layer: the same four |
+| anything past the bound, a streamed attention group, `RADIANCE_DEBUG_QSA_EAGER` | as before | everything, per layer |
+
+**The attention's kernel never moves.** Which kernel a step's attention runs is decided exactly as
+before (dense by the rounded bound, the sparse row otherwise): the dense and the sparse kernel read
+the same keys below the bound but sum them in another order, and a verify's rows feed the next
+step, so a different kernel at the same context is other text at a near-tie. Only *who makes*
+the selection changes, and it is byte for byte the selection each layer made for itself.
+
+**The stateful half always runs.** Block keys and the tail are what later steps score and build
+on; only the query side and the scoring are skipped.
+
+**The block table in place of the selection** is exact because of what `qsa_select` writes below
+the bound for a row at position `p` of a sequence whose context ends there: `sel` is the table's
+first `ceil((p + 1) / ratio)` entries and `seqused` is `p + 1`, the sequence's own. The launch is
+the same op and kernel (`attn_paged_gate_quant`, `q_len` 1), its split count does not read the
+table's width, and it sums pages in the same order, so the bytes are the selection's. It holds for
+a row that is alone in its sequence and at the context's last position, which the architecture
+vouches for (`qsa_table_rows`: a plain decode row and a serial head's round on Qwen4-Exp), and it
+is taken only when `max_q_len == 1`.
+
+**One selection a pass** (`kQsaOnce`) is exact because below the bound a row has at most `topk`
+complete blocks, so `qsa_select` takes every block whose key is not 0 -- any block with a page and
+a score that is a number -- and what it writes (the pages in block order, the partial page, the
+count, `seqused`) depends on the positions and the block table alone: every layer's scores give the
+same bytes. The first full-attention layer of the pass therefore issues its selection exactly as
+before (query, scores, `qsa_select`) and every later layer's attention reads that one; the later
+layers issue no query, no score and no select. `sel`, `nsel` and `seqused` are the model's buffers,
+live across its layers, and nothing else writes them. The MTP head has one such layer and so issues
+what it always did.
+
+One consequence is deliberate: a block whose score is not a number (a NaN block key) is dropped
+or kept for the whole pass as the first layer's score has it, and is always kept where no
+selection is made, as the dense attention always kept it.
+
+**Whether a step is within the bound is the group's exact ceiling.** `max_ctx_len` is rounded up to
+1024 tokens so a recorded pass replays (`core/sched/batch.cpp`, `bound_bucket`); by it a 4-row
+verify is "past" the budget from 1025 tokens of context on. `RadBatch::kv_used_max_h[group]` is the
+exact host ceiling of every row's `position + 1` (context plus this step's rows, the furthest a
+row issued ahead can be), and `qsa_within` reads it where the architecture's pass key carries
+which side of the bound it is on (`qsa_exact_host`; `qwen4exp_fp8.cpp`, `pass_key`). The cost is
+one more recording of each pass kind when a request crosses the bound.
+
+Per chain verify step of Qwen3.8-Flash-Next (12 QSA layers) this removes 36 launches up to 1024
+tokens of context and 33 from there to the bound, and 3 a head pass up to 1024 tokens (its rounds
+up to the bound).
 
 ## Attention over a selected set
 
@@ -203,6 +262,10 @@ with:
   form, and split against unsplit at bit identity on mostly-tied scores, so the tie rule decides;
 - **`RADIANCE_DEBUG_QSA`**: prints `nc`, `nsel`, `seqused` and the head of the table for the first
   few steps. `nc` above `topk` is intended dropping, not a divergence. It synchronises the stream.
+- **`RADIANCE_DEBUG_QSA_EAGER`**: every step scores and selects per layer, the issue sequence
+  before "Below the bound" existed (`tests/arch_test.cpp`'s pinned step hashes are the old ones
+  under it). Greedy text with and without it must be byte-identical, drafts included: at or below
+  the bound the two differ only in what is launched, never in a byte the attention reads.
 
 **Count the reach, not the prompt.** The bound is on the context each query sees, so a prompt a
 few tokens under it crosses the bound during decode and is expected to start differing there.

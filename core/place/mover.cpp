@@ -8,6 +8,7 @@
 #include "../device/device.h"
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -174,6 +175,12 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         cp.n_work = shadow + sc.n_stage;
         cp.n_turn = std::min<int64_t>(std::max(cfg.turnover_slots, 0),
                                       shadow * RAD_PLACE_TURNOVER_SLOTS / RAD_PLACE_SHADOW_SLOTS);
+        /* Under MoverConfig::turnover_adaptive the kept-free count starts at its floor: a fresh
+         * placement fills what it can at once, and the first burst of swaps lands in the shadow
+         * slots and these while balance() frees the rest. */
+        cp.turn_now = cfg.turnover_adaptive
+                          ? std::min<int64_t>(cp.n_turn, std::max(cfg.turnover_floor, 0))
+                          : cp.n_turn;
         total_turn += cp.n_turn;
         cp.slab.init(slab_slots, sc.stride);
         total_slab += slab_slots;
@@ -379,9 +386,10 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         republish(u);
     }
 
-    RAD_INFO("mover: %lld slab slots (%lld shadow, %lld more kept free out of a loan), %lld pinned "
-             "pool slots, %s static vram%s",
-             (long long)total_slab, (long long)total_shadow, (long long)total_turn,
+    RAD_INFO("mover: %lld slab slots (%lld shadow, %s%lld more kept free out of a loan%s), %lld "
+             "pinned pool slots, %s static vram%s",
+             (long long)total_slab, (long long)total_shadow, cfg.turnover_adaptive ? "up to " : "",
+             (long long)total_turn, cfg.turnover_adaptive ? " as swaps ask for them" : "",
              (long long)total_pool,
              humanb(static_bytes_).c_str(), file_.ok() ? ", file tier open" : "");
     /* The pageable region is charged to no budget, so this is the only place it is reported. */
@@ -1126,7 +1134,13 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 
         if (promote) {
             const int64_t slot = cp.slab.take();
-            if (slot < 0) { ++stats_.starved_slab; return false; }
+            if (slot < 0) {
+                ++stats_.starved_slab;
+                /* The slots kept free were too few for this step's swaps: all of them, for a
+                 * while (balance). */
+                if (cfg_.turnover_adaptive) turn_boost_ = kTurnBoost;
+                return false;
+            }
             if (promote_to(unit, slot) < 0) { cp.slab.add_free(slot); return false; }
             return true;
         }
@@ -1626,7 +1640,19 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
             if (unit_[(size_t)m.unit].klass != (int32_t)c || !cp.slab.covered(m.slab_slot)) continue;
             if (m.frees_slab()) ++pending;
         }
-        const int64_t turn = turnover ? cp.n_turn : 0;
+        if (cfg_.turnover_adaptive) {
+            /* Three steps of the mean swaps a step (a swap holds its slot about three steps,
+             * RAD_PLACE_TURNOVER_SLOTS), between the floor and the configured count; all of
+             * them while a starved promotion is recent. The mean is over every class, so a
+             * class keeps a little more than its own share asks for. */
+            const int64_t floor_ = std::min<int64_t>(cp.n_turn, std::max(cfg_.turnover_floor, 0));
+            const int64_t want = turn_boost_ > 0 ? cp.n_turn : std::min<int64_t>(
+                cp.n_turn, std::max<int64_t>(floor_, (int64_t)std::lround(3.0f * demand_mean_)));
+            cp.turn_now = want >= cp.turn_now ? want : std::max(want, cp.turn_now - kTurnShrink);
+        } else {
+            cp.turn_now = cp.n_turn;
+        }
+        const int64_t turn = turnover ? cp.turn_now : 0;
         int64_t short_by = cp.n_work + turn - (cp.slab.n_free() + pending);
         if (short_by > 0) {
             drop_cand_.clear();
@@ -1682,6 +1708,12 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
     }
     count_flex();
     return flush_moves();
+}
+
+void Mover::swap_demand(int64_t proposed) {
+    if (!cfg_.turnover_adaptive) return;
+    demand_mean_ += ((float)std::max<int64_t>(proposed, 0) - demand_mean_) / kTurnMean;
+    if (turn_boost_ > 0) --turn_boost_;
 }
 
 int Mover::idle_tick(HeatEngine* heat) {

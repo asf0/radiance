@@ -21,11 +21,15 @@
  *     an invalidation. A slot is rewritten one lap after it was last read, so a system-scope
  *     acquire is placed at least once per half lap; without it every kernel after the first lap
  *     reads its predecessor's arguments. Slots are 1 KiB so no argument fetch shares a cache line
- *     with the next slot;
+ *     with the next slot. No fence makes a write through the BAR arrive: the card's host data
+ *     path is flushed in front of every doorbell (host_writes_out);
  *   - host-written memory: the first dispatch after the host waits on any queue takes a
  *     system-scope acquire, since host writes for the next step follow such a wait;
  *   - copies touching host or peer memory carry the scope themselves, as do the barrier packets
  *     that implement events and synchronisation.
+ *
+ * A chained kernel that has lost its barrier bit may go without the acquire (see "the acquire of a
+ * chained launch"): it reads behind a wait in its own prologue, long after its packet's acquire.
  */
 #include "device.h"
 
@@ -225,6 +229,9 @@ struct Dev {
     bool        has_vram = false;
     uint32_t    kfd_id = 0;             /* the driver's gpu_id: its sysfs and ioctls name it so */
     bool        host_kargs = false;     /* no large BAR: the argument ring lives in host memory */
+    /* The card's host data path flush register (HSA_AMD_AGENT_INFO_HDP_FLUSH), where the host
+     * writes arguments into VRAM; see host_writes_out. */
+    volatile uint32_t* hdp_flush = nullptr;
 };
 
 struct Global {
@@ -441,6 +448,18 @@ bool init_devices() {
             RAD_INFO("device: card %d (%s) keeps kernel arguments in pinned host memory, as a "
                      "test asked", i, bus);
         }
+        if (!g.dev[(size_t)i].host_kargs) {
+            hsa_amd_hdp_flush_t hdp{};
+            if (hsa_agent_get_info(g.dev[(size_t)i].agent,
+                                   (hsa_agent_info_t)HSA_AMD_AGENT_INFO_HDP_FLUSH,
+                                   &hdp) == HSA_STATUS_SUCCESS)
+                g.dev[(size_t)i].hdp_flush = hdp.HDP_MEM_FLUSH_CNTL;
+            if (!g.dev[(size_t)i].hdp_flush)
+                RAD_WARN("device: card %d (%s) gives no host data path flush register, so a kernel "
+                         "may start before the arguments written for it through the BAR have "
+                         "reached VRAM; chained launches keep the packet processor's acquire, "
+                         "which leaves them the time they had", i, bus);
+        }
     }
     /* Without the handler a fault falls back to the runtime's own handling, which the
      * memory-fault report below replaces; warn at startup. */
@@ -600,6 +619,7 @@ struct Stream {
     hsa_queue_t*    q = nullptr;
     uint64_t        mask = 0;
     char*           karg = nullptr;           /* VRAM the CPU writes through the BAR, or host memory */
+    volatile uint32_t* hdp = nullptr;         /* Dev::hdp_flush where `karg` is VRAM */
     std::atomic<bool> busy{false};
     uint64_t        wr = 0;                   /* next packet index */
     uint64_t        rd = 0;                   /* last read index seen */
@@ -1093,10 +1113,39 @@ inline int reserve(Stream* s, uint64_t* out) {
     return RAD_OK;
 }
 
+/* What the host wrote for the card, on its way before the packets that read it are announced.
+ *
+ * An argument slot in VRAM is written through the BAR: the bytes sit in the processor's
+ * write-combining buffers until a store fence, and behind the link in the card's host data path,
+ * which hands them on to memory in its own time unless it is told to flush. Nothing orders that
+ * against the doorbell. A kernel the card starts soon enough after its packet was announced
+ * reads the slot as the launch a lap of the ring before left it: first its chain record, which
+ * it obeys (an old target, so no wait) or does not accept (so it counts nothing and the chained
+ * launch behind it waits for good), then, behind its wait, its arguments.
+ *
+ * On an R9700 "soon enough" is a microsecond or two. The packet processor's acquire holds a
+ * launch 0.9 us and an ordered launch waits for the kernel in front, which is all that kept
+ * launches from it; a chained launch whose packet goes without the acquire starts that much
+ * sooner behind its doorbell. Runs of fourteen 256 KiB card-side copies issued one by one that
+ * way: back to back, six runs in nine of 300 000 ended with a unit moved by another launch's
+ * arguments; with the host quiet for 50 us behind each doorbell the queue stalled in its first
+ * lap, four runs in four, on either card. With the flush below neither happened (fourteen runs
+ * and four), nor did it with the acquire on the packets, with plain launches, or with a 2 us
+ * pause in front of each doorbell.
+ *
+ * The register is the driver's (HSA_AMD_AGENT_INFO_HDP_FLUSH, the remapped page it gives a
+ * process for this), and the store travels the link behind the slot's bytes and in front of the
+ * doorbell's: the order the driver's own submissions use. It goes in front of every doorbell, a
+ * chained launch's or not: no launch was ordered against the write. */
+inline void host_writes_out(Stream* s) {
+    _mm_sfence();
+    if (s->hdp) *s->hdp = 1;
+}
+
 inline void publish(Stream* s, uint64_t idx, uint16_t header, uint16_t setup) {
     s->wr = idx + 1;
     hsa_queue_store_write_index_relaxed(s->q, idx + 1);
-    _mm_sfence();                       /* the argument slot, written before the header */
+    host_writes_out(s);                 /* the argument slot, in VRAM before the header */
     __atomic_store_n(reinterpret_cast<uint32_t*>(
                          static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) +
                          (idx & s->mask)),
@@ -1136,6 +1185,9 @@ struct TapeRec {
     uint8_t  chain = 0;
     /* A collective's launch (a_peer_launch). */
     uint8_t  peer = 0;
+    /* A chained kernel whose library acquires for it in the kernel (chain_bare): played without
+     * its barrier bit, its packet takes no acquire from the packet processor. */
+    uint8_t  bare = 0;
 };
 
 struct Tape {
@@ -1156,12 +1208,13 @@ inline bool capturing() { return t_tape && t_tape_pause == 0; }
 
 /* A dispatch just written at `p` on `s`, with its argument block `ka`. */
 void tape_note_dispatch(Stream* s, const hsa_kernel_dispatch_packet_t* p, uint16_t setup,
-                        const unsigned char* ka, uint32_t n, uint8_t fence, bool chain) {
+                        const unsigned char* ka, uint32_t n, uint8_t fence, bool chain, bool bare) {
     Tape* t = t_tape;
     TapeRec r;
     r.kind = kTapeDispatch;
     r.fence = fence;
     r.chain = chain ? 1 : 0;
+    r.bare = chain && bare ? 1 : 0;
     r.peer = t_peer ? 1 : 0;
     r.s = s;
     r.pkt = *p;
@@ -1182,19 +1235,75 @@ inline uint16_t header(hsa_packet_type_t type, int acq, int rel, bool barrier = 
                       (rel << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE));
 }
 
-/* Whether the packet at `idx` must acquire at system scope, and the bookkeeping if it does. */
-inline int acquire_scope(Stream* s, uint64_t idx, bool forced) {
+/* Whether the packet at `idx` must acquire at system scope, and the bookkeeping if it does.
+ * `*asked` says the acquire is one the argument ring's half lap, a host write or the caller asks
+ * for, at whichever scope it comes back, and not the agent scope every dispatch takes besides. */
+inline int acquire_scope(Stream* s, uint64_t idx, bool forced, bool* asked) {
     const uint64_t ep = G().host_epoch.load(std::memory_order_acquire);
     const bool lap = (int64_t)idx - s->last_sys_acq >= (int64_t)(kQueuePackets / 2);
-    if (forced || lap || s->epoch != ep) {
+    *asked = forced || lap || s->epoch != ep;
+    if (*asked) {
         s->last_sys_acq = (int64_t)idx;
         s->epoch = ep;
-        /* The prefetch stream reads nothing the host writes; a system acquire there would only
-         * invalidate the L2 under the compute stream. */
-        if (s->agent_only && !forced) return HSA_FENCE_SCOPE_AGENT;
+        /* The prefetch stream reads no data the host writes, so a host write or epoch does not
+         * make it acquire at system scope (that would only invalidate the L2 under the compute
+         * stream). Its own kernel arguments are host-written into its ring like any stream's,
+         * though: after the ring laps, an agent-scope acquire leaves the slot's old line in the
+         * L2 and a launch could run with the previous lap's arguments. The half lap keeps the
+         * system acquire: one in 2048 prefetch launches. */
+        if (s->agent_only && !forced && !lap) return HSA_FENCE_SCOPE_AGENT;
         return HSA_FENCE_SCOPE_SYSTEM;
     }
     return HSA_FENCE_SCOPE_AGENT;
+}
+
+/* The acquire of a chained launch.
+ *
+ * A packet's acquire runs when the packet processor launches the kernel. A chained kernel that has
+ * lost its barrier bit is launched ahead and reads nothing then: it reads behind the wait in its
+ * prologue, once the launches in front have written, and acquires there itself. The packet's
+ * acquire guards nothing it reads, and the packet processor launches nothing else while it runs
+ * one. Measured on an R9700, a chain of small dependent kernels issued behind a gate: 2.1 us a
+ * launch with the agent-scope acquire, 1.2 us without (system scope costs what agent scope does;
+ * the same hand-over inside one persistent kernel, with no launch between, 0.3 to 0.6 us). In a
+ * pass that is time on the path only where a dependent launch reaches the card after the kernel
+ * it waits for has ended: ~65 of a Qwen3.8-Flash-Next verify pass's 664 dependent launches, the
+ * delta net's update behind its two overlapped launches first among them.
+ *
+ * The acquire did one thing by the way, for every kernel on the card: it emptied the scalar data
+ * cache. No fence a compiler puts in a kernel does (an agent-scope acquire is a global_inv: the
+ * vector caches), and a load whose address every lane shares is often a scalar one: a row's
+ * scale, a routing count, the activation a head reads. A chained form that reads such a value
+ * where the launch in front wrote it finds what an earlier launch read from that address, unless
+ * a later packet's acquire happened to fall in between. With an acquire on every packet it nearly
+ * always had (one launch in 1800 read stale in a probe of 1024-block readers); without, 1797 in
+ * 1800 did, and the model's text changed. So the acquire goes only where every chained form the
+ * engine can launch empties that cache itself behind its wait (RadKernelChainFn saying 2,
+ * rad_dev_chain_unfenced; `s_dcache_inv` in r4d_chain.h and chain_kernel.h), which also closes
+ * the window the fenced packets leave.
+ *
+ * What stays as it was: the release (dropping it as well measured nothing), a packet that keeps
+ * its bit, a plain kernel, every barrier packet, and every acquire acquire_scope asks for: the
+ * argument ring's half lap, the first dispatch after a host wait, a copy over the link. Those
+ * guard what the kernel reads of its own slot, its arguments and chain record, which the host
+ * wrote where some launch read a lap ago and which the L2 would still hold; they are kept at
+ * whichever scope they come. The prefetch stream keeps the acquire on every packet, as before:
+ * its half-lap acquire is an agent-scope one, and nothing waits for its launches.
+ *
+ * The acquire did a second thing by the way: it held the launch until the slot the host had
+ * just written was in VRAM, which nothing else saw to (host_writes_out). A first cut of this
+ * change, without the flush there, stopped a server once: a chained card-side copy on a card's
+ * second queue never finished, and the queue stood on it with 14 packets written behind. So a
+ * card whose arguments are in VRAM and that gives no flush register keeps the acquire on its
+ * chained launches. RADIANCE_AQL_CHAIN_FENCE=1 keeps it on every chained launch, to rule this
+ * out. */
+inline bool chain_bare(const Stream* s) {
+    static const bool keep = [] {
+        const char* e = std::getenv("RADIANCE_AQL_CHAIN_FENCE");
+        return e && *e == '1';
+    }();
+    if (keep || s->agent_only || rad_dev_chain_unfenced() == 0) return false;
+    return s->hdp != nullptr || G().dev[(size_t)s->ord].host_kargs;
 }
 
 /* Collectives on a shared card.
@@ -1314,20 +1423,27 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     const bool chain = k->chained && rad_dev_chain_enabled() && s->chain_ctr &&
                        n <= RAD_CHAIN_KARG_OFF;
     if (k->chained) chain_record(s, slot, chain, s->chain_issued);
-    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain);
+    const bool bare = chain && chain_bare(s);
+    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain, bare);
     /* Attach the ride after the tape copied the packet: a recorded packet carries no signal, and
      * a play attaches whichever ride is pending then (PlayRun::put). */
     if (s->ride.handle) {
         p->completion_signal = s->ride;
         s->ride.handle = 0;
     }
-    const int acq = acquire_scope(s, idx, (fence & kFenceAcquireSystem) != 0);
+    bool asked = false;
+    const int acq = acquire_scope(s, idx, (fence & kFenceAcquireSystem) != 0, &asked);
     const int rel = (fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
     /* Behind another chained kernel a chained one waits in its prologue; a completion signal keeps
      * the bit, since its completion must cover everything before it. */
     const bool keep = !(chain && s->prev_chained && !s->plain_inflight && !p->completion_signal.handle &&
                         !(s->peer_inflight && card_shared(s)));
-    publish(s, idx, header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, keep), setup);
+    /* Without the bit, a kernel that acquires for itself takes none from the packet processor,
+     * unless the ring or the host asked for this one. */
+    publish(s, idx,
+            header(HSA_PACKET_TYPE_KERNEL_DISPATCH,
+                   bare && !keep && !asked ? HSA_FENCE_SCOPE_NONE : acq, rel, keep),
+            setup);
     s->chain_frontier = s->chain_issued;
     s->frontier_open = !keep;
     if (chain) s->chain_issued += blocks_of(p);
@@ -1372,6 +1488,9 @@ struct PlayRun {
 
     void ring() {
         if (!unrung) return;
+        /* The chained records' argument slots (put) are VRAM the packets read as soon as they
+         * are announced. */
+        host_writes_out(s);
         hsa_queue_store_write_index_relaxed(s->q, next);
         hsa_signal_store_relaxed(s->q->doorbell_signal, (hsa_signal_value_t)(next - 1));
         unrung = 0;
@@ -1448,7 +1567,8 @@ struct PlayRun {
                 chain_record(s, slot, true, dependent ? s->chain_issued : s->chain_frontier);
             }
         }
-        const int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
+        bool asked = false;
+        const int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0, &asked);
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         if (rel < rel_min) rel = rel_min;
         /* A dispatch carrying a record keeps the bit: its completion must cover everything before
@@ -1467,7 +1587,12 @@ struct PlayRun {
             stamp->ordered = ordered;
             stamp->chained = chain;
         }
-        const uint16_t h = header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, ordered);
+        /* Without the bit, a kernel that acquires for itself takes none from the packet
+         * processor, unless the ring or the host asked for this one (see "the acquire of a
+         * chained launch"). */
+        const uint16_t h = header(HSA_PACKET_TYPE_KERNEL_DISPATCH,
+                                  chain && r.bare && !ordered && !asked ? HSA_FENCE_SCOPE_NONE : acq,
+                                  rel, ordered);
         __atomic_store_n(reinterpret_cast<uint32_t*>(p), (uint32_t)h | ((uint32_t)r.pkt.setup << 16),
                          __ATOMIC_RELEASE);
         foreign = false;
@@ -1795,6 +1920,7 @@ int a_stream_create(RadStream* out, int high_priority) {
         return RAD_E_DEVICE;
     }
     s->karg = static_cast<char*>(ka);
+    s->hdp = d.host_kargs ? nullptr : d.hdp_flush;
     s->chain_ctr = reinterpret_cast<uint64_t*>(s->karg + (size_t)(s->mask + 1) * kKargSlot);
     *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) = 0;
     _mm_sfence();
@@ -4651,6 +4777,32 @@ bool ride_reusable(void* token) {
     std::lock_guard<std::mutex> lk(pool().mu);
     return reusable(g);
 }
+
+int chain_probe(void* stream, unsigned* x, unsigned* seen, unsigned pairs, unsigned blocks) {
+    if (!ours(stream) || !x || !seen) return RAD_E_INVAL;
+    for (unsigned i = 0; i < pairs; ++i)
+        if (rad_aql_probe_store(x, i + 1u, stream) < 0 ||
+            rad_aql_probe_load(x, seen + (size_t)i * blocks, blocks, stream) < 0)
+            return RAD_E_DEVICE;
+    return RAD_OK;
+}
+
+int chain_asks(void* stream, const void* src, void* dst, uint64_t bytes, unsigned* seen, unsigned n) {
+    Stream* s = ours(stream);
+    if (!s || !src || !dst || !seen || !s->chain_ctr || bytes == 0 || (bytes & 15)) return RAD_E_INVAL;
+    for (unsigned i = 0; i < n; ++i)
+        if (rad_aql_probe_ask(src, dst, bytes, seen, i + 1u,
+                              reinterpret_cast<unsigned long long*>(s->chain_ctr), stream) < 0)
+            return RAD_E_DEVICE;
+    return RAD_OK;
+}
+
+int chain_marks(void* stream, unsigned* seen, unsigned n) {
+    if (!ours(stream) || !seen) return RAD_E_INVAL;
+    for (unsigned i = 0; i < n; ++i)
+        if (rad_aql_probe_mark(seen, i + 1u, stream) < 0) return RAD_E_DEVICE;
+    return RAD_OK;
+}
 }  // namespace aql
 
 size_t aql_code_registered(void) { return a_code_mark(); }
@@ -4961,8 +5113,11 @@ hipError_t hipPeekAtLastError(void) {
 
 namespace rad {
 namespace aql {
-/* A build without the AQL backend hands out no ride. */
+/* A build without the AQL backend hands out no ride and launches no chain. */
 bool ride_reusable(void*) { return false; }
+int chain_probe(void*, unsigned*, unsigned*, unsigned, unsigned) { return RAD_E_UNSUPPORTED; }
+int chain_marks(void*, unsigned*, unsigned) { return RAD_E_UNSUPPORTED; }
+int chain_asks(void*, const void*, void*, uint64_t, unsigned*, unsigned) { return RAD_E_UNSUPPORTED; }
 }  // namespace aql
 }  // namespace rad
 

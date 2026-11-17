@@ -407,7 +407,7 @@ __device__ __forceinline__ void hc_enter_body(HC_ENTER_PARAMS) {
 template <class CH>
 __global__ __launch_bounds__(kThreads)
 void hc_enter_kernel(HC_ENTER_PARAMS) {
-    if (CH::on) r4d_chain_wait();
+    if (CH::on) r4d_chain_wait_vec();
     hc_enter_body(x, h, rows, n, hc, xrow, hrow);
     if (CH::on) r4d_chain_done();
 }
@@ -2170,7 +2170,7 @@ void hc_read_fused_kernel(const unsigned short* __restrict__ h, const float* __r
                           long qrow, long srow, long rqrow, long rsrow, float wadd,
                           unsigned int* __restrict__ sync,
                           unsigned na, unsigned gxa, unsigned gxb, unsigned nb_all) {
-    if (CH::on) r4d_chain_wait();
+    if (CH::on) r4d_chain_wait_vec();
     __shared__ unsigned s_ticket;
     if (threadIdx.x == 0)
         s_ticket = __hip_atomic_fetch_add(&sync[0], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -3076,7 +3076,7 @@ void hc_norm_down_tiled_kernel(const unsigned short* __restrict__ h, const float
                                long kc, float wadd, unsigned int* __restrict__ ctr,
                                unsigned int* __restrict__ sync, float eps,
                                unsigned nn, unsigned gdx, unsigned gdy, unsigned gdz) {
-    if (CH::on) r4d_chain_wait();
+    if (CH::on) r4d_chain_wait_vec();
     __shared__ unsigned s_ticket;
     if (threadIdx.x == 0)
         s_ticket = __hip_atomic_fetch_add(&sync[0], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -3696,7 +3696,7 @@ __device__ __forceinline__ void hc_up_mix_tiled_body(HC_UMT_PARAMS) {
 template <int RT, int NT, bool F8, bool I8, class CH>
 __global__ __launch_bounds__(kThreads)
 void hc_up_mix_tiled_kernel(HC_UMT_PARAMS) {
-    if (CH::on) r4d_chain_wait();
+    if (CH::on) r4d_chain_wait_vec();
     hc_up_mix_tiled_body<RT, NT, F8, I8>(upv, uld, dbuf, h, w, scalein, x, q, qs, rq, rqs, ctr,
                                          rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow,
                                          wadd);
@@ -4761,7 +4761,7 @@ __device__ __forceinline__ void mtp_enter_tiled_body(MTP_ENTER_TILED_PARAMS) {
 template <int RT, int NT, bool F8, class CH, int KT = kTKT>
 __global__ __launch_bounds__(kThreads)
 void mtp_enter_tiled_kernel(MTP_ENTER_TILED_PARAMS) {
-    if (CH::on) r4d_chain_wait();
+    if (CH::on) r4d_chain_wait_vec();
     mtp_enter_tiled_body<RT, NT, F8, KT>(h, e, wh, we, fchv, fcev, fld, x, rows, n, hc, flat, eps, wadd, hrow, erow, xrow);
     if (CH::on) r4d_chain_done();
 }

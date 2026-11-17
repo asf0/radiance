@@ -1022,6 +1022,9 @@ void Engine::tiering_dispatch(Rank& r, int step) {
      * credited; the next unstaged step swaps on them. */
     std::vector<Swap> swaps;
     if (!r.stager.staged() && r.heat.step(&swaps) < 0) return;
+    /* What the turnover slots follow (MoverConfig::turnover_adaptive). A staged step proposes
+     * nothing and holds the turnover filled anyway (below), so it is not a quiet step. */
+    if (!r.stager.staged()) r.mover.swap_demand((int64_t)swaps.size());
     for (const Swap& s : swaps) {
         /* Contract: every proposed unit is busy until `issue` takes it or `abandon` returns it;
          * a dropped proposal stays busy forever. */

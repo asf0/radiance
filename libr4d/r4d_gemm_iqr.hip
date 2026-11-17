@@ -364,7 +364,7 @@ __global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
 void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restrict__ XS,
                     uint16_t* __restrict__ Y, uint32_t N, uint32_t M, uint32_t x_ld, uint32_t xs_ld,
                     GatedOut go) {
-    if (CH::on) r4d_chain_wait();
+    if (CH::on) r4d_chain_wait_vec();
     using D = Dec<F>;
     static_assert(!GATED || NT == 1u, "the gated form serves one token tile");
     constexpr bool BIAS = F::SC == kRowF32;
@@ -754,7 +754,7 @@ __device__ __forceinline__ void iqr_m64_body(R4D_IQR_M64_PARAMS) {
 template <class F, uint32_t NT, uint32_t MW, class CH>
 __global__ __launch_bounds__(MW * kWave) R4D_WAVES(MW >= 8u ? 4u : 6u)
 void iqr_m64_kernel(R4D_IQR_M64_PARAMS) {
-    if (CH::on) r4d_chain_wait();
+    if (CH::on) r4d_chain_wait_vec();
     iqr_m64_body<F, NT, MW>(c0, Bp, Sb, Y, C, Ctr, rows, cols, nb, b_ld, sb_ld, ck);
     if (CH::on) r4d_chain_done();
 }

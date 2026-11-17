@@ -2117,7 +2117,7 @@ static MoeScaleGrid moe_scale_grid(const RadParam* p, int n_p, int64_t g) {
     if (is("fp8a8") || is("fp8a8f32")) return { g, g };
     if (is("mxfp4a8")) return { 1, 32 };
     if (is("w4a8") || is("w4a8h") || is("w4nla8h")) return { 1, g };
-    if (is("w4nl64a8h") || is("w5nl64a8h")) return { 1, g / 2 };
+    if (is("w4nl64a8h") || is("w5nl64a8h") || is("w6nl64a8h")) return { 1, g / 2 };
     if (is("w4nl32a8h")) return { 1, g / 4 };
     if (is("i8a8") || is("i8a8h") || is("w4a8i8") || is("w4a8i8h")) return { 1, g };
     if (is("w4nl64a8i8h")) return { 1, g / 2 };

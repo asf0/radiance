@@ -154,6 +154,7 @@ struct Plugin {
     void (*mla_stats)(unsigned long long*) = nullptr;
     void (*pin_mla_rows)(int) = nullptr;
     void (*pin_late_push)(int) = nullptr;
+    void (*pin_ar_form)(int) = nullptr;
     int (*record)(const void**, int) = nullptr;
     void (*ar8_settings)(const R4DAr8Settings*) = nullptr;
 };
@@ -226,6 +227,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
     okall &= sym(pl->h, "r4d_mla_rows_pin_form", &pl->pin_mla_rows);
     okall &= sym(pl->h, "r4d_ar_late_push_pin", &pl->pin_late_push);
+    okall &= sym(pl->h, "r4d_ar_form_pin", &pl->pin_ar_form);
     okall &= sym(pl->h, "r4d_record_dispatches", &pl->record);
     okall &= sym(pl->h, "r4d_ar8_test_settings", &pl->ar8_settings);
     ScopedAr8::apply = pl->ar8_settings;
@@ -2327,15 +2329,15 @@ static Planes nl_planes(const std::vector<float>& w, int64_t N, int64_t K, int64
  * the stored scale. Planes: codes, scale (E4M3 [1 x gs]), scale.1 (f32 constant), table. With
  * `w5`, w5nl64a8h's: u5 codes into kW5nlTable, whose largest entry is 30. */
 static Planes nl64_planes(const std::vector<float>& w, int64_t N, int64_t K, int64_t gs = 64,
-                          bool w5 = false) {
-    const float* tab = w5 ? kW5nlTable : kW4nlTable;
-    const int nt = w5 ? 32 : 16;
-    const float top = w5 ? 30.0f : 22.0f;
+                          int w5 = 0) {
+    const float* tab = w5 == 2 ? kW6nlTable : w5 ? kW5nlTable : kW4nlTable;
+    const int nt = w5 == 2 ? 64 : w5 ? 32 : 16;
+    const float top = w5 == 2 ? 64.0f : w5 ? 30.0f : 22.0f;
     Planes p;
     rad_enc_clear(&p.enc);
     rad_enc_copy_str(p.enc.scheme, "affine");
     rad_enc_copy_str(p.enc.transform, "fwht128");
-    rad_enc_add_plane(&p.enc, "codes", w5 ? RAD_U5 : RAD_U4, 1, 1);
+    rad_enc_add_plane(&p.enc, "codes", w5 == 2 ? RAD_U6 : w5 ? RAD_U5 : RAD_U4, 1, 1);
     rad_enc_add_plane(&p.enc, "scale", RAD_F8E4M3, 1, gs);
     rad_enc_add_plane(&p.enc, "scale.1", RAD_F32, 0, 0);
     rad_enc_add_table(&p.enc, "table", RAD_F32, 1, nt);
@@ -2362,7 +2364,8 @@ static Planes nl64_planes(const std::vector<float>& w, int64_t N, int64_t K, int
                     int best = 0;
                     for (int c = 1; c < nt; ++c)
                         if (std::fabs(u - tab[c]) < std::fabs(u - tab[best])) best = c;
-                    rad_store_code(p.data[0].data() + n * crow, w5 ? RAD_U5 : RAD_U4,
+                    rad_store_code(p.data[0].data() + n * crow,
+                                   w5 == 2 ? RAD_U6 : w5 ? RAD_U5 : RAD_U4,
                                    g * 128 + h * gs + j, best);
                 }
             }
@@ -17254,7 +17257,7 @@ static void dsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
  * Every form (run-aligned prefill, (tile, run) decode, uniform prefill grid) runs on the same bytes
  * and must match the first byte for byte, since all keep each element's accumulation order. */
 static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512, int64_t top_k = 10,
-                     int pool_pct = 0) {
+                     int pool_pct = 0, bool w6_only = false) {
     if (iters <= 0) iters = 20;
     const RadKernelInfo* r = find(pl, "moe_gemm_w4a8");
     if (!r) { std::printf("--perfmoe: row moe_gemm_w4a8 absent\n"); return; }
@@ -17287,9 +17290,10 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         sorted.insert(sorted.end(), by_e[(size_t)e].begin(), by_e[(size_t)e].end());
         rmin = std::min(rmin, n); rmax = std::max(rmax, n); rows_c[e & 1] += n;
     }
-    std::printf("moe_gemm_w4a8 at a %lld-token chunk: Tr=%lld routed rows over %lld experts, a run "
-                "%lld..%lld rows (mean %.1f), %d launches\n", (long long)Mtok, (long long)Tr,
-                (long long)E, (long long)rmin, (long long)rmax, (double)Tr / (double)E, iters);
+    std::printf("%s at a %lld-token chunk: Tr=%lld routed rows over %lld experts, a run "
+                "%lld..%lld rows (mean %.1f), %d launches\n", w6_only ? "W5NL/W6NL down" : "moe_gemm_w4a8",
+                (long long)Mtok, (long long)Tr, (long long)E, (long long)rmin, (long long)rmax,
+                (double)Tr / (double)E, iters);
 
     void* d_s = dalloc((size_t)Tr * 4);
     void* d_o = dalloc((size_t)(E + 1) * 4);
@@ -17302,8 +17306,9 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
     /* Form 4, where pinnable, is the decode form at two 128-wide K blocks per pass (the timing
      * kMoeGuFk256Rows is set from). Only gate_up has it (K a multiple of 256 and a format that
      * folds scale groups); elsewhere it runs as form 2. */
-    const int nforms = pl.pin_moe ? (pl.pin_fk ? 4 : 3) : 1;
+    const int nforms = (pl.pin_moe ? (pl.pin_fk ? 4 : 3) : 1) + (w6_only && pl.pin_moe ? 1 : 0);
     for (const Proj& P : projs) {
+        if (w6_only && !P.srt) continue;
         const int64_t N = std::max(P.N0, P.N1), K = std::max(P.K0, P.K1), kb = K / group;
         const int64_t Ma = P.srt ? Tr : Mtok;
         const int64_t nec[2] = { E / 2, E / 2 };
@@ -17371,8 +17376,23 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             d_ws[c] = dalloc(wsc.size() * 2);
             st_memcpy(d_ws[c], wsc.data(), wsc.size() * 2, hipMemcpyHostToDevice);
         }
+        /* A separate six-bit allocation: do not overread the five-bit experts. Its independent
+         * deterministic generator also leaves the pre-existing benchmark's RNG stream alone. */
+        void* d_w6[2] = { nullptr, nullptr };
+        if (w6_only) for (int c = 0; c < 2; ++c) {
+            const size_t bytes = (size_t)(nec[c] * Nc[c] * Kc[c] / 8 * 6);
+            d_w6[c] = dalloc(bytes);
+            hb.resize(bytes);
+            uint64_t seed = 0xd1b54a32d192ed03ull ^ (uint64_t)c;
+            for (size_t i = 0; i < bytes; ++i) {
+                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                hb[i] = (uint8_t)seed;
+            }
+            if (d_w6[c]) st_memcpy(d_w6[c], hb.data(), bytes, hipMemcpyHostToDevice);
+        }
         void* d_y = dalloc((size_t)(Tr * N * 2));
-        if (!d_s || !d_o || !d_a || !d_as || !d_w[0] || !d_w[1] || !d_ws[0] || !d_ws[1] || !d_y) {
+        if (!d_s || !d_o || !d_a || !d_as || !d_w[0] || !d_w[1] || !d_ws[0] || !d_ws[1] || !d_y ||
+            (w6_only && (!d_w6[0] || !d_w6[1]))) {
             std::printf("  alloc failed\n");
             return;
         }
@@ -17409,6 +17429,9 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         }
         const double flop = 2.0 * ((double)rows_c[0] * P.N0 * P.K0 + (double)rows_c[1] * P.N1 * P.K1);
         const double welems = (double)nec[0] * P.N0 * P.K0 + (double)nec[1] * P.N1 * P.K1;
+        double live_welems = 0;
+        if (w6_only) for (int64_t e = 0; e < E; ++e)
+            if (!by_e[(size_t)e].empty()) live_welems += (double)Nc[e & 1] * Kc[e & 1];
         std::vector<uint16_t> first((size_t)(Tr * N)), got((size_t)(Tr * N));
         /* Every scale grid over the same bytes: w4a8h's bf16 per (row, 128 of K), w4nl64a8h's two
          * E4M3 per 128 and w4nl32a8h's four (timing only the extra accumulators and fold), and
@@ -17418,16 +17441,17 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
          * activation bytes, the int8 levels and the iu8 WMMA. The five-bit form has no such row. */
         const RadKernelInfo* r8 = find(pl, "moe_gemm_w4a8i8");
         for (int a8 = 0; a8 < (r8 ? 2 : 1); ++a8)
-        for (const int sub : { 1, 2, 4, 5 }) {
-        const bool g64 = sub > 1, w5 = sub == 5;
-        if (w5 && (a8 || d_tab[0] || d_tab[1])) continue;
+        for (const int sub : { 1, 2, 4, 5, 6 }) {
+        const bool g64 = sub > 1, w5 = sub == 5, w6 = sub == 6;
+        if ((w6_only && !w5 && !w6) || (!w6_only && w6)) continue;
+        if ((w5 || w6) && (a8 || d_tab[0] || d_tab[1])) continue;
         const RadKernelInfo* ra = a8 ? r8 : r;
         ts[0] = T(d_a, a8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3, { Ma, K });
-        const int64_t sg = w5 ? 2 : sub;
-        ts[2] = T(d_tab[0] ? d_tab[0] : d_w[0], w5 ? R4D_DT_MOEW5 : R4D_DT_MOEW4,
-                  { nec[0], P.N0, P.K0 });
-        ts[6] = T(d_tab[1] ? d_tab[1] : d_w[1], w5 ? R4D_DT_MOEW5 : R4D_DT_MOEW4,
-                  { nec[1], P.N1, P.K1 });
+        const int64_t sg = (w5 || w6) ? 2 : sub;
+        ts[2] = T(w6 ? d_w6[0] : d_tab[0] ? d_tab[0] : d_w[0],
+                  w6 ? R4D_DT_MOEW6 : w5 ? R4D_DT_MOEW5 : R4D_DT_MOEW4, { nec[0], P.N0, P.K0 });
+        ts[6] = T(w6 ? d_w6[1] : d_tab[1] ? d_tab[1] : d_w[1],
+                  w6 ? R4D_DT_MOEW6 : w5 ? R4D_DT_MOEW5 : R4D_DT_MOEW4, { nec[1], P.N1, P.K1 });
         if (d_tab[0]) ts[2].stride[0] = 0;
         if (d_tab[1]) ts[6].stride[0] = 0;
         ts[3] = g64 ? T(d_ws[0], RAD_F8E4M3, { nec[0], P.N0, sg * P.K0 / group })
@@ -17435,16 +17459,19 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         ts[7] = g64 ? T(d_ws[1], RAD_F8E4M3, { nec[1], P.N1, sg * P.K1 / group })
                     : T(d_ws[1], RAD_BF16, { nec[1], P.N1, P.K1 / group });
         ps.back().sval = a8 ? (sub == 4 ? "w4nl32a8i8h" : g64 ? "w4nl64a8i8h" : "w4a8i8h")
-                            : w5 ? "w5nl64a8h" : sub == 4 ? "w4nl32a8h" : g64 ? "w4nl64a8h" : "w4a8h";
-        const double wbytes = welems * (w5 ? 0.625 : 0.5);
-        const std::string pname = std::string(P.name) + (w5 ? " w5" : sub == 4 ? " g32"
+                            : w6 ? "w6nl64a8h" : w5 ? "w5nl64a8h" : sub == 4 ? "w4nl32a8h"
+                            : g64 ? "w4nl64a8h" : "w4a8h";
+        const double wbytes = (w6_only ? live_welems : welems) * (w6 ? 0.75 : w5 ? 0.625 : 0.5);
+        const std::string pname = std::string(P.name) + (w6 ? " w6" : w5 ? " w5" : sub == 4 ? " g32"
                                                          : g64 ? " g64" : "") + (a8 ? " i8" : "");
         for (int f = 0; f < nforms; ++f) {
-            if (pl.pin_moe) pl.pin_moe(f == 3 ? 2 : f + 1);
-            if (pl.pin_fk) pl.pin_fk(f == 3 ? 2 : 1);
+            const int pinned = w6_only && pl.pin_moe ? f - 1 : f;
+            const std::string form = pinned < 0 ? "auto" : std::to_string(pinned + 1);
+            if (pl.pin_moe) pl.pin_moe(pinned < 0 ? 0 : pinned == 3 ? 2 : pinned + 1);
+            if (pl.pin_fk) pl.pin_fk(pinned < 0 ? 0 : pinned == 3 ? 2 : 1);
             const int rc = ra->launch(&a, nullptr);
             if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
-                std::printf("  %-12s form %d  rc=%d (not served)\n", pname.c_str(), f + 1, rc);
+                std::printf("  %-12s form %-4s  rc=%d (not served)\n", pname.c_str(), form.c_str(), rc);
                 continue;
             }
             {
@@ -17473,12 +17500,13 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             } else {
                 int64_t diff = 0;
                 for (size_t i = 0; i < got.size(); ++i) diff += got[i] != first[i];
-                same = diff ? ("  " + std::to_string(diff) + " elements differ from form 1")
-                            : "  byte-identical to form 1";
+                const char* reference = w6_only && pl.pin_moe ? "auto" : "form 1";
+                same = diff ? ("  " + std::to_string(diff) + " elements differ from " + reference)
+                            : std::string("  byte-identical to ") + reference;
             }
-            std::printf("  %-12s form %d  %9.1f us  %6.1f TFLOP/s useful  %6.1f GB/s of weight%s\n",
-                        pname.c_str(), f + 1, us, flop / (us * 1e6), wbytes / (us * 1e3),
-                        same.c_str());
+            std::printf("  %-12s form %-4s  %9.1f us  %6.1f TFLOP/s useful  %6.1f GB/s of %sweight%s\n",
+                        pname.c_str(), form.c_str(), us, flop / (us * 1e6), wbytes / (us * 1e3),
+                        w6_only ? "live-expert " : "", same.c_str());
         }
         }
         if (pl.pin_moe) pl.pin_moe(0);
@@ -22850,15 +22878,15 @@ static void moe_aligned_down_tile(const Plugin& pl, const RadKernelInfo* row, Ra
  * it (`moe_gemm_i8a8`), each with its own four-class twin. */
 static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int sub = 0,
                         bool w5 = false, bool four = false, int64_t top_k = 2, int act8 = 0,
-                        int64_t ag = 128) {
+                        int64_t ag = 128, bool w6 = false) {
     const bool g64 = sub > 1, w8 = act8 == 2;
     /* Against an int8 activation the codebook is read at its int8 levels (r4d_args.h's kW4nlI8). */
     float tab_i8[16];
     for (int i = 0; i < 16; ++i)
         tab_i8[i] = (float)(i < 8 ? kW4nlI8[i] : -kW4nlI8[i - 8]) * kW4nlI8Unit;
-    const float* tab = w5 ? kW5nlTable : act8 ? tab_i8 : kW4nlTable;
+    const float* tab = w6 ? kW6nlTable : w5 ? kW5nlTable : act8 ? tab_i8 : kW4nlTable;
     const char* const rname = w8 ? "moe_gemm_i8a8" : act8 ? "moe_gemm_w4a8i8" : "moe_gemm_w4a8";
-    if (act8 && (w5 || (w8 && sub))) {
+    if ((w6 && (w5 || sub != 2)) || (act8 && (w5 || w6 || (w8 && sub)))) {
         ok((std::string(rname) + " (" + sh.name + ")").c_str(), false, "no such int8 form");
         return;
     }
@@ -22871,7 +22899,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     }
     const char* dt = w8 ? "i8a8"
                    : act8 ? (sub == 4 ? "w4nl32a8i8h" : g64 ? "w4nl64a8i8h" : "w4a8i8")
-                   : w5 ? "w5nl64a8h" : sub == 4 ? "w4nl32a8h" : g64 ? "w4nl64a8h" : "w4a8";
+                   : w6 ? "w6nl64a8h" : w5 ? "w5nl64a8h"
+                   : sub == 4 ? "w4nl32a8h" : g64 ? "w4nl64a8h" : "w4a8";
     const std::string what = std::string(rname) + " vs a host decode (T=" +
                              std::to_string(Tr) + ", " + sh.name +
                              (g64 || act8 ? std::string(", ") + dt : std::string()) +
@@ -22900,7 +22929,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     for (int c = 0; c < 2; ++c) {
         const int ow = c ? 6 : 2, os = c ? 7 : 3;
         const int64_t kbc = Kc[c] / group;
-        const int64_t wbytes = w8 ? Nc[c] * Kc[c] : w5 ? Nc[c] * Kc[c] / 8 * 5 : Nc[c] * Kc[c] / 2;
+        const int64_t wbytes = w8 ? Nc[c] * Kc[c] : w6 ? Nc[c] * Kc[c] / 4 * 3
+                                  : w5 ? Nc[c] * Kc[c] / 8 * 5 : Nc[c] * Kc[c] / 2;
         wq[c].assign((size_t)(nec[c] * wbytes), 0);
         ws[c].assign((size_t)(nec[c] * Nc[c] * kbc * (sub == 4 ? 2 : 1)), 0);
         std::vector<float> wsrc((size_t)(Nc[c] * Kc[c]));
@@ -22911,8 +22941,16 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                     wsrc[(size_t)(n * Kc[c] + k)] =
                         (float)(((e * 7 + n * 31 + k * 17) % 61) - 30) / 37.0f;
             cp[c].push_back(w8 ? int8_planes(wsrc, Nc[c], Kc[c], RAD_BF16)
-                            : g64 ? nl64_planes(wsrc, Nc[c], Kc[c], 128 / sub, w5)
+                            : g64 ? nl64_planes(wsrc, Nc[c], Kc[c], 128 / sub, w6 ? 2 : w5)
                                   : int4_planes(wsrc, Nc[c], Kc[c], group, RAD_BF16, false));
+            if (w6) {
+                /* Exercise every six-bit code, not only the levels the source happened to pick. */
+                Planes& p = cp[c].back();
+                for (int64_t n = 0; n < Nc[c]; ++n)
+                    for (int64_t k = 0; k < Kc[c]; ++k)
+                        rad_store_code(p.data[0].data() + n * p.row_bytes(0), RAD_U6, k,
+                                       (int)((k + n * 17 + e * 13) % 64));
+            }
             std::vector<uint8_t> w, sc;
             const int rw = g64 ? stored(r, lp, ow, cp[c].back(), { "codes", "table" }, &w)
                                : stored(r, lp, ow, cp[c].back(), { "codes" }, &w);
@@ -22990,13 +23028,15 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     std::vector<RadTensor> ts = {
         T(d_a,     act8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3, { M, K }),
         T(d_as,    RAD_F32,      { M, kb }),
-        T(d_w[0],  w8 ? (uint32_t)RAD_I8 : w5 ? (uint32_t)R4D_DT_MOEW5 : (uint32_t)R4D_DT_MOEW4,
+        T(d_w[0],  w8 ? (uint32_t)RAD_I8 : w6 ? (uint32_t)R4D_DT_MOEW6
+                    : w5 ? (uint32_t)R4D_DT_MOEW5 : (uint32_t)R4D_DT_MOEW4,
           { nec[0], sh.N0, sh.K0 }),
         g64 ? T(d_ws[0], RAD_F8E4M3, { nec[0], sh.N0, sub * sh.K0 / group })
             : T(d_ws[0], RAD_BF16,   { nec[0], sh.N0, sh.K0 / group }),
         T(d_s,     RAD_I32,      { Tr }),
         T(d_o,     RAD_I32,      { ne + 1 }),
-        T(d_w[1],  w8 ? (uint32_t)RAD_I8 : w5 ? (uint32_t)R4D_DT_MOEW5 : (uint32_t)R4D_DT_MOEW4,
+        T(d_w[1],  w8 ? (uint32_t)RAD_I8 : w6 ? (uint32_t)R4D_DT_MOEW6
+                    : w5 ? (uint32_t)R4D_DT_MOEW5 : (uint32_t)R4D_DT_MOEW4,
           { nec[1], sh.N1, sh.K1 }),
         g64 ? T(d_ws[1], RAD_F8E4M3, { nec[1], sh.N1, sub * sh.K1 / group })
             : T(d_ws[1], RAD_BF16,   { nec[1], sh.N1, sh.K1 / group }),
@@ -23146,7 +23186,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
         hi->stride[0] = t.stride[0] * 2;
         hi->data = (char*)t.data + t.stride[0] * bits / 8;
     };
-    const int wbits = w8 ? 8 : w5 ? 5 : 4, sbits = g64 ? 8 : 16;
+    const int wbits = w8 ? 8 : w6 ? 6 : w5 ? 5 : 4, sbits = g64 ? 8 : 16;
     RadTensor c4w[4], c4s[4];
     halves(ts[2], wbits, &c4w[0], &c4w[2]);
     halves(ts[3], sbits, &c4s[0], &c4s[2]);
@@ -23188,6 +23228,20 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     moe_aligned_down_tile(pl, r4, a4, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1],
                           dn_wide, ne, what4);
     moe_dec_variants(pl, r4, a4, d_y, (size_t)(Tr * N), fk2, what4);
+}
+
+static void moe_w6_cases(const Plugin& pl) {
+    const MoeW4Shape sh[] = {
+        { "w6 gate/up", 256, 256, 128, 256, 2, 5 },
+        { "w6 down sorted", 256, 256, 256, 128, 1, 6, true },
+    };
+    for (const auto& s : sh)
+        for (int64_t t : { (int64_t)24, (int64_t)200 })
+            moe_w4_gemm(pl, t, s, 2, false, true, 2, 0, 128, true);
+    /* Flash-Next TP2's actual down geometry, including the odd width and top-k=10. */
+    const MoeW4Shape qfn = { "Flash-Next TP2 down", 2560, 384, 2560, 256, 1, 20, true };
+    for (int64_t t : { (int64_t)10, (int64_t)200 })
+        moe_w4_gemm(pl, t, qfn, 2, false, true, 10, 0, 128, true);
 }
 
 /* The four-class grouped GEMM, each class at its own geometry, against a host decode.
@@ -29157,6 +29211,7 @@ struct ArHc {
     const char* act = nullptr;                 /* gather's shared arm: null operand, "none", "sigmoid" */
     bool use_scratch = false;                  /* hand the inverse table's scratch to the gather */
     void* inst = nullptr;
+    int rounds = 1;                            /* launches on the one instance, y handed in again */
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     std::vector<uint16_t> y_in, inj, h0;       /* what we hand the kernel */
     std::vector<uint16_t> ye, ew, sh, sg;      /* the gather's inputs */
@@ -29232,8 +29287,11 @@ static void ar_hc_worker(ArHc* t) {
             }
         }
         if (t->rc_launch == RAD_OK) {
-            t->rc_launch = t->row->launch(&a, nullptr);
-            st_stream_sync(nullptr);
+            for (int round = 0; round < t->rounds && t->rc_launch == RAD_OK; ++round) {
+                if (round) st_memcpy(y, t->y_in.data(), yb, hipMemcpyHostToDevice);
+                t->rc_launch = t->row->launch(&a, nullptr);
+                st_stream_sync(nullptr);
+            }
             t->y_out.resize((size_t)(t->M * t->n));
             t->h_out.resize((size_t)(t->M * t->hc * t->n));
             st_memcpy(t->y_out.data(), y, yb, hipMemcpyDeviceToHost);
@@ -29436,6 +29494,115 @@ static void ar_hc_write_case(const Plugin& pl, const std::vector<int>& devs, con
                skew == 0, std::to_string(skew) + " elements differ between ranks");
         }
         if (row->fini) for (ArHc& x : t) if (x.inst) row->fini(x.inst);
+    }
+}
+
+/* The register form of the two fused writes (r4d_ar_hc_write_reg_kernel and its gather twin: one
+ * word a thread, the write's operands read ahead, the handshake of r4d_ar_seq.h's
+ * r4d_ar_word_handshake) against the plain kernels, through r4d_ar_form_pin, at the decode and
+ * verify heights of Qwen3.8-Flash-Next's residual (n 2560, four streams): five launches back to
+ * back on one instance, so both slot parities and the counters' carry-over are walked, and every
+ * rank's y and h after the last compared byte for byte. The register form runs a second time with
+ * every push held ~20 us behind its flag (r4d_ar_late_push_pin), which is the path its push check
+ * re-reads on. The forms must agree bit for bit: the plain kernels are the ones ar_hc_write_case
+ * holds against the host oracle. */
+static void ar_hc_forms_case(const Plugin& pl, const std::vector<int>& devs, const char* name,
+                             bool want_gather) {
+    const RadKernelInfo* row = find(pl, name);
+    const std::string nm = std::string(name) + " register form";
+    if (!row) { ok(nm.c_str(), false, "row absent"); return; }
+    if (devs.size() < 2) { skip(nm.c_str(), "needs 2 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(nm.c_str(), "no peer path between the cards (device.p2p)"); return; }
+    if (!pl.pin_ar_form || !pl.pin_late_push) { skip(nm.c_str(), "no r4d_ar_form_pin"); return; }
+    struct Arm { const char* act; };
+    const std::vector<Arm> arms = want_gather ? std::vector<Arm>{ { nullptr }, { "none" } }
+                                              : std::vector<Arm>{ { nullptr } };
+    for (const Arm& arm : arms)
+    for (int64_t M : { 1, 2, 3, 4, 5, 6, 8 }) {
+        const int64_t n = 2560, hc = 4, k = want_gather ? 8 : 0, T = M * k;
+        std::vector<int32_t> sorted((size_t)T, -1);
+        if (want_gather) {
+            std::vector<int32_t> ex((size_t)T);
+            uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)M * 1315423911ull);
+            auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+            for (int64_t i = 0; i < T; ++i) {
+                const uint64_t v = rnd();
+                ex[(size_t)i] = (v % 31 == 0) ? -1 : (int32_t)((v >> 8) % 64);
+            }
+            int64_t pos = 0;
+            for (int32_t e = 0; e < 64; ++e)
+                for (int64_t i = 0; i < T; ++i)
+                    if (ex[(size_t)i] == e) sorted[(size_t)pos++] = (int32_t)i;
+        }
+        /* form 0: the plain kernels; 1: the register form; 2: the register form, late pushes. */
+        std::vector<std::vector<ArHc>> runs;
+        bool up = true, ran = true;
+        for (int form = 0; form < 3 && up && ran; ++form) {
+            pl.pin_ar_form(form == 0 ? 0 : 1);
+            pl.pin_late_push(form == 2 ? 1 : 0);
+            std::vector<ArHc> t(2);
+            std::vector<std::thread> th;
+            for (int r = 0; r < 2; ++r) {
+                ArHc& x = t[(size_t)r];
+                x.row = row; x.rank = r; x.dev = devs[(size_t)r]; x.world = 2;
+                x.M = M; x.n = n; x.hc = hc; x.top_k = k; x.act = arm.act; x.rounds = 5;
+                x.y_in.resize((size_t)(M * n));
+                x.inj.resize((size_t)(M * hc));
+                x.h0.resize((size_t)(M * hc * n));
+                uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)(r + 1) * 0x9E3779B97F4A7C15ull) ^
+                              ((uint64_t)M * 1315423911ull);
+                auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+                for (auto& v : x.y_in) v = h_to_bf16(((int64_t)(rnd() % 4001) - 2000) / 512.0f);
+                /* The gains and the streams are replicated across ranks, as the engine holds them. */
+                uint64_t rc = 0x2545F4914F6CDD1Dull ^ (uint64_t)M;
+                auto rndc = [&]() { rc ^= rc << 13; rc ^= rc >> 7; rc ^= rc << 17; return rc; };
+                for (auto& v : x.inj) v = h_to_bf16(((int64_t)(rndc() % 2001) - 1000) / 4000.0f);
+                for (auto& v : x.h0) v = h_to_bf16(((int64_t)(rndc() % 4001) - 2000) / 512.0f);
+                if (want_gather) {
+                    x.sorted = sorted;
+                    x.ye.resize((size_t)(T * n));
+                    x.ew.resize((size_t)T);
+                    for (auto& v : x.ye) v = h_to_bf16(((int64_t)(rnd() % 4001) - 2000) / 512.0f);
+                    for (auto& v : x.ew) v = h_to_bf16((float)(rndc() % 1000 + 1) / 1024.0f);
+                    if (arm.act) {
+                        x.sh.resize((size_t)(M * n));
+                        x.sg.resize((size_t)M);
+                        for (auto& v : x.sh) v = h_to_bf16(((int64_t)(rnd() % 4001) - 2000) / 256.0f);
+                        for (auto& v : x.sg) v = h_to_bf16(((int64_t)(rndc() % 801) - 400) / 100.0f);
+                    }
+                }
+                th.emplace_back(ar_hc_worker, &x);
+            }
+            for (std::thread& x : th) x.join();
+            for (const ArHc& x : t) { up = up && x.rc_init == RAD_OK; ran = ran && x.rc_launch == RAD_OK; }
+            if (row->fini) for (ArHc& x : t) if (x.inst) row->fini(x.inst);
+            runs.push_back(std::move(t));
+        }
+        pl.pin_ar_form(-1);
+        pl.pin_late_push(0);
+        const std::string at = fmt(" M=%lld n=%lld hc=%lld%s", (long long)M, (long long)n,
+                                   (long long)hc, want_gather ? (arm.act ? ", top_k 8, shared arm"
+                                                                         : ", top_k 8") : "");
+        ok((nm + at + ": every form launches").c_str(), up && ran && runs.size() == 3);
+        if (!up || !ran || runs.size() != 3) continue;
+        static const char* const kWhat[] = { "", "byte-identical to the plain kernels after five launches",
+                                             "with every push ~20 us behind its flag: byte-identical too" };
+        for (size_t f = 1; f < 3; ++f) {
+            int64_t bad = 0, nz = 0;
+            for (int r = 0; r < 2; ++r) {
+                const ArHc& a = runs[0][(size_t)r];
+                const ArHc& b = runs[f][(size_t)r];
+                for (size_t i = 0; i < a.y_out.size(); ++i) bad += a.y_out[i] != b.y_out[i];
+                for (size_t i = 0; i < a.h_out.size(); ++i) { bad += a.h_out[i] != b.h_out[i]; nz += b.h_out[i] != 0; }
+            }
+            /* The two ranks' y agree as well (the fold is symmetric), and something was written. */
+            int64_t skew = 0;
+            for (size_t i = 0; i < runs[f][0].y_out.size(); ++i)
+                skew += runs[f][0].y_out[i] != runs[f][1].y_out[i];
+            ok((nm + at + ", " + kWhat[f]).c_str(), bad == 0 && skew == 0 && nz > M * hc * n,
+               fmt("%lld bytes differ from the plain kernels, %lld between the ranks", (long long)bad,
+                   (long long)skew));
+        }
     }
 }
 
@@ -30599,6 +30766,20 @@ static void device_phase(const Plugin& pl) {
             std::vector<RadTensor> ts = { T(d, RAD_U8, { (int64_t)1 << 20 }) };
             std::vector<RadParam> ps = { PI("bytes", (int64_t)1 << 20) };
             run_case(r, ts, ps);
+            /* With the architecture's own workgroup count (`blocks`): one block, the count
+             * Qwen3.8-Flash-Next asks for at a verify, the most the row takes, and absent, 0 and
+             * one past the most (the kernel's own count each) all launch, and the weight they read
+             * is the weight afterwards: the row writes nothing at any count. */
+            std::vector<uint8_t> h((size_t)1 << 20), back((size_t)1 << 20);
+            for (size_t i = 0; i < h.size(); ++i) h[i] = (uint8_t)(i * 131u + (i >> 9));
+            st_memcpy(d, h.data(), h.size(), hipMemcpyHostToDevice);
+            for (const long long nb : { 0ll, 1ll, 32ll, 1024ll, 1025ll }) {
+                std::vector<RadParam> pb = { PI("bytes", (int64_t)1 << 20), PI("blocks", nb) };
+                run_case(r, ts, pb);
+            }
+            st_memcpy(back.data(), d, back.size(), hipMemcpyDeviceToHost);
+            ok("prefetch at its caller's workgroup count leaves the weight as it was", back == h,
+               "the weight's bytes changed");
             RadLayout L{};
             const int st = r->layout ? r->layout(nullptr, 0, 0, nullptr, nullptr, nullptr, 0, &L) : 0;
             ok("prefetch's layout hook takes any stored form (RAD_LAYOUT_ANY)", st == RAD_LAYOUT_ANY,
@@ -30681,6 +30862,17 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_window_h512_gqa16_i8kv",  512, 16,  1, "i8", 0, 700);
     attn_numeric_case(pl, "attn_window_h512_gqa16_bf16kv", 512, 16,  1, "bf16",     0, 700);
     attn_numeric_case(pl, "attn_window_h512_gqa16_bf16kv", 512, 16, 16, "bf16",     0, 300);
+    /* LFM3: 16 query heads over 4 kv heads at head_dim 128, full and with its 256-token window; the
+     * rows take what the decode leg's band (q_len <= 16) leaves. Launches, then numeric checks, the
+     * last two with a context past the window. The int8 row has numeric cases only: attn_case
+     * builds a bf16 or an fp8 cache. */
+    attn_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 32, "bf16",     1);
+    attn_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 32, "bf16",     1, 256);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_i8kv",   128, 4, 32, "i8",       0);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 32, "bf16",     0);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 17, "bf16",     0, 300);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 64, "bf16",     256, 700);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_i8kv",   128, 4, 64, "i8",       256, 700);
     /* The h256/gqa2 prefill numeric check with ctx 2048 > window 1024, so the window applies: for
      * query row 0, pos = 2048-64 = 1984 and the visible keys are [961..1984], so wlo0 = 961 and
      * tstart = 961/48 = 20. This exercises the window mask and the below-window tile skip (tiles
@@ -32900,7 +33092,11 @@ static void device_phase(const Plugin& pl) {
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
                 moe_w4_gemm(pl, t, sh, 2, true);
         }
+        moe_w6_cases(pl);
     }
+
+    /* Also expose the W6 tests alone while retaining them in the normal W4 row's test. */
+    if (sel("moe_gemm_w6nl")) moe_w6_cases(pl);
 
     /* The grouped GEMM against an int8 activation: the same shapes through each row's forms. */
     {
@@ -33637,6 +33833,9 @@ static void device_phase(const Plugin& pl) {
             std::printf("  %s\n", n.c_str());
             ar_hc_write_case(pl, devs, n.c_str(), std::strstr(base, "4rank") ? 4 : 2,
                              std::strstr(base, "gather") != nullptr);
+            /* The host twins keep the plain kernels: their mailbox is read over the link. */
+            if (!std::strstr(base, "4rank") && n == base)
+                ar_hc_forms_case(pl, devs, n.c_str(), std::strstr(base, "gather") != nullptr);
         }
     }
     /* The wide rows at every width are dispatched above and skip themselves, naming the width
@@ -33948,6 +34147,8 @@ static void usage(void) {
                 "             an M-token chunk (512 experts, top 10 by default); every form, each\n"
                 "             compared with the first. pooled%% of the experts are read out of\n"
                 "             pinned host memory through a pointer table, as the engine's are.\n"
+                "  --perfw6nl M [iters] [experts] [top_k]: W5NL and W6NL down at that TP2\n"
+                "             geometry and routing, synthetic resident weights; auto and pinned forms.\n"
                 "  --perfmoeiqr M [iters] [experts] [top_k] [draw] [routings]:  --perfmoe's IQR\n"
                 "             rows alone (moe_gemm_iqr at Qwen3.8-Flash-Next's per-rank shapes); the\n"
                 "             routing draws from `draw` of the experts (0 or default: all), fewer\n"
@@ -34057,6 +34258,7 @@ int main(int argc, char** argv) {
     int hy_it = 100;
     int moe_pool = 0;
     int moe_it = 20;
+    bool perf_w6nl = false;
     long long m16_m = 0, m16_e = 256, m16_k = 10, m16_d = 0;
     int m16_it = 20;
     int video_it = 0;
@@ -34207,14 +34409,18 @@ int main(int argc, char** argv) {
             if (hy_m < 1 || hy_m > 256 || hy_it < 1) {
                 std::fprintf(stderr, "--perfhyv3moe: M 1..256, iters > 0\n"); return 2;
             }
-        } else if (!std::strcmp(argv[i], "--perfmoe")) {
-            /* The routed-expert GEMM at a prefill chunk of M tokens, every prefill form. */
+        } else if (!std::strcmp(argv[i], "--perfmoe") || !std::strcmp(argv[i], "--perfw6nl")) {
+            /* The routed-expert GEMM at a chunk of M tokens, every launch form. */
+            perf_w6nl = !std::strcmp(argv[i], "--perfw6nl");
             if (i + 1 >= argc) { usage(); return 2; }
             moe_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) moe_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) moe_e = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) moe_k = std::strtoll(argv[++i], nullptr, 0);
-            if (i + 1 < argc && argv[i + 1][0] != 0x2d) moe_pool = (int)std::strtol(argv[++i], nullptr, 0);
+            if (!perf_w6nl && i + 1 < argc && argv[i + 1][0] != 0x2d) moe_pool = (int)std::strtol(argv[++i], nullptr, 0);
+            if (perf_w6nl && (moe_m < 1 || moe_it < 1 || moe_e < 2 || moe_e % 2 || moe_k < 1 || moe_k > moe_e)) {
+                std::fprintf(stderr, "--perfw6nl: M/iters > 0, experts even >= 2, top_k 1..experts\n"); return 2;
+            }
         } else if (!std::strcmp(argv[i], "--perfmoeiqr")) {
             /* The IQR rows of --perfmoe alone, and how many experts its routing draws from. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -34460,9 +34666,9 @@ int main(int argc, char** argv) {
     if (moe_m) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        moe_perf(pl, moe_m, moe_it, moe_e, moe_k, moe_pool);
+        moe_perf(pl, moe_m, moe_it, moe_e, moe_k, moe_pool, perf_w6nl);
         dfree_all();
-        moe_iqr_perf(pl, moe_m, moe_it, moe_e, moe_k);
+        if (!perf_w6nl) moe_iqr_perf(pl, moe_m, moe_it, moe_e, moe_k);
 #else
         skip("routed-expert GEMM timing", "built without HIP");
 #endif

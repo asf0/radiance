@@ -908,6 +908,9 @@ static const RadOperandSpec oKvLenTrim[] = {
 /* `prefetch` reads a weight's leading `bytes` into the cache and writes nothing (docs/OPS.md). */
 static const RadParamSpec pPrefetch[] = {
     { "bytes", RAD_P_INT, RAD_REQUIRED },
+    /* The workgroups reading, where the architecture measured its own count; absent or 0, the
+     * kernel's (its `nb` axis). */
+    { "blocks", RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oPrefetch[] = {
     { "w", RAD_OPD_WEIGHT, 0 },
@@ -4368,7 +4371,9 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
 /* The windowed kernels (r4d_attn_paged_window.hip): head_dim 128, 256 and 512, 1/2/4/8 queries per
  * KV head (16 at 512), any window, causal or not. Gemma 4's sliding layers are h256/gqa2 with a
  * 1024-token window, its full layers h512 at gqa 8 (TP1/TP2), 4 (TP4) or 2 (TP8), the 12B's at
- * gqa 16 (TP1); h128/gqa1 is Unlimited-OCR's MHA decoder. One kernel serves every q_len (splitting
+ * gqa 16 (TP1); h128/gqa1 is Unlimited-OCR's MHA decoder; h128/gqa4 is LFM3 (full layers, and
+ * sliding ones with a 256-token window), whose decode band (q_len <= 16) stays on the h128/gqa4
+ * decode leg, which ranks above these rows. One kernel serves every q_len (splitting
  * the key range when there are too few tiles to fill the card), so `q_len` cuts no band. `causal` and `window` are runtime fields; block_size
  * is derived: 16.
  *
@@ -4381,6 +4386,7 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
         C_GE("window", WMIN), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),                       \
     };
 R4D_WIN_C(cWinH128G1Bf16, 128, 1, "bf16", 0) R4D_WIN_C(cWinH128G1I8, 128, 1, "i8", 0)
+R4D_WIN_C(cWinH128G4Bf16, 128, 4, "bf16", 0) R4D_WIN_C(cWinH128G4I8, 128, 4, "i8", 0)
 R4D_WIN_C(cWinH128G8Bf16, 128, 8, "bf16", 0) R4D_WIN_C(cWinH128G8I8, 128, 8, "i8", 0)
 R4D_WIN_C(cWinH128G16Bf16, 128, 16, "bf16", 0) R4D_WIN_C(cWinH128G16I8, 128, 16, "i8", 0)
 R4D_WIN_C(cWinH256G1Bf16, 256, 1, "bf16", 0) R4D_WIN_C(cWinH256G1I8, 256, 1, "i8", 0)
@@ -5106,7 +5112,7 @@ static const RadConstraint cMoeMx[] = {
 static const RadConstraint cMoeGemmW4[] = {
     C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536),
     C_GE("top_k", 1), C_EQ("group", 128),
-    C_IN("dtype", "w4a8 w4a8h w4nla8h w4nl64a8h w4nl32a8h w5nl64a8h"),
+    C_IN("dtype", "w4a8 w4a8h w4nla8h w4nl64a8h w4nl32a8h w5nl64a8h w6nl64a8h"),
 };
 /* The op against an int8 activation with an f32 scale per (row, 128 of K): int8 experts with a
  * bf16 scale per (row, 128 of K), `i8a8h` rotated 128 wide along K as its activation is; and the
@@ -6058,6 +6064,7 @@ static const RadConstraint cVsa[] = {
 static const RadConstraint cQuantCols[] = { C_DIV("n", 8), C_IN("dtype", "bf16") };
 
 static const RadConstraint cPixtralPatch[] = { C_IN("dtype","bf16"), C_EQ("K",588), C_GE("M",1), C_LE("M",2147483647), C_GE("N",1), C_LE("N",2147483647) };
+static const RadConstraint cMusePatch[] = { C_IN("dtype","bf16"), C_EQ("K",1176), C_GE("M",1), C_LE("M",2147483647), C_GE("N",1), C_LE("N",2147483647) };
 static const RadConstraint cNemotron[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647) };
 static const RadConstraint cNemotronMerge[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("merge",2) };
 static const RadConstraint cNemotronRope64[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",64) };
@@ -6068,6 +6075,10 @@ static const RadKernelInfo kKernels[] = {
 { "gemm_bf16_pixtral_patch", "gemm_nt", "gemm", "RGB 14x14 patch projection with ordered f32 dots",
   "K=588, M<=INT_MAX, N<=INT_MAX, pitched bf16 rows", "bf16",
   RAD_DOMAIN_DEVICE, 10, ROW(cPixtralPatch), NOTUNE,
+  nullptr, nullptr, r4d_rad_pixtral_patch },
+{ "gemm_bf16_muse_patch", "gemm_nt", "gemm", "Muse Glimmer RGB 14x14x2 patch projection",
+  "K=1176, M<=INT_MAX, N<=INT_MAX, pitched bf16 rows", "bf16",
+  RAD_DOMAIN_DEVICE, 10, ROW(cMusePatch), NOTUNE,
   nullptr, nullptr, r4d_rad_pixtral_patch },
 { "position_scale_bf16", "position_scale", "attn", "Ministral rounded query scale", "pitched active rows, nonnegative i32 positions", "bf16",
   RAD_DOMAIN_DEVICE, 50, ROW(cNemotron), NOTUNE,
@@ -7436,7 +7447,8 @@ static const RadKernelInfo kKernels[] = {
 #define R4D_WIN_PAIR(HD, GQ)                                                                       \
     R4D_WIN_ROW(HD, GQ, bf16kv, bf16, cWinH##HD##G##GQ##Bf16, "bf16")                              \
     R4D_WIN_ROW(HD, GQ, i8kv, i8, cWinH##HD##G##GQ##I8, "int8 (an f16 scale of K and of V per token and head)")
-R4D_WIN_PAIR(128, 1) R4D_WIN_PAIR(128, 16)   /* Muse Glimmer's 32/2-head sliding layers */
+R4D_WIN_PAIR(128, 1) R4D_WIN_PAIR(128, 4)
+R4D_WIN_PAIR(128, 16)   /* Muse Glimmer's 32/2-head sliding layers */
 R4D_WIN_PAIR(256, 1) R4D_WIN_PAIR(256, 2) R4D_WIN_PAIR(256, 4) R4D_WIN_PAIR(256, 8)
 R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512, 8)
 R4D_WIN_PAIR(512, 16)
@@ -10947,7 +10959,12 @@ extern "C" int rad_kernel_concurrent(int i) {
 
 /* Which rows can chain (RadKernelChainFn, rad_abi.h): every kernel their launch emits has a
  * chained form (r4d_chain.h) the launch selects from the `chain` parameter. A row joins this list
- * only once all of its kernels have one. */
+ * only once all of its kernels have one.
+ *
+ * They answer 2: every chained form here ends its wait in r4d_chain_acquire, which empties the
+ * scalar data cache behind the fence, so the engine may issue their packets without the packet
+ * processor's acquire. A form that waited without it would have to keep this at 1 for the whole
+ * library: one row's 1 keeps the fences on every chained packet of the engine. */
 extern "C" int rad_kernel_chain(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;
@@ -11069,13 +11086,13 @@ extern "C" int rad_kernel_chain(int i) {
         "kv_store_i8",
     };
     for (const char* p : kChained)
-        if (std::strcmp(k->name, p) == 0) return 1;
+        if (std::strcmp(k->name, p) == 0) return 2;
     /* The host-mailbox twins (host_twins, --p2p off) of the two-rank fused writes: the same
      * launcher and kernels as the rows they are generated from, so the same chained forms. Only
      * these two: the other collectives' twins have not been run chained through the mailbox. */
     static const char* const kChainedHostTwins[] = { "ar_hc_write_host", "ar_gather_hc_write_host" };
     for (const char* p : kChainedHostTwins)
-        if (std::strcmp(k->name, p) == 0) return 1;
+        if (std::strcmp(k->name, p) == 0) return 2;
     return 0;
 }
 

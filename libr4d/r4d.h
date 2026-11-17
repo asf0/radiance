@@ -322,6 +322,10 @@ void r4d_ar_oneshot_2rank_wht6(long peer_scratch, long my_scratch, long peer_fla
 // is the engine's link word, ended once the peer's push has landed (r4d_ar_link_landed);
 // `gate_ctr` is its block counter. The gather form below takes the same pair. A non-zero `chain`
 // launches the chained form (r4d_chain.h), which the gather form has at decode heights.
+// At a message of one 16B word a thread on a P2P instance (`stage` 0) both take their register
+// form (r4d_ar_hc_write_reg_kernel), which also stores into the peer's wake word: `peer_flags` is
+// then 3 * r4d_ar_max_blocks() words (the flags and two slots' check words) and one more line of
+// 64 bytes behind them, as r4d_ar_entry.hip allocates it.
 void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                      long seq_ctrs, long slot_stride16, long y, long inj, long h, long M, long n,
                      long hc, long irow, long hrow, long stream, long nblocks, long nthreads,

@@ -2340,7 +2340,7 @@ int ref_unrelayout_gemm_q_m2(const RadParam*, int, int, const RadEncoding*, cons
 
 #define DT_FLOAT "bf16 f16 f32 fp8_e4m3 fp8_e5m2 i8 i32, chosen per operand from its own dtype"
 #define DT_ANY   "any dtype rad_types.h names, per operand"
-#define DT_FLOAT_CB DT_FLOAT "; or u4 / u5 codes into an f32 table, joined (w4nl* / w5nl*)"
+#define DT_FLOAT_CB DT_FLOAT "; or u4 / u5 / u6 codes into an f32 table, joined (w4nl* / w5nl* / w6nl*)"
 
 static const RadKernelInfo kKernels[] = {
 SIMPLE("ref_rmsnorm", "rmsnorm", "norm", "root-mean-square norm with a gain", DT_FLOAT,

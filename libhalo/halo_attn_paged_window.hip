@@ -5,7 +5,9 @@
 //
 // head_dim 128 is Unlimited-OCR's decoder (10 query heads over 10 KV heads): the plain MHA case,
 // served here so its q slice of the fused q|k|v plane is read in place instead of being lifted into
-// a dense buffer. Gemma 4's text layers: sliding layers are 16 query heads over 8 KV heads at
+// a dense buffer. head_dim 128 at gqa 4 is LFM3's attention (16 query heads over 4 KV heads): full
+// layers, and sliding layers with a 256-token window; its decode steps stay on
+// halo_attn_paged_h128_gqa4.hip and every longer q_len lands here. Gemma 4's text layers: sliding layers are 16 query heads over 8 KV heads at
 // head_dim 256 with a 1024-token window, full layers 16 over 2 at head_dim 512. Where this overlaps
 // libhalo's other h256 legs, the row table decides (halo_rows.cpp).
 //
@@ -1191,7 +1193,7 @@ extern "C" {
     int halo_rad_attn_window_h##HD##_gqa##G##_fp8(const RadArgs* a, RadStream s) {                 \
         return halo_win::launch_attn<HD, G, true>(a, s);                                           \
     }
-HALO_WIN_DEF(128, 1)
+HALO_WIN_DEF(128, 1) HALO_WIN_DEF(128, 4)
 HALO_WIN_DEF(256, 1) HALO_WIN_DEF(256, 2) HALO_WIN_DEF(256, 4) HALO_WIN_DEF(256, 8)
 HALO_WIN_DEF(512, 1) HALO_WIN_DEF(512, 2) HALO_WIN_DEF(512, 4) HALO_WIN_DEF(512, 8)
 #undef HALO_WIN_DEF

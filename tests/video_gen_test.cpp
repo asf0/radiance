@@ -143,7 +143,7 @@ struct VideoFixture {
     int start() { return drv.init(prog, fake_positions, { gen::VideoDriver::RankIO{} }); }
     /* With the reference conditioning of a container with the video VAE's encoder, and the audio
      * VAE's too when `audio`. */
-    int start_refs(bool audio = true) {
+    int start_refs(bool audio = true, int ranks = 1) {
         RadVideoGenDecl& d = prog.video_gen;
         d.max_ref_images = 9;
         d.max_ref_videos = 3;
@@ -153,7 +153,8 @@ struct VideoFixture {
         d.max_enc_samples = audio ? 500000 : 0;
         d.enc_ratio = 16;
         d.max_mod_cells = 8;
-        return drv.init(prog, fake_positions, { gen::VideoDriver::RankIO{} }, fake_pack,
+        return drv.init(prog, fake_positions,
+                        std::vector<gen::VideoDriver::RankIO>((size_t)ranks), fake_pack,
                         fake_encode_geom);
     }
     std::unique_ptr<gen::VideoRequest> req(int32_t chunks = 2, int32_t steps = 0) {
@@ -1040,6 +1041,42 @@ TEST(a_reference_picture_is_encoded_shown_and_laid_into_the_step) {
         CHECK_OK(f.drv.done());
     }
     CHECK_EQ(kinds, std::string("ECSSADD"));
+}
+
+/* Mixed host/device encoders read their small geometry on either execution site. All ranks
+ * must receive the shared pinned-host table, not their separate, CPU-inaccessible VRAM copies. */
+TEST(reference_encoder_geometry_is_shared_by_host_and_device_ranks) {
+    VideoFixture f;
+    f.build();
+    CHECK_OK(f.start_refs(true, 2));
+    auto r = f.req(2);
+    r->refs.push_back(picture(gen::VideoRefMedia::FIRST_FRAME, "first_frame", 1, 64, 32));
+    r->refs.push_back(sound(gen::VideoRefMedia::AUDIO, "ref_audio_1", 1, 1000));
+    std::string why;
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+    int encoded = 0;
+    for (int i = 0; i < 16; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        if (b->gen == RAD_GEN_PASS_VENCODE || b->gen == RAD_GEN_PASS_AENCODE) {
+            const RadBatch* other = f.drv.batch_for(1);
+            REQUIRE(other != nullptr);
+            const int32_t* geometry = b->vgen_b->enc_geom_d;
+            REQUIRE(geometry != nullptr);
+            CHECK(geometry == other->vgen_b->enc_geom_d);
+            int32_t want[32] = {};
+            const bool audio = b->gen == RAD_GEN_PASS_AENCODE;
+            const int64_t in[4] = { audio ? 1000 : 1, audio ? 0 : 32,
+                                     audio ? 0 : 64, audio ? 2 : 3 };
+            const int64_t n = fake_encode_geom(b->gen, in, want, 32);
+            REQUIRE(n > 0);
+            for (int64_t j = 0; j < n; ++j) CHECK_EQ(geometry[j], want[j]);
+            ++encoded;
+        }
+        f.answer(0);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(encoded, 2);
 }
 
 /* A first and a last frame at the video's size: one Vencode pass each, the keyframe table pinning

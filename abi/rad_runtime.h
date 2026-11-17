@@ -729,7 +729,8 @@ typedef struct RadVideoGenBatch {
     /* VENCODE: f32 [enc_frames, enc_height, enc_width, 3] RGB in 0..255, the frames padded to
      * whole clips by repeating the last (rad_arch_encode_geom's entry 23). AENCODE: f32
      * [enc_channels, enc_n_samples], each channel padded with zeros to the hop (entry 0). Both:
-     * the pass's geometry as rad_arch_encode_geom gave it, i32 on the device, and the media's
+     * the pass's geometry as rad_arch_encode_geom gave it, i32 in pinned host memory also readable
+     * by device kernels (mixed-site encoders share it), and the media's
      * kind (RAD_ENC_*, below) and its number within the kind from 1. */
     const float*    enc_pixels;
     int32_t         enc_frames, enc_height, enc_width;

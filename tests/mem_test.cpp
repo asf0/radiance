@@ -654,6 +654,40 @@ TEST(the_engine_s_queues_come_off_the_card_before_the_split) {
     CHECK(unclaimed < 114 * MiB);
 }
 
+/* The runtime keeps queue scratch resident once a kernel with a private segment has run
+ * (rad_dev_resident_scratch_bytes); it is part of the hardware queues' term, the largest rank's. */
+TEST(resident_queue_scratch_is_charged_with_the_hardware_queues) {
+    Config c = small_config();
+    c.vram_weights_mib = 0;
+    c.vram_kv_mib      = 0;
+    c.gpu_headroom_mib = 96;
+    VramFacts f{};
+    f.capacity   = 32LL << 30;
+    f.free       = f.capacity - (512LL << 20);
+    f.arena      = 144LL << 20;
+    f.staging    = 98LL << 20;
+    f.statics    = 2LL << 30;
+    f.experts    = 200LL << 30;
+    f.kv_ceiling = 100LL << 30;
+    f.n_queues = 2; f.queue_bytes = 33LL << 20;
+    VramBudget b0, b1;
+    Config c0 = c, c1 = c;
+    CHECK_OK(vram_budget_resolve(c0, { f }, &b0));
+    f.queue_scratch = 160LL << 20;
+    CHECK_OK(vram_budget_resolve(c1, { f }, &b1));
+    CHECK_EQ(b0.queues, 66LL << 20);
+    CHECK_EQ(b1.queues, (66LL << 20) + (160LL << 20));
+    CHECK_EQ(b1.claimable, b0.claimable - (160LL << 20));
+    /* The minimum the fleet asks of the card moves by the same bytes. */
+    int64_t need0 = 0, want0 = 0, need1 = 0, want1 = 0;
+    f.queue_scratch = 0;
+    vram_budget_need({ f }, &need0, &want0);
+    f.queue_scratch = 160LL << 20;
+    vram_budget_need({ f }, &need1, &want1);
+    CHECK_EQ(need1 - need0, 160LL << 20);
+    CHECK_EQ(want1 - want0, 160LL << 20);
+}
+
 TEST(the_smallest_card_binds_and_a_short_one_refuses_by_name) {
     Config c = small_config();
     c.vram_weights_mib = 0;

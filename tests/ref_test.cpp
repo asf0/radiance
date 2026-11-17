@@ -4907,12 +4907,66 @@ TEST(op_moe_gemm_q_mod4) {
  * (w4nl64a8h/w5nl64a8h) or 32 (w4nl32a8h). The oracle inverts a relaid weight into exactly this
  * description (core/runtime/oracle.cpp). The final case is one last-class expert at K = 128 whose
  * 64-wide halves scale by 2 and 3 under one 0.5 activation scale; any other grid reads differently. */
+TEST(op_moe_gemm_q_reads_six_bit_codebook_experts) {
+    constexpr int64_t N = 2, K = 128;
+    T codes0(RAD_U6, {N, K}), codes1(RAD_U6, {N, K});
+    T table(RAD_F32, {1, 64}), scale(RAD_F8E4M3, {N, 2}), level(RAD_F32, {1, 1});
+    std::vector<float> levels(64);
+    for (int c = 0; c < 64; ++c) levels[(size_t)c] = c < 32 ? (float)(c + 1) : (float)(31 - c);
+    table.f(levels); scale.f({ 1, 2, 2, 1 }); level.f({ 0.5f });
+    for (int64_t n = 0; n < N; ++n) for (int64_t k = 0; k < K; ++k) {
+        const int base = (int)((k % 32 + (k / 64) * 32 + n * 5) % 64);
+        rad_store_code(codes0.mem.data() + n * (K * 6 / 8), RAD_U6, k, base);
+        rad_store_code(codes1.mem.data() + n * (K * 6 / 8), RAD_U6, k, (base + 3) % 64);
+    }
+    RadEncoding enc{};
+    rad_enc_clear(&enc);
+    rad_enc_copy_str(enc.scheme, "affine");
+    rad_enc_copy_str(enc.transform, "fwht128");
+    rad_enc_add_plane(&enc, "codes", RAD_U6, 1, 1);
+    rad_enc_add_plane(&enc, "scale", RAD_F8E4M3, 1, 64);
+    rad_enc_add_plane(&enc, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&enc, "table", RAD_F32, 1, 64);
+    const int cs[] = { 0, 3 }, ss[] = { 1, 2 };
+    RadTensor cp0[] = { codes0.t, table.t }, cp1[] = { codes1.t, table.t }, sp[] = { scale.t, level.t };
+    RadLayout cl{}, sl{};
+    REQUIRE_EQ(rad_planes_layout(&enc, cs, cp0, 2, &cl), RAD_OK);
+    REQUIRE_EQ(rad_planes_layout(&enc, ss, sp, 2, &sl), RAD_OK);
+    std::vector<uint8_t> even((size_t)cl.bytes), odd((size_t)cl.bytes), scales((size_t)sl.bytes);
+    REQUIRE_EQ(rad_planes_relayout(&enc, cs, cp0, 2, even.data(), cl.bytes), RAD_OK);
+    REQUIRE_EQ(rad_planes_relayout(&enc, cs, cp1, 2, odd.data(), cl.bytes), RAD_OK);
+    REQUIRE_EQ(rad_planes_relayout(&enc, ss, sp, 2, scales.data(), sl.bytes), RAD_OK);
+    T input(RAD_F32, {2, K}), as(RAD_F32, {2, 1}), sorted(RAD_I32, {2});
+    T off(RAD_I32, {3}), out(RAD_F32, {2, N});
+    T w0(RAD_U6, {1, N, K}), w1(RAD_U6, {1, N, K});
+    T s0(RAD_F8E4M3, {1, N, K}), s1(RAD_F8E4M3, {1, N, K});
+    input.f(std::vector<float>((size_t)(2 * K), 1.0f)); as.f({1, 1});
+    sorted.n({0, 1}); off.n({0, 1, 2});
+    A a;
+    a.t(input).t(as).t(w0).t(s0).t(sorted).t(off).t(w1).t(s1).t(out)
+     .i("M", 2).i("N", N).i("K", K).i("n_expert", 2).i("top_k", 1).i("group", 128)
+     .s("a_order", "token").s("dtype", "w6nl64a8h");
+    void* p0[] = { even.data() }, *p1[] = { odd.data() }, *ps[] = { scales.data() };
+    a.ts[2].data = p0; a.ts[3].data = ps; a.ts[6].data = p1; a.ts[7].data = ps;
+    for (int i : { 2, 3, 6, 7 }) a.ts[(size_t)i].stride[0] = 0;
+    REQUIRE_EQ(run("moe_gemm_q", a), RAD_OK);
+    for (int e = 0; e < 2; ++e) for (int n = 0; n < N; ++n) {
+        float want = 0;
+        for (int k = 0; k < K; ++k) {
+            const int code = ((k % 32 + (k / 64) * 32 + n * 5) + e * 3) % 64;
+            const float subscale = n == 0 ? (k < 64 ? 1.0f : 2.0f) : (k < 64 ? 2.0f : 1.0f);
+            want += levels[(size_t)code] * subscale * 0.5f;
+        }
+        CHECK_EQ(out.at(e * N + n), want);
+    }
+}
+
 TEST(op_moe_gemm_q_scale_grid_by_dtype) {
     struct Want { const char* dt; int64_t rows, cols; };
     /* N 256, K 512, group 128; the last class at N 128, K 256. */
     const Want wants[] = { { "fp8a8", 2, 4 },      { "w4a8", 256, 4 },     { "w4a8h", 256, 4 },
                            { "w4nla8h", 256, 4 },  { "w4nl64a8h", 256, 8 }, { "w5nl64a8h", 256, 8 },
-                           { "w4nl32a8h", 256, 16 }, { "mxfp4a8", 256, 16 } };
+                           { "w6nl64a8h", 256, 8 }, { "w4nl32a8h", 256, 16 }, { "mxfp4a8", 256, 16 } };
     for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
         const RadKernelInfo* k = kern(op);
         REQUIRE(k != nullptr && k->opd_shape != nullptr);
@@ -8852,6 +8906,72 @@ TEST(qsa_select_orders_above_then_ties_and_appends_the_partial_page) {
     CHECK_EQ(r.sel[2], -1LL); CHECK_EQ(r.sel[4], -1LL);
     CHECK_EQ(r.nsel[0], 2LL);
     CHECK_EQ(r.su[0], 1LL * 4 + 3 + 1);
+}
+
+/* At or below the exactness bound (every complete block fits in topk) a row at the end of its
+ * sequence's context selects the head of the block table, in table order, then the partial page,
+ * and its seqused is the context's length, whatever the blocks score. The attention block issues
+ * such a row over the sequence's own table and length and the indexer selects nothing
+ * (AttnGatedFP8::qsa_use, docs/QSA.md "Below the bound"); this is the equality that rests on. */
+TEST(qsa_select_below_the_bound_is_the_block_table_and_the_context_length) {
+    const int64_t ratio = 4, topk = 8, nb = 12;
+    std::vector<int64_t> bt;
+    for (int64_t b = 0; b < nb; ++b) bt.push_back(100 + 7 * ((b * 5) % nb));   /* scattered pages */
+    uint32_t g = 12345;
+    for (int64_t p = 0; p <= topk * ratio + ratio - 2; ++p) {       /* every position up to the bound */
+        for (int variant = 0; variant < 3; ++variant) {
+            std::vector<float> sc((size_t)nb);
+            for (int64_t b = 0; b < nb; ++b) {
+                g = g * 1664525u + 1013904223u;
+                /* scores as they come: positive, equal ones, and exact zeros (a relu's) */
+                sc[(size_t)b] = variant == 0 ? (float)((g >> 20) % 7) * 0.25f
+                              : variant == 1 ? 0.0f : 3.5f;
+            }
+            const int64_t n = (p + 1) / ratio;                      /* complete blocks, this row's */
+            const Sel r = qsa_select_run(sc, nb, bt, n, { p }, topk, ratio);
+            REQUIRE_EQ(r.sel.size(), (size_t)(topk + 1));
+            const int64_t pages = (p + ratio) / ratio;              /* ceil((p + 1) / ratio) */
+            CHECK_EQ(r.nsel[0], pages);
+            CHECK_EQ(r.su[0], p + 1);
+            for (int64_t i = 0; i <= topk; ++i)
+                CHECK_EQ(r.sel[(size_t)i], i < pages ? bt[(size_t)i] : -1LL);
+        }
+    }
+}
+
+/* The rows of a chain verify or a prefill chunk at or below the bound select the same bytes
+ * whatever they score -- here over a plane of zeros against random scores: every row its own
+ * complete blocks in table order, the partial page, the count and seqused. The sparse attention of
+ * such a step (between 1025 and 2047 tokens of context a multi-row step is the sparse row a query)
+ * therefore reads, at every layer, the selection the pass's first full-attention layer issued
+ * (QsaIndexer::step, kQsaOnce). The last positions put a row on exactly `topk` blocks plus a
+ * partial page. */
+TEST(qsa_select_of_a_chains_rows_over_a_constant_plane_is_the_scored_selection_below_the_bound) {
+    const int64_t ratio = 4, topk = 8, nb = 16, M = 4;
+    std::vector<int64_t> bt;
+    for (int64_t b = 0; b < nb; ++b) bt.push_back(200 + 3 * ((b * 7) % nb));   /* scattered pages */
+    uint32_t g = 777;
+    int partial_at_topk = 0;
+    for (int64_t p0 = 0; p0 + M - 1 <= topk * ratio + ratio - 2; ++p0) {
+        std::vector<int64_t> pos;
+        for (int64_t j = 0; j < M; ++j) pos.push_back(p0 + j);
+        const int64_t nc = (pos.back() + 1) / ratio;                /* the sequence's, after the step */
+        std::vector<float> sc((size_t)(M * nb));
+        for (auto& v : sc) { g = g * 1664525u + 1013904223u; v = (float)((g >> 20) % 5) * 0.5f; }
+        const Sel scored = qsa_select_run(sc, nb, bt, nc, pos, topk, ratio);
+        const Sel flat = qsa_select_run(std::vector<float>((size_t)(M * (topk + 1)), 0.0f), topk + 1,
+                                        bt, nc, pos, topk, ratio);
+        REQUIRE_EQ(scored.sel.size(), (size_t)(M * (topk + 1)));
+        REQUIRE_EQ(flat.sel.size(), scored.sel.size());
+        CHECK(flat.sel == scored.sel);
+        CHECK(flat.nsel == scored.nsel);
+        CHECK(flat.su == scored.su);
+        for (int64_t j = 0; j < M; ++j) {
+            CHECK_EQ(flat.su[(size_t)j], pos[(size_t)j] + 1);
+            if ((pos[(size_t)j] + 1) / ratio == topk && flat.nsel[(size_t)j] == topk + 1) ++partial_at_topk;
+        }
+    }
+    CHECK(partial_at_topk > 0);
 }
 
 /* ================================================================== kv_resolve

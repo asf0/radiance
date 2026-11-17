@@ -317,6 +317,7 @@ and runs.
 | `museglimmer` | Meta Muse Glimmer 30B: gated attention alternating sliding-window (rotary) and NoPE full layers, Gemma-2 double norms, a 50-block windowed ViT; bf16 |
 | `museglimmer_ct` | the same trunk as an int4 container (`--set quantization_config.quant_method=compressed-tensors`) |
 | `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
+| `lfm3_bf16` | LiquidAI LFM3 in bf16 (LFM3-1.7B) |
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
 | `nomicbert` | nomic-embed-text-v2-moe, an embedding model (§5.6) |
 | `nemotron35_embed` | Nemotron 3.5 Embed 1B/8B and Rerank 8B, BF16 text/image retrieval at TP1 (§5.6) |
@@ -1067,7 +1068,8 @@ one for one with the key); a larger headroom that lost part of itself is reporte
 What the engine allocates after reading the card is charged before the split, not to the headroom:
 the step staging, the KV tiers' copy staging and the hardware queues. The driver backs each queue
 with VRAM beyond its ring (33 MiB on an R9700), so startup measures one and the receipt's `hardware
-queues` line shows the count and price.
+queues` line shows the count and price. It also includes the queue scratch the runtime keeps once a kernel with a private
+segment has run (5 MiB a compute unit, 160 MiB on an R9700).
 
 ### 4.4 Long context
 
@@ -1639,6 +1641,17 @@ the 3B LFM2's from 12.14 to 11.31 and Unlimited-OCR's from 2.79 to 2.49. They st
 other model; the startup report's `chained launches` row says which and why. Where two models of more
 than one card share their cards, a launch behind a collective keeps its barrier bit (about 1% of
 a step; MULTIMODEL §9.1).
+
+A chained kernel acquires in its own prologue, behind its wait, so its packet goes out without
+the packet processor's acquire where every kernel library the engine loaded says its chained forms
+cover all they read there (`rad_kernel_chain` answering 2: libr4d's do, by emptying the scalar
+data cache behind the fence). That acquire holds the packet processor about 0.9 us a launch on an
+R9700 and comes before the kernel in front has written, so it guards nothing the launch reads. It
+did give the arguments the host had just written into VRAM the time to get there; the backend now
+sees to that itself and flushes the card's host data path in front of every doorbell, for every
+launch (a card that offers no flush register keeps the acquire). The log line `chained launches:
+on` says whether the packets take the acquire. `RADIANCE_AQL_CHAIN_FENCE=1` puts it back, to rule
+the change out.
 
 **Draft trees.** Where the model's plugin measured a gain (the Gemma 4 31B with DFlash2: +7%
 single-stream decode and +6-9% aggregate at 1-16 users on 4x R9700, +4% and +6-12% on two,
@@ -2422,7 +2435,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `server.api-key-env: NAME` | — | read the API key from the environment variable `NAME` instead of the file, so the key is not written where the configuration is kept or shown; an unset or empty `NAME` refuses startup like an empty `server.api-key` |
 | `server.allow-host: NAME` | — | a `Host` name the keyless loopback-only routes accept besides the loopback names; a list for several (§6.6) |
 | `server.trusted-proxy: CIDR` | — | a network whose sockets may name the client behind them, via `X-Forwarded-For`, for the log; vouching changes attribution, never access; a list for several (§6.6) |
-| `mm-max-patches: N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.18) |
+| `mm-max-patches: N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower, and 0 in a build without a media decoder (`RAD_WITH_FFMPEG`: it would refuse every media part, so the tower is not loaded and its card memory goes to the experts; an explicit N loads it); 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.18) |
 | `override-chat-template: PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
 | `max-queued-requests: N` | 8 × `max-num-seqs` | requests admitted and unfinished at once; past it, 429 |
 | `server.http-threads: N` | one per hardware thread, at least 4 | HTTP workers kept while idle |
@@ -4533,6 +4546,7 @@ TranslateGemma 18.3 ms a step, against 19.8-20.5.
 | `RADIANCE_G4_CALIB_LAYERS` | `lo:hi`: the same for `arch/gemma4`'s tap, which takes the Gemma 4 31B's Grams from its bf16 checkpoint (docs/ARCHITECTURES.md, gemma4) |
 | `RADIANCE_PROFILE_EVERY` | with `profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_AQL_STAMP`, `RADIANCE_AQL_STAMP_OUT` | `N`: time every dispatch of one recorded pass in N on card 0, each with a completion signal of its own, without changing its barriers or chains (`profile-ops` plays no recorded pass). One CSV line a dispatch (pass, record, queue, kernel, ordered, chained, start and end in ns) goes to `RADIANCE_AQL_STAMP_OUT` (default `/tmp/radiance-stamps-<pid>.csv`); `scripts/stampgaps.py` summarises it per kind of pass. AQL backend only |
+| `RADIANCE_AQL_CHAIN_FENCE` | `1`: a chained launch's packet keeps the packet processor's acquire even where the kernel libraries acquire in the kernel (§ "Chained launches"). For ruling the unfenced packets out of a fault, not for deployment: about 1% of a Qwen3.8-Flash-Next step. AQL backend only |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue

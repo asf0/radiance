@@ -214,13 +214,17 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
     }
     RAD_TRY(rad_dev_set(ranks_[0].device));
 
-    /* The ring holds three worst-case builds before a long-context prefill waits on an upload two
-     * builds back. A decode build's span is far smaller, so hundreds fit. */
+    /* The ring holds kRingBuilds worst-case builds. A speculative step takes four or more builds
+     * (history pass, draft rounds, the next verify), and reserve() must not wait on an upload of
+     * the step being issued (that would hold step_next back until the card ran this step's draft
+     * uploads): two steps of builds fit with room over. A decode build's span is far smaller than
+     * the worst case, so many more fit; this is pinned host memory only, the device slab stays
+     * one build. */
     int64_t worst_pay = 0;
     for (const Group& g : s.groups) worst_pay += max_seqs_ * g.max_blocks * (int64_t)sizeof(int32_t);
     const int64_t worst_ranges = worst_pay / k_range_max + max_seqs_ * (int64_t)s.groups.size() + 1;
     ranges_.reserve((size_t)worst_ranges);
-    ring_.bytes = 3 * (s.host_bytes + worst_ranges * (int64_t)sizeof(RadCopyRange) + k_carve_align);
+    ring_.bytes = kRingBuilds * (s.host_bytes + worst_ranges * (int64_t)sizeof(RadCopyRange) + k_carve_align);
     ring_.host = static_cast<char*>(rad_dev_alloc(ring_.bytes, RAD_MEM_HOST_PINNED));
     if (!ring_.host) {
         RAD_ERR("step batch staging: could not reserve %s of pinned host staging",

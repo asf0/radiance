@@ -26,6 +26,7 @@
 #include "mem/vram_budget.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
+#include "mm/media.h"
 #include "runtime/arena.h"
 #include "runtime/kvbind.h"
 #include "runtime/xprefetch.h"
@@ -1269,10 +1270,18 @@ int Engine::declare() {
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
         const bool always = pb.chain_pays == RAD_CHAIN_ALWAYS;
         const bool pays = always || (cfg_.n_spec > 0 && pb.chain_pays != RAD_CHAIN_NONE);
+        /* Their packets go without the packet processor's acquire where every row that can chain
+         * acquires in the kernel for all it reads (RadKernelChainFn saying 2): one row that does
+         * not, from any library this engine loaded, keeps the acquire on all of them, since a
+         * queue's packets are not told apart by library. */
+        bool fenced = pays;
+        for (const KernelRow& row : reg_->rows())
+            if (row.chain && !row.chain_fenced) fenced = false;
         /* Local: also beside an aux device. A cross-card wait is a barrier packet with a
          * system-scope acquire, which clears the queue's chain state (aql.cpp barrier()), so the
          * launch after it keeps its barrier bit; RADIANCE_AUX_NOCHAIN turns chaining off there. */
-        rad_dev_chain_infer(cfg_.aux_device >= 0 && std::getenv("RADIANCE_AUX_NOCHAIN") ? 0 : pays);
+        const bool aux_off = cfg_.aux_device >= 0 && std::getenv("RADIANCE_AUX_NOCHAIN");
+        rad_dev_chain_infer(pays && !aux_off ? (fenced ? 2 : 1) : 0);
         const bool on = rad_dev_chain_enabled() != 0;
         const char* why = on     ? (always ? "the model's plugin measured a gain with them"
                                            : "the model's plugin measured a gain with its "
@@ -1280,7 +1289,12 @@ int Engine::declare() {
                           : pays ? "the device backend does not chain"
                                  : "no drafter whose plugin measured a gain with them decodes "
                                    "speculatively";
-        RAD_INFO("chained launches: %s -- %s", on ? "on" : "off", why);
+        RAD_INFO("chained launches: %s -- %s%s", on ? "on" : "off", why,
+                 !on ? ""
+                 : rad_dev_chain_unfenced() ? "; their packets take no acquire from the packet processor"
+                                            : "; their packets keep the packet processor's acquire "
+                                              "(a row that chains does not acquire for its scalar "
+                                              "loads itself)");
         decide("chained launches", on ? "on" : "off", why);
     }
     /* Trees: a block drafter's proposals verified as a tree, where the model's plugin measured a
@@ -1321,18 +1335,32 @@ int Engine::declare() {
         const bool tower = rad_meta_geti(&meta_, "vision_config.patch_size", 0) > 0 ||
                            rad_meta_geti(&meta_, "vision_config.image_size", 0) > 0;
         cfg_.mm_max_patches = (enc && *enc) || (!file_ && tower) ? 16384 : 0;
+        /* A build with no media decoder (RAD_WITH_FFMPEG) refuses every media part, so a tower it
+         * loaded could never run a pass: it would only hold card memory the routed experts are
+         * short of. Qwen3.8-Flash-Next at tp 2 on two R9700: 857 MiB a rank, about 800 expert
+         * units a rank that the routed GEMMs then read from the pinned pool over the link instead
+         * of from the card. An explicit --mm-max-patches still loads the tower. */
+        const bool undecodable = cfg_.mm_max_patches > 0 && !mm::decoder_available();
+        if (undecodable) cfg_.mm_max_patches = 0;
         /* Whole output rows a pass: the plugin's merge, when it states one. */
         RadArchProbe pb{};
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
         if (cfg_.mm_max_patches > 0 && pb.enc_merge > 1)
             cfg_.mm_max_patches -= cfg_.mm_max_patches % pb.enc_merge;
-        if (cfg_.mm_max_patches == 0 && tower)
+        if (undecodable)
+            RAD_INFO("media: off -- the model carries a vision tower, but this build has no media "
+                     "decoder (RAD_WITH_FFMPEG) and would refuse every media part, so the tower "
+                     "is not loaded and its card memory goes to the experts and the cache; "
+                     "--mm-max-patches N loads it all the same");
+        else if (cfg_.mm_max_patches == 0 && tower)
             RAD_INFO("media: off -- the checkpoint has a vision tower but this container was "
                      "converted without its weights; convert again to serve images and video");
         decide("--mm-max-patches", std::to_string(cfg_.mm_max_patches),
                cfg_.mm_max_patches > 0
                    ? "the model carries a vision tower: 16384 patches is a 2048 x 2048 image, the "
                      "largest one encoder pass takes"
+               : undecodable ? "the model carries a vision tower, but this build has no media "
+                               "decoder to feed it"
                : tower ? "the checkpoint has a vision tower but this container was converted "
                          "without its weights"
                        : "the model carries no vision tower");
@@ -1760,6 +1788,7 @@ int Engine::plan() {
                 for (RadStream s : q) if (s) rad_stream_destroy(s);
             }
             f.n_queues = 2 + (r->program.scratch_regions > 1 ? 1 : 0);
+            f.queue_scratch = 0;   /* set below, once props are read */
             /* The weights' cost, split into the fixed floor and the elastic plane
              * (weight_footprint in core/place/planner.h). Per rank, so already this card's share
              * under TP. */
@@ -1780,6 +1809,7 @@ int Engine::plan() {
             }
             RadDeviceProps props{};
             rad_dev_props(r->device, &props);
+            f.queue_scratch = rad_dev_resident_scratch_bytes(&props);
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
             /* Unified memory: the pinned host pool is the same RAM as the card, so the
@@ -3749,6 +3779,9 @@ int Engine::load_weights() {
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
+        /* The lent slots kept free for swaps follow the swaps asked for (mover.h): a rank that
+         * holds nearly all its experts gets the idle ones back as residents. */
+        mc.turnover_adaptive = true;
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         if (cfg_.aux_device >= 0) r->mover.set_no_loans(true);   /* local: Mover::set_no_loans */
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool

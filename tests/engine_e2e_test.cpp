@@ -22,6 +22,7 @@
 #include "rad_test.h"
 #include "e2e_config.h"
 #include "tiny_golden.h"
+#include "lfm3_golden.h"
 #include "tiny_model.h"
 
 #include "mm/media.h"
@@ -193,7 +194,7 @@ std::string words(tiny::Rng& r, size_t n) {
 struct World {
     /* RAD_E2E_KEEP keeps the checkpoints for tests/mktinygolden.py, which reads them. */
     tiny::TempDir dir{ "e2e", std::getenv("RAD_E2E_KEEP") != nullptr };
-    std::string qwen35, lfm2, gemma4, llama, llama_rad;
+    std::string qwen35, lfm2, lfm3, gemma4, llama, llama_rad;
     /* llama.rad with its lm head int8 per (row, 128 of K). */
     std::string llama_i8head;
     /* The llama as an int4 W4A16 release with zero points (tiny_model.h, write_llama_ct_int4),
@@ -231,6 +232,7 @@ struct World {
             fprintf(stderr, "    checkpoints kept in %s\n", dir.path.c_str());
         qwen35 = dir / "qwen35";
         lfm2 = dir / "lfm2";
+        lfm3 = dir / "lfm3";
         gemma4 = dir / "gemma4";
         llama = dir / "llama";
         llama_rad = dir / "llama.rad";
@@ -246,7 +248,7 @@ struct World {
         g31_df2 = dir / "g31_df2.rad";
         g31w = dir / "g31w";
         g31w_df2 = dir / "g31w_df2.rad";
-        for (const std::string* d : { &qwen35, &lfm2, &gemma4, &llama, &qwen35_kv, &gemma4_kv,
+        for (const std::string* d : { &qwen35, &lfm2, &lfm3, &gemma4, &llama, &qwen35_kv, &gemma4_kv,
                                       &qwen35_spec, &qwen3asr, &llama_int4, &g31, &g31_draft, &g31w })
             if (mkdir(d->c_str(), 0755) != 0) return;
         tiny::Qwen35 qkv;
@@ -270,6 +272,7 @@ struct World {
         tiny::Gemma4 g31ws = g31s;
         g31ws.window = 1024;
         if (!tiny::write_qwen35(qwen35, {}) || !tiny::write_lfm2(lfm2, {}) ||
+            !tiny::write_lfm3(lfm3, {}) ||
             !tiny::write_gemma4(gemma4, {}) || !tiny::write_llama(llama, {}) ||
             !tiny::write_qwen35(qwen35_kv, qkv) || !tiny::write_gemma4(gemma4_kv, gkv) ||
             !tiny::write_qwen35(qwen35_spec, qspec) || !tiny::write_qwen3asr(qwen3asr, {}) ||
@@ -1199,12 +1202,76 @@ TEST(runtime_lora_refuses_targets_it_cannot_serve_at_startup) {
     CHECK(has(s.log, "has the served model's own name"));
 }
 
+/* LFM3's IQ8R container (data/recipes/lfm3-1.7b-iq8r.recipe) beside the bf16 container of the same
+ * checkpoint, a tiny LFM3 at widths the recipe's scale group divides: the recipe quantises the
+ * eight trunk linears of every layer and nothing else, the engine serves it, and its record stays
+ * near the bf16 one. On random weights of this size rounding to int8 moves an agreed top token's
+ * log-probability by up to 0.2 and changes the top token at one position in sixteen; a rotation
+ * applied on one side only, or a scale plane read at the wrong group, leaves no resemblance. */
+TEST(lfm3_iq8r_container_tracks_the_bf16_one) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_lfm3_iq8r");
+    tiny::Lfm3 spec;
+    spec.hidden = 256; spec.heads = 4; spec.kv_heads = 2; spec.ffn = 512;
+    const std::string ckpt = d / "ckpt";
+    REQUIRE_EQ(mkdir(ckpt.c_str(), 0755), 0);
+    REQUIRE(tiny::write_lfm3(ckpt, spec));
+    REQUIRE(World::write_corpus(d / "corpus.jsonl", { kTinyGoldPrompt }));
+    auto convert = [&](const std::string& out, bool iq8r, std::string* log) {
+        std::vector<std::string> argv = { RAD_E2E_CONVERT, d / "ckpt", "-o", out };
+        if (iq8r) {
+            argv.push_back("--recipe");
+            argv.push_back(RAD_E2E_RECIPES "/lfm3-1.7b-iq8r.recipe");
+        }
+        const int st = tiny::run(argv, engine_env({}), log);
+        if (st != 0) fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(*log).c_str());
+        return st;
+    };
+    std::string blog, qlog;
+    REQUIRE_EQ(convert(d / "bf16.rad", false, &blog), 0);
+    REQUIRE_EQ(convert(d / "iq8r.rad", true, &qlog), 0);
+    /* 2 conv layers x 4 linears and 2 attention layers x 6; the gate is not among them */
+    CHECK(qlog.find("20 quantised by the recipe") != std::string::npos);
+
+    struct Top { int32_t id; float lp; };
+    const size_t row = 16 * sizeof(Top);
+    auto record = [&](const char* name) {
+        const std::string out = d / (std::string(name) + ".rec");
+        Ran r = radiance(d / (std::string(name) + ".rad"),
+                         { "--kld-record", out, "--kld-corpus", d / "corpus.jsonl" });
+        if (r.status != 0) fprintf(stderr, "    %s:\n%s\n", name, tail(r.log).c_str());
+        return r.status == 0 ? tiny::read_text(out + "/top.bin") : std::string();
+    };
+    const std::string a = record("bf16"), q = record("iq8r");
+    REQUIRE(!a.empty());
+    REQUIRE_EQ(q.size(), a.size());
+    REQUIRE(a != q);                                   /* the int8 trunk is what ran */
+    const int n = (int)(a.size() / row);
+    int same = 0;
+    double worst = 0;
+    for (int p = 0; p < n; ++p) {
+        Top x, y;
+        std::memcpy(&x, a.data() + (size_t)p * row, sizeof x);
+        std::memcpy(&y, q.data() + (size_t)p * row, sizeof y);
+        if (x.id != y.id) continue;
+        ++same;
+        worst = std::max(worst, (double)std::fabs(x.lp - y.lp));
+    }
+    fprintf(stderr, "    lfm3 iq8r against bf16: %d of %d top tokens equal, worst |dlogp| %.4f\n",
+            same, n, worst);
+    CHECK(same * 10 >= n * 9);
+    CHECK(worst < 0.5);
+}
+
 /* ================================================================== against transformers */
 
 /* Each family's forward pass against transformers' own, run in float32 over the same weights
  * (tests/tiny_golden.h, from tests/mktinygolden.py): the gated delta net with its query scale and
  * (1 + w) norms, the gated and partial-rotary attention, LFM2's convolutions, Gemma 4's sliding and
- * K-equals-V global layers, soft cap and layer scalars. bf16 activations put this engine within
+ * K-equals-V global layers, soft cap and layer scalars; LFM3 against LiquidAI's own modelling code
+ * (tests/lfm3_golden.h, from tests/mklfm3golden.py), for its sandwich norms, head gates, partial
+ * rotary and sliding window. bf16 activations put this engine within
  * about 0.08 of transformers' log-probabilities; a wrong rotary width, window or epsilon moves
  * them by 0.5 or more and changes the top token at a tenth of the positions. So at every position
  * the top token must agree, unless transformers' own top two are within the bound, and the
@@ -1214,16 +1281,22 @@ TEST(each_family_computes_what_transformers_computes) {
     REQUIRE(w.ok);
     tiny::TempDir d("e2e_gold");
     REQUIRE(World::write_corpus(d / "corpus.jsonl", { kTinyGoldPrompt }));
-    for (const TinyGold& g : kTinyGold) {
+    std::vector<const TinyGold*> golds;
+    for (const TinyGold& g : kTinyGold) golds.push_back(&g);
+    golds.push_back(&kLfm3Gold);
+    for (const TinyGold* gp : golds) {
+        const TinyGold& g = *gp;
         const std::string family = g.family;
         const std::string model = family == "qwen35" ? w.qwen35
                                 : family == "lfm2"   ? w.lfm2
+                                : family == "lfm3"   ? w.lfm3
                                                      : w.gemma4;
         const uint64_t h = fnv1a(tiny::read_text(model + "/model.safetensors"));
         if (h != g.weights_fnv)
             fprintf(stderr, "    %s: the checkpoint is not the one the golden was made from; "
-                            "regenerate tests/tiny_golden.h with tests/mktinygolden.py\n",
-                    g.family);
+                            "regenerate tests/%s\n",
+                    g.family, family == "lfm3" ? "lfm3_golden.h with tests/mklfm3golden.py"
+                                               : "tiny_golden.h with tests/mktinygolden.py");
         REQUIRE_EQ(h, g.weights_fnv);
         const std::string out = d / family;
         Ran r = radiance(model, { "--kld-record", out, "--kld-corpus", d / "corpus.jsonl" });
@@ -1266,6 +1339,15 @@ TEST(lfm2_chunking_and_batching_change_no_logit) {
     check_recording_matches(world().lfm2, world().corpus_short,
                             { "--max-num-batched-tokens", "64", "--max-num-seqs", "1" });
     check_recording_matches(world().lfm2, world().corpus_short,
+                            { "--max-num-batched-tokens", "512", "--max-num-seqs", "4" });
+}
+
+/* LFM3 has both states at once: the convolution's rolling window, seven taps wide, and an 8-token
+ * attention window on its sliding layers, which every document crosses. */
+TEST(lfm3_chunking_and_batching_change_no_logit) {
+    check_recording_matches(world().lfm3, world().corpus_short,
+                            { "--max-num-batched-tokens", "64", "--max-num-seqs", "1" });
+    check_recording_matches(world().lfm3, world().corpus_short,
                             { "--max-num-batched-tokens", "512", "--max-num-seqs", "4" });
 }
 
@@ -1386,6 +1468,7 @@ TEST(libavx_alone_serves_every_family_within_rounding_of_libref) {
     const struct { const char* name; const std::string* model; const std::string* corpus; }
         kRuns[] = { { "qwen35 on libavx", &w.qwen35, &w.corpus },
                     { "lfm2 on libavx", &w.lfm2, &w.corpus_short },
+                    { "lfm3 on libavx", &w.lfm3, &w.corpus_short },
                     { "gemma4 on libavx", &w.gemma4, &w.corpus_short },
                     { "llama_fp8 on libavx", &w.llama_rad, &w.corpus_tiny },
                     { "qwen3asr's decoder on libavx", &w.qwen3asr, &w.corpus_short } };
@@ -1737,7 +1820,8 @@ struct Family {
     const char* name;
     std::string World::*model;
 };
-const Family kSpecFamilies[] = { { "lfm2", &World::lfm2 }, { "gemma4", &World::gemma4 },
+const Family kSpecFamilies[] = { { "lfm2", &World::lfm2 }, { "lfm3", &World::lfm3 },
+                                 { "gemma4", &World::gemma4 },
                                  { "qwen35", &World::qwen35_spec } };
 
 const std::vector<int32_t>& repetitive_prompt() {
@@ -1835,7 +1919,7 @@ TEST(concurrent_requests_return_what_each_returns_alone) {
     for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(100 + i, 60 + 37 * i));
     const struct { const char* name; std::string World::*model; const char* n_spec; } kRuns[] = {
         { "qwen35", &World::qwen35, "4" }, { "lfm2", &World::lfm2, "4" },
-        { "gemma4", &World::gemma4, "4" } };
+        { "lfm3", &World::lfm3, "4" }, { "gemma4", &World::gemma4, "4" } };
     for (const auto& run : kRuns) {
         std::vector<std::vector<int32_t>> alone;
         {
@@ -2045,6 +2129,70 @@ TEST(a_prompt_resumed_from_a_window_snapshot_returns_what_a_cold_run_does) {
     }
 }
 
+/* LFM3 resumes three kinds of state at once: the full-attention layers from the cached blocks, the
+ * sliding layers from a window snapshot, and the convolutions' last inputs from the same checkpoint
+ * slot. The convolutions make it a linear-state model to the scheduler, so checkpoints follow the
+ * interval and not the window's lower floor. Under `exact` a prompt sharing a 200-token head
+ * resumes at a checkpoint (every 64 tokens) inside it; under `nearest` a prompt that extends a
+ * 600-token one resumes from that prompt's tail checkpoint, 75 windows deep. Either way the reply,
+ * and every probability in it, equals a cold run's, and so does a repeat, which resumes further
+ * in. */
+TEST(lfm3_resumed_from_the_prefix_cache_returns_what_a_cold_run_does) {
+    REQUIRE(world().ok);
+    struct Case {
+        const char* name;
+        std::vector<int32_t> first, second;
+        std::vector<std::string> args;
+        int64_t lo, hi;                     /* where the shared hit must end */
+    };
+    std::vector<Case> cases;
+    {
+        const std::vector<int32_t> head = prompt_ids(7, 200);
+        std::vector<int32_t> a = head, b = head;
+        for (int32_t t : prompt_ids(8, 70)) a.push_back(t);
+        for (int32_t t : prompt_ids(9, 90)) b.push_back(t);
+        cases.push_back({ "exact", a, b,
+                          { "--num-speculative-tokens", "0", "--checkpoint-interval", "64" }, 1,
+                          200 });
+        const std::vector<int32_t> c = prompt_ids(51, 600);
+        std::vector<int32_t> d = c;
+        for (int32_t t : prompt_ids(52, 60)) d.push_back(t);
+        cases.push_back({ "nearest", c, d,
+                          { "--num-speculative-tokens", "0", "--checkpoint-interval", "64",
+                            "--prefix-resume", "nearest" },
+                          512, 599 });
+    }
+    for (const Case& k : cases) {
+        json cold;
+        {
+            Server s;
+            REQUIRE(s.start(world().lfm3, kPlain));
+            cold = post(s.port, "/completion", completion(k.second, 24, 0.0, 0, 3));
+            CHECK_EQ(s.stop(), 0);
+        }
+        Server s;
+        REQUIRE(s.start(world().lfm3, k.args));
+        (void)post(s.port, "/completion", completion(k.first, 24, 0.0, 0, 3));
+        const json shared = post(s.port, "/completion", completion(k.second, 24, 0.0, 0, 3));
+        const json again = post(s.port, "/completion", completion(k.second, 24, 0.0, 0, 3));
+        const int64_t c1 = timing(shared, "cache_n"), c2 = timing(again, "cache_n");
+        REQUIRE(cold.contains("completion_probabilities"));
+        const bool same = tokens_of(shared) == tokens_of(cold) &&
+                          tokens_of(again) == tokens_of(cold) &&
+                          shared["completion_probabilities"] == cold["completion_probabilities"] &&
+                          again["completion_probabilities"] == cold["completion_probabilities"];
+        if (!(c1 >= k.lo && c1 <= k.hi && c2 > c1 && same))
+            fprintf(stderr, "    %s: cached %lld then %lld, %s a cold run's\n", k.name,
+                    (long long)c1, (long long)c2, same ? "equal to" : "NOT equal to");
+        CHECK(c1 >= k.lo);
+        CHECK(c1 <= k.hi);
+        CHECK(c2 > c1);
+        CHECK_EQ(tokens_of(cold).size(), (size_t)24);
+        CHECK(same);
+        CHECK_EQ(s.stop(), 0);
+    }
+}
+
 /* The row a running server's /diagnostics reports for `option`, or null. */
 json config_row(int port, const std::string& option) {
     Call c;
@@ -2248,7 +2396,8 @@ TEST(a_requests_last_step_issues_no_step_ahead) {
 TEST(a_decoded_token_has_the_probabilities_prefilling_it_gives) {
     REQUIRE(world().ok);
     const struct { const char* name; std::string World::*model; double tol; } kRuns[] = {
-        { "lfm2", &World::lfm2, 0.0 }, { "gemma4", &World::gemma4, 0.0 },
+        { "lfm2", &World::lfm2, 0.0 }, { "lfm3", &World::lfm3, 0.0 },
+        { "gemma4", &World::gemma4, 0.0 },
         { "llama_fp8", &World::llama_rad, 0.0 }, { "qwen35", &World::qwen35, 0.1 } };
     const std::vector<int32_t> p = prompt_ids(31, 120);
     for (const auto& run : kRuns) {

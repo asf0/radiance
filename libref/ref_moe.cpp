@@ -295,6 +295,7 @@ static CbForm cb_form(const RadParam* p, int n_p) {
     if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true };
+    if (s && !std::strcmp(s, "w6nl64a8h")) return CbForm{ 6, 64, RAD_F8E4M3, true };
     /* The same stored experts under their names against an int8 activation. */
     if (s && !std::strcmp(s, "w4nl64a8i8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w4nl32a8i8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
@@ -318,7 +319,7 @@ static int cb_check(const RadParam* p, int n_p, int operand, const RadEncoding* 
     const RadEncPlane& b = enc->plane[sel[1]];
     if (codes)
         return !std::strcmp(a.role, "codes") && a.kind == RAD_PLANE_TILED &&
-               a.dtype == (f.bits == 5 ? (uint32_t)RAD_U5 : (uint32_t)RAD_U4) &&
+               a.dtype == (f.bits == 6 ? (uint32_t)RAD_U6 : f.bits == 5 ? (uint32_t)RAD_U5 : (uint32_t)RAD_U4) &&
                a.block[0] == 1 && a.block[1] == 1 && !std::strcmp(b.role, "table") &&
                b.kind == RAD_PLANE_TABLE && b.dtype == RAD_F32 && b.extent[0] == 1 &&
                b.extent[1] == ((int64_t)1 << f.bits)
@@ -368,7 +369,7 @@ static const RadPlanesHeader* cb_joined(const RadTensor& t) {
  * `row_bytes` apart, the layout rad_planes.h keeps. */
 struct CbTensor {
     RadTensor t;              /* `data`: the codes plane, from the tile's first weight row */
-    float     tab[32];
+    float     tab[64];
     int64_t   cols = 0, row_bytes = 0;
     int       bits = 0;
 };
@@ -385,13 +386,13 @@ struct LdCb {
  * codes not covering [n, k]. A u4 or u5 entry is always joined: only its table says what a code
  * means. */
 static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbTensor* out) {
-    if (w.dtype != RAD_U4 && w.dtype != RAD_U5) return 0;
+    if (w.dtype != RAD_U4 && w.dtype != RAD_U5 && w.dtype != RAD_U6) return 0;
     const RadPlanesHeader* h = rad_planes_header(w.data);
     const RadPlanesEntry *ec = nullptr, *et = nullptr;
     const void* codes = h ? rad_planes_find(w.data, "codes", &ec) : nullptr;
     const void* tab = h ? rad_planes_find(w.data, "table", &et) : nullptr;
     if (!codes || !tab || h->n_planes != 2) return RAD_E_DTYPE;
-    const int bits = ec->dtype == RAD_U4 ? 4 : ec->dtype == RAD_U5 ? 5 : 0;
+    const int bits = ec->dtype == RAD_U4 ? 4 : ec->dtype == RAD_U5 ? 5 : ec->dtype == RAD_U6 ? 6 : 0;
     if (!bits || ec->kind != RAD_PLANE_TILED || ec->block[0] != 1 || ec->block[1] != 1 ||
         et->kind != RAD_PLANE_TABLE || et->dtype != RAD_F32 ||
         et->rows * et->cols != ((int64_t)1 << bits))

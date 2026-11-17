@@ -282,6 +282,39 @@ TEST(gptq_with_a_hessian_lowers_the_output_error) {
     CHECK(gc.planes[1] == g.planes[1]);
 }
 
+TEST(w6nl_gptq_and_coordinate_descent_accept_bf16_domain_hessians) {
+    NEED_LIBQUANT();
+    const int64_t R = 16, C = 128, T = 4096;
+    std::vector<float> h((size_t)(C * C), (float)T * 0.25f);
+    for (int64_t i = 0; i < C; ++i) h[(size_t)(i * C + i)] += (float)T;
+    const TempDir td("rad_w6nl_gptq");
+    REQUIRE(!td.path.empty());
+    REQUIRE(write_gram(td.path + "/gram.r0.blk.3.ffn_down_exps.bin", C, T, h));
+    Opts o;
+    o.s("table", "w6nl").i("group", 64).s("scale", "fp8_e4m3").s("scale2", "f32")
+     .s("block2", "*x*").f("scale2_value", 0x1p-13).s("transform", "fwht128")
+     .s("rule", "search").i("cd", 3).s("calib", td.path.c_str());
+    const std::vector<float> w = draw(R * C, 770, 1.0f);
+    const Quantised q = quantise(quantizer("gptq"), o, "blk.3.ffn_down_exps.17.weight", R, C, w);
+    REQUIRE_EQ(q.status, RAD_OK);
+    CHECK_EQ(q.enc.plane[0].dtype, (uint32_t)RAD_U6);
+    CHECK_EQ(q.planes[0].size(), (size_t)(R * C * 6 / 8));
+    CHECK_EQ(q.enc.plane[3].extent[1], 64LL);
+    for (int i = 0; i < 64; ++i) {
+        float value = 0.0f;
+        std::memcpy(&value, q.planes[3].data() + i * sizeof(float), sizeof value);
+        const uint8_t fp8 = rad_f32_to_fp8e4m3(value);
+        CHECK_EQ(rad_load_f32(&fp8, RAD_F8E4M3, 0), value);
+        if (i >= 32) {
+            float positive = 0.0f;
+            std::memcpy(&positive, q.planes[3].data() + (i - 32) * sizeof(float), sizeof positive);
+            CHECK_EQ(value, -positive);
+        }
+    }
+    const std::vector<float> decoded = decode(q, R, C);
+    CHECK(rel_err(w, decoded) < 0.2);
+}
+
 /* ------------------------------------------------------------------ recipes, compiled
  *
  * A rule's options are typed by its quantiser's own table before declare runs, so a misspelt key or
@@ -337,7 +370,10 @@ TEST(every_shipped_recipe_compiles_and_its_grids_are_accepted) {
     REQUIRE(!calib.path.empty());
     const char* old = std::getenv("CALIB");
     const std::string saved = old ? old : "";
+    const char* old_mtp = std::getenv("MTP_CALIB");
+    const std::string saved_mtp = old_mtp ? old_mtp : "";
     setenv("CALIB", calib.path.c_str(), 1);
+    setenv("MTP_CALIB", calib.path.c_str(), 1);
 
     int files = 0, rules = 0;
     std::error_code ec;
@@ -391,6 +427,7 @@ TEST(every_shipped_recipe_compiles_and_its_grids_are_accepted) {
     CHECK(rules >= 250);
     std::filesystem::current_path(cwd, ec);
     if (old) setenv("CALIB", saved.c_str(), 1); else unsetenv("CALIB");
+    if (old_mtp) setenv("MTP_CALIB", saved_mtp.c_str(), 1); else unsetenv("MTP_CALIB");
 }
 
 /* ------------------------------------------------------------------ GPTQ against the textbook
@@ -660,6 +697,7 @@ TEST(round_to_nearest_stores_the_nearest_code_on_every_grid) {
         "table=iq4nl,group=32,scale=f16",
         "table=w4nl,group=128,scale=bf16,transform=fwht128",
         "table=w5nl,group=64,scale=fp8_e4m3,scale2=f32",
+        "table=w6nl,group=64,scale=fp8_e4m3,scale2=f32,transform=fwht128,rule=search",
         "table=binary,group=32,scale=f16,rule=search",
         "table=ternary,group=32,scale=bf16",
         "table=-1.5;-0.25;0;0.5;2,group=32,scale=f32",

@@ -134,6 +134,11 @@ struct GdnFP8 {
      * pf_out_rows rows and pf_out_seqs sequences. 0 where none is declared. */
     rad_op  op_pf_out = 0;
     int64_t pf_out_rows = 0, pf_out_seqs = 0;
+    /* The same read as a second op for steps of at least pf_out_v_rows rows, where the
+     * architecture measured another workgroup count for them (decl_prefetch's `blocks`); 0 where
+     * every step takes op_pf_out. */
+    rad_op  op_pf_out_v = 0;
+    int64_t pf_out_v_rows = 0;
     rad_op op_ar = 0, op_add = 0;
     /* The next block absorbs this block's closing all-reduce (see rad_block_attn_gated_fp8.h). */
     bool ar_out = false;
@@ -508,11 +513,12 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * holds nothing behind it), else on the second lane behind a join from lane 0 (as
      * prefetch_beside). */
     if (op_pf_out && D > 0 && D <= pf_out_seqs && P == 0 && T <= pf_out_rows) {
+        const rad_op pf = op_pf_out_v && T >= pf_out_v_rows ? op_pf_out_v : op_pf_out;
         if (prefetch_lane0()) {
-            RAD_ISSUE(c, op_pf_out, RAD_W(out.w));
+            RAD_ISSUE(c, pf, RAD_W(out.w));
         } else {
             if (rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK)
-                RAD_ISSUE(c, op_pf_out, RAD_W(out.w));
+                RAD_ISSUE(c, pf, RAD_W(out.w));
             rad_lane(c, 0);
         }
     }

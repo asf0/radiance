@@ -64,6 +64,9 @@ struct KernelRow {
     bool                 reference = false;
     /* rad_kernel_chain: its launches can wait in the kernel instead of behind the barrier bit. */
     bool                 chain = false;
+    /* rad_kernel_chain said 2: its chained forms' acquire covers their scalar loads too, so their
+     * packets need no acquire from the packet processor. */
+    bool                 chain_fenced = false;
 };
 
 /* A kernel bound to one geometry, one domain and one variant, with init() already run. */

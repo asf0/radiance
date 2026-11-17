@@ -1264,7 +1264,11 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
     for (size_t r = 0; r < ranks_.size(); ++r) {
         const int ri = (int)r;
         RadVideoGenBatch& V = vout_[(size_t)r];
-        V.enc_geom_d = dptr<int32_t>(ri, R_ENCG);
+        /* The encoder mixes device kernels with host-only k=1 convolutions and snake
+         * activations. Those host ops dereference their raw geometry operand directly;
+         * a rank's VRAM copy segfaults on discrete GPUs. The pinned staging table is
+         * readable by both execution sites and lives until this pass has completed. */
+        V.enc_geom_d = hptr<int32_t>(R_ENCG);
         V.enc_kind = it.kind;
         V.enc_slot = it.slot;
         if (audio) {

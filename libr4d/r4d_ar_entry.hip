@@ -266,6 +266,10 @@ int ar8_settle(ArInst* in, int rank, int world) {
  * counter, padded to a cache line. */
 long kSeqWords(long nbw) { return 2L * nbw + 32; }
 
+/* Behind a flags allocation's flags and check words: a 2-rank instance's wake word
+ * (r4d_ar_link_wake, r4d_ar_seq.h), on a line of its own. */
+constexpr long kWakeBytes = 64;
+
 /* Build the world. `max_numel` is the largest message any launch on this instance carries.
  *
  * One sizing rule for the whole family: a slot holds a full message. The one-shots need exactly
@@ -367,10 +371,10 @@ int build(ArInst* in, long long group, int rank, int world, long long max_numel,
         if (hipGetDevice(&dev) != hipSuccess) return RAD_E_DEVICE;
         if (host) {
             sc = r4d_ar_host_alloc((long)nslots * in->slot_bytes);
-            fl = r4d_ar_host_alloc((flag_words + 2L * maxb) * 4);
+            fl = r4d_ar_host_alloc((flag_words + 2L * maxb) * 4 + kWakeBytes);
         } else {
             sc = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 1, handle, &hlen);
-            fl = r4d_ar_ipc_alloc((flag_words + 2L * maxb) * 4, 1, handle, &hlen);
+            fl = r4d_ar_ipc_alloc((flag_words + 2L * maxb) * 4 + kWakeBytes, 1, handle, &hlen);
         }
         sq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 0, handle, &hlen));
 
