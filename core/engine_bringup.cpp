@@ -4864,7 +4864,8 @@ int Engine::start() {
 
     if (cfg_.aux_device >= 0) {
         aux_auto_ = cfg_.aux_split < 0;
-        rad_tools_set_aux_split(aux_auto_ ? 0 : cfg_.aux_split);
+        plugins_.aux_device = cfg_.aux_device;
+        plugins_.aux_split = aux_auto_ ? 0 : cfg_.aux_split;
     }
     RAD_TRY(declare());
 
@@ -4903,7 +4904,7 @@ int Engine::start() {
         rad_tools_registry().fini_instances();
         rad_aux_registry().fini_instances();
         for (auto& r : ranks_) r->program = Program{};
-        rad_tools_set_aux_split(cfg_.aux_split);
+        plugins_.aux_split = cfg_.aux_split;
         RAD_TRY(declare());
         RAD_TRY(plan());
     }

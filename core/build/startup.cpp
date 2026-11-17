@@ -73,9 +73,8 @@ void rad_engine_release(const std::string& arch_plugin, int slot_base, int n_ran
  * Never destroyed, for the reason above. */
 static std::vector<std::string> home_subdirs(const std::string& home, const char* sub);
 static int g_aux_device = -1;   /* set once the aux kernels loaded */
+static std::mutex g_aux_mu;
 int rad_tools_aux_device() { return g_aux_device; }
-static int64_t g_aux_split = 0;   /* the split the next declare uses (rad_aux_split) */
-void rad_tools_set_aux_split(int64_t n) { g_aux_split = n; }
 
 Registry& rad_aux_registry() {
     static Registry* r = new Registry();
@@ -84,6 +83,15 @@ Registry& rad_aux_registry() {
 
 int rad_tools_load_aux_kernels(const std::string& home, const std::vector<std::string>& hierarchy,
                                int device) {
+    /* Once a process: a fleet starts the same model's engine again after an unload, and the
+     * registry refuses a second copy of a library. One aux card a process. */
+    std::lock_guard<std::mutex> lk(g_aux_mu);
+    if (g_aux_device == device) return RAD_OK;
+    if (g_aux_device >= 0) {
+        RAD_ERR("--aux-device %d: this process already serves aux device %d; one aux card a process",
+                device, g_aux_device);
+        return RAD_E_INVAL;
+    }
     Registry& r = rad_aux_registry();
     r.set_code_device(device);
     std::vector<std::string> kdirs = home_subdirs(home, "kernels");
@@ -497,7 +505,7 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
     }
 
     Builder b(r, meta, ctx);
-    if (g_aux_device >= 0) { b.set_aux(&rad_aux_registry(), g_aux_device); b.set_aux_split(g_aux_split); }
+    if (lp.aux_device >= 0) { b.set_aux(&rad_aux_registry(), lp.aux_device); b.set_aux_split(lp.aux_split); }
     if (ref) b.set_reference(ref);
     if (sources) b.set_sources(sources);
     b.set_instances(instances);

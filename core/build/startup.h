@@ -38,6 +38,11 @@ struct LoadedPlugins {
     /* The registry declare selects through: an engine's own share of the process set
      * (Registry::share), or null for the process registry itself, as the tools use. */
     Registry*                   registry = nullptr;
+    /* Local: this engine's aux device (-1 none) and the routed experts a layer its declare keeps on
+     * the rank's card. Per engine, not per process: in a fleet a model without --aux-device
+     * declares beside one that has it. */
+    int                         aux_device = -1;
+    int64_t                     aux_split = 0;
 
     /* `name@version`, space separated, in hierarchy order; what a benchmark records as the
      * libraries measured. */
@@ -183,7 +188,6 @@ Registry& rad_tools_registry();
 /* Local: the aux device's registry and its loader (kernel libraries only). */
 Registry& rad_aux_registry();
 int rad_tools_aux_device();   /* -1 until rad_tools_load_aux_kernels succeeded */
-void rad_tools_set_aux_split(int64_t n);
 int rad_tools_load_aux_kernels(const std::string& home, const std::vector<std::string>& hierarchy,
                                int device);
 
