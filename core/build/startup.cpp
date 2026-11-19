@@ -15,6 +15,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 
 namespace rad {
 
@@ -516,6 +517,30 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
     if (s < 0) {
         RAD_ERR("%s: rad_arch_declare returned %s", lp.arch_plugin.c_str(), rad_strerror(s));
         for (const auto& e : b.errors()) RAD_ERR("    %s", e.c_str());
+        /* A plugin that needs an op it declared, and finds it resolved to no kernel, returns a
+         * status and may say nothing more. The ops no library serves in either domain are the
+         * usual reason on a card whose kernel library covers fewer forms, so they are listed with
+         * the constraint that refused each: the device's line, which names the form the card
+         * lacks. */
+        const Program& p = b.program();
+        std::set<std::pair<int32_t, std::string>> no_host;
+        for (const Program::Miss& m : p.misses)
+            if (m.domain == RAD_DOMAIN_HOST) no_host.emplace(m.index, m.span);
+        std::vector<std::string> unserved;
+        for (const Program::Miss& m : p.misses) {
+            if (m.domain != RAD_DOMAIN_DEVICE || !no_host.count({ m.index, m.span })) continue;
+            const std::string line = m.line();
+            if (std::find(unserved.begin(), unserved.end(), line) == unserved.end())
+                unserved.push_back(line);
+        }
+        if (!unserved.empty()) {
+            const size_t shown = std::min<size_t>(unserved.size(), 16);
+            RAD_ERR("    %zu op form(s) it declared before stopping have no kernel in the loaded "
+                    "libraries, on the card or on the host; a plugin that needs one of them stops "
+                    "where it finds that%s:", unserved.size(),
+                    shown < unserved.size() ? " (the first 16)" : "");
+            for (size_t i = 0; i < shown; ++i) RAD_ERR("      %s", unserved[i].c_str());
+        }
         return s;
     }
 

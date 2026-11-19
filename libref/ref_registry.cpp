@@ -654,7 +654,8 @@ static const RadParamSpec pMoeGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_
                                           P_INTO("parts"), P_INTO("a_group") };
 static const RadOperandSpec oMoeGemmQ[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"), WTAB("w_scale"),
                                             OPD("sorted_tok"), OPD("expert_offset"),
-                                            WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y") };
+                                            WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y"),
+                                            OPD_O("split") };
  /* The same op over four classes by expert number mod 4: `w`/`w_scale` class 0 at [N, K],
  * `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry e / 4 of class e % 4; how four ranks
  * share the extra block of a five-block expert (as in libr4d's schema). */
@@ -667,7 +668,8 @@ static const RadOperandSpec oMoeGemmQMod4[] = { OPD("a"), OPD_O("a_scale"), WTAB
                                                 WTAB("w_scale"), OPD("sorted_tok"),
                                                 OPD("expert_offset"), WTAB("w_1"),
                                                 WTAB("w_1_scale"), WTAB("w_2"), WTAB("w_2_scale"),
-                                                WTAB("w_3"), WTAB("w_3_scale"), OUT("y") };
+                                                WTAB("w_3"), WTAB("w_3_scale"), OUT("y"),
+                                                OPD_O("split") };
 
 /* With `shared` and `shared_gate`, the shared expert is folded in: y = bf16(shared * act(gate)) +
  * bf16(gathered), scale_rows' fused gate-and-add. `act` (sigmoid or none) applies to the scalar. */

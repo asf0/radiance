@@ -616,7 +616,13 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
             return no(fmt("%s reads K=%lld against a weight of %lld columns (a widened, rotated "
                           "input)", op.op.c_str(), k, (long long)w.decl.shape[1]));
     }
-    if (w.enc_known && w.enc.transform[0])
+    /* A quantised GEMM over a transformed weight is fed had_quant's rotated codes, so the adapter
+     * epilogue would multiply A against a transformed activation. A plain fp GEMM (gemm_nt,
+     * gemm_nt_bias) is fed what the architecture hands it: plain activations, with the kernel
+     * library's layout/relayout hooks presenting the planes in the plain basis at load (a plain
+     * kernel with no such hook is refused at declare by its own layout, RAD_E_DTYPE). A resolved
+     * plain GEMM over a transformed encoding is therefore basis-safe for the adapter epilogue. */
+    if ((gq || gqb) && w.enc_known && w.enc.transform[0])
         return no(fmt("weight '%s' is stored in the '%.*s' transform basis, so its GEMM is fed a "
                       "transformed activation", w.name.c_str(), (int)RAD_ENC_STR, w.enc.transform));
     return true;
@@ -631,6 +637,10 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
     for (size_t i = 1; i < prog.ops.size(); ++i) {
         const OpInfo& op = prog.ops[i];
         if (op.weights.empty() || !op_live(op)) continue;
+        /* A prefetch only stages a weight's planes for the GEMMs that read them; the adapter's
+         * delta is applied at the site's expand op, so staging the base planes stays correct.
+         * A prefetch neither carries nor invalidates an adapter. */
+        if (op.op == "prefetch") continue;
         rad_weight b = 0;
         std::string why;
         const bool site = op_is_site(prog, op, &b, &why);

@@ -1092,8 +1092,9 @@ int Ctx::lane_join(int from, int to) {
  * size here. The ABI-35 host mirrors are used by issue-time split selection; unsupported dynamic
  * geometries fail closed via the pass-key contract, while Qwen keys its full-group maximum in the
  * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
- * never recorded (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 480,
+ * never recorded (below). `ckpt_cut` and `ckpt_cu`: a pass carrying them is never recorded.
+ */
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 496,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -1120,6 +1121,9 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* A generator pass is shaped by what RadBatch::gen_b, agen_b, vgen_b or sgen_b carries, which
      * no key below reads. */
     if (b->gen) return 0;
+    /* A step with a checkpoint inside it copies from addresses the engine armed for it
+     * (Ctx::set_ckpt_snap), which no recording could replay. */
+    if (b->ckpt_cut > 0) return 0;
     uint64_t h = 0x9e3779b97f4a7c15ull;
     auto mix = [&](uint64_t v) {
         h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);

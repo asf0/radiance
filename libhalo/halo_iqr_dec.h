@@ -1,12 +1,15 @@
+/* Derived from libr4d/r4d_iqr_dec.h by the libhalo rename transform (2026-11-17);
+ * see libhalo/README.md. Op schemas, row names and stored weight layouts are
+ * shared with libr4d by design. Everything else in this file is libhalo's own
+ * and diverges as it is measured on gfx1151. */
 /* halo_iqr_dec.h -- device decoders of the IQR weights (halo_iqr.h), decoded from their codes where
- * they are read. Derived from libr4d/r4d_iqr_dec.h by the libhalo rename transform (2026-11-15),
- * then ported to gfx1151: frag11 replaces libr4d's gfx12 fragment transpose.
+ * they are read.
  *
  * A decoder is fetch (a lane's raw code dwords of one 16-row x 128-K unit, issued ahead like any
  * operand load) and rows (raw to the int8 values: for each of the tile's 16 rows, the lane's four
  * columns packed in a dword, the operand of one sudot4). A GEMM on the WMMA tiles takes the unit
  * through `frag`: the 16 x 128 bytes through this wave's LDS tile, read back as the int8 tiles'
- * fragment order (halo_fp8_frag.h), two 64-K supertiles.
+ * fragment order (r4d_fp8_frag.h), two 64-K supertiles.
  *
  * The forms' tables are read from LDS, staged once a block by `stage`: Table and Trellis entries
  * one byte each, Grid entries one V-vector each.
@@ -18,6 +21,7 @@
  * host's f32 operations, computed by the lane of its row and read by the others. */
 #pragma once
 #include "halo_fp8_wmma.h"
+#include "halo_common.h"
 #include "halo_iqr.h"
 
 #include <hip/hip_runtime.h>
@@ -46,9 +50,10 @@ struct Ctx {
     uint32_t run_tiles;     /* a trellis run's 16-row tiles */
 };
 
-/* The LDS tile a unit is transposed through: 16 rows of 128 bytes and 8 of padding, so the sixteen
- * rows' 8-byte fragment reads fall on distinct banks. */
-constexpr uint32_t kTrPitch = 136, kTrBytes = 16 * kTrPitch;
+/* The LDS tile a unit is transposed through: 16 rows of 128 bytes and 16 of padding. gfx11's
+ * fragment read is a lane's whole 16-byte k run of one row (halo_wmma.h), so a row starts on a
+ * 16-byte bound for one ds_read_b128; at 144 bytes (36 dwords) the rows start on banks 4r. */
+constexpr uint32_t kTrPitch = 144, kTrBytes = 16 * kTrPitch;
 
 /* Bits [s, s + n) of the 64 bits hi:lo, n <= 32 (constants after unrolling). On byte bounds one
  * v_perm, which also zeroes the bytes above; else a funnel shift and a mask. */
@@ -415,30 +420,5 @@ struct Dec {
         }
     }
 };
-
-/* gfx1151 (libhalo port): the unit's int8 tile as the eight A fragments of
- * v_wmma_i32_16x16x16_iu8, through this wave's LDS tile `tr`. A gfx11 int8 fragment is sixteen
- * bytes a lane at the un-split K offset: lane l holds row (l & 15), K 16 ks .. 16 ks + 15 of step
- * ks, and lanes 16-31 replicate lanes 0-15 (libhalo/PORTING.md section 2; libr4d's form held eight
- * bytes at 8 (l >> 4)). A wave's LDS accesses complete in order, so only the compiler must not move
- * the reads above the writes; the second fence keeps the next unit's writes below these reads. */
-__device__ __forceinline__ void frag11(const uint32_t (&w)[16], uint8_t* tr, uint32_t lane,
-                                       uint4 (&a)[8]) {
-#pragma unroll
-    for (uint32_t q = 0; q < 16; ++q) *(uint32_t*)(tr + q * kTrPitch + 4u * lane) = w[q];
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
-    __builtin_amdgcn_wave_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
-    const uint8_t* row = tr + (lane & 15u) * kTrPitch;
-#pragma unroll
-    for (uint32_t ks = 0; ks < 8; ++ks) {
-        const uint2 lo = *(const uint2*)(row + ks * 16u);
-        const uint2 hi = *(const uint2*)(row + ks * 16u + 8u);
-        a[ks] = make_uint4(lo.x, lo.y, hi.x, hi.y);
-    }
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
-    __builtin_amdgcn_wave_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
-}
 
 }  // namespace halo_iqr_dev

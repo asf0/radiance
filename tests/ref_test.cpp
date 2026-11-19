@@ -3361,6 +3361,36 @@ TEST(op_attn_paged) {
     CHECK_NEAR(out2.at(5), 1.0f, 1e-6);
 }
 
+/* An image span split by a step cannot give its first rows keys not staged yet.
+ * Compare the exact same Q/K/V with full-span versus chunk-bounded key counts. This
+ * records the scheduler fallback's numerical limit; it is not a full-model parity test. */
+TEST(op_attn_paged_split_image_span_is_not_full_span_bidirectional_attention) {
+    T q_all(RAD_F32, {2, 1, 2}); q_all.f({0, 0, 0, 0});
+    T q_one(RAD_F32, {1, 1, 2}); q_one.f({0, 0});
+    T kv(RAD_F32, {1, 1, 2, 4});
+    kv.f({0, 0, 1, 0,  0, 0, 3, 0});
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T full_keys(RAD_I32, {1}); full_keys.n({2});
+    T first_keys(RAD_I32, {1}); first_keys.n({1});
+    T full(RAD_F32, {2, 1, 2}), first(RAD_F32, {1, 1, 2}), last(RAD_F32, {1, 1, 2});
+    auto attend = [&](const T& q, const T& used, const T& out, int n) {
+        A a; a.t(q).t(kv).t(bt).t(used).tnull().tnull().tnull().t(out)
+              .i("q_len", n).i("head_dim", 2).i("gqa", 1).i("block_size", 2)
+              .i("causal", 0).i("window", 2).s("q_dtype", "f32").s("kv_dtype", "f32");
+        return run("attn_paged", a);
+    };
+    REQUIRE_EQ(attend(q_all, full_keys, full, 2), RAD_OK);
+    REQUIRE_EQ(attend(q_one, first_keys, first, 1), RAD_OK);
+    REQUIRE_EQ(attend(q_one, full_keys, last, 1), RAD_OK);
+    CHECK_NEAR(full.at(0), 2.0f, 1e-6);
+    CHECK_NEAR(full.at(2), 2.0f, 1e-6);
+    CHECK_NEAR(first.at(0), 1.0f, 1e-6);
+    CHECK_NEAR(last.at(0), 2.0f, 1e-6);
+    const double diff = first.at(0) - full.at(0);
+    const double rel_l2 = std::sqrt(diff * diff / 8.0);
+    CHECK_NEAR(rel_l2, 0.3535533905932738, 1e-6);
+}
+
 TEST(op_attn_paged_sink) {
     /* op_attn_paged's cache and queries, non-causal, with a sink logit a head: token 0 now sees both
      * keys too, and each sink adds exp(sink) to the denominator only. Head 0, token 0, q = [1,0]:
@@ -4902,11 +4932,8 @@ TEST(op_moe_gemm_q_mod4) {
     }
 }
 
-/* The weight scale grid is the one the dtype names, in both grouped GEMMs: 128x128 tiles for block
- * fp8; for four-bit experts one scale per row per K group of 128 (w4a8/w4a8h/w4nla8h), 64
- * (w4nl64a8h/w5nl64a8h) or 32 (w4nl32a8h). The oracle inverts a relaid weight into exactly this
- * description (core/runtime/oracle.cpp). The final case is one last-class expert at K = 128 whose
- * 64-wide halves scale by 2 and 3 under one 0.5 activation scale; any other grid reads differently. */
+/* w6nl64a8h through the grouped GEMM: two experts whose relaid u6 codes index one 64-entry table,
+ * each weight its level times an E4M3 scale per (row, 64 of K) and the f32 level above it. */
 TEST(op_moe_gemm_q_reads_six_bit_codebook_experts) {
     constexpr int64_t N = 2, K = 128;
     T codes0(RAD_U6, {N, K}), codes1(RAD_U6, {N, K});
@@ -4961,6 +4988,11 @@ TEST(op_moe_gemm_q_reads_six_bit_codebook_experts) {
     }
 }
 
+/* The weight scale grid is the one the dtype names, in both grouped GEMMs: 128x128 tiles for block
+ * fp8; for four-bit experts one scale per row per K group of 128 (w4a8/w4a8h/w4nla8h), 64
+ * (w4nl64a8h/w5nl64a8h) or 32 (w4nl32a8h). The oracle inverts a relaid weight into exactly this
+ * description (core/runtime/oracle.cpp). The final case is one last-class expert at K = 128 whose
+ * 64-wide halves scale by 2 and 3 under one 0.5 activation scale; any other grid reads differently. */
 TEST(op_moe_gemm_q_scale_grid_by_dtype) {
     struct Want { const char* dt; int64_t rows, cols; };
     /* N 256, K 512, group 128; the last class at N 128, K 256. */

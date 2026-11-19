@@ -292,6 +292,9 @@ RAD_TEST_MAIN()
  * on every chained packet of an engine that loads it, so a row added with a wait of its own shows
  * up here rather than as a slower step. */
 TEST(libr4ds_rows_that_chain_acquire_for_themselves) {
+#ifndef RAD_TEST_HAS_LIBR4D
+    SKIP("this build makes no libr4d");
+#endif
     Registry r;
     const int st = r.load_dir(dir_of("kernels"), { "libr4d", "libref" });
     if (!r.plugin("libr4d")) {

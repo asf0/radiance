@@ -1,5 +1,6 @@
 # Candidate Qwen3.8 Flash-Next: U4-trellis gate/up, W6NL down, BF16 PLE and vision.
-# Requires the W6NL runtime and codebook in this branch. Untested as a complete model.
+# Needs libquant's table=w6nl and libr4d's w6nl64a8h. No complete model has been converted with
+# this recipe.
 # CALIB: flat, verified BF16-domain expert and trunk RADGRAM2 files for this checkpoint.
 # MTP_CALIB: separately captured draft Grams (including the qg/k/v and shared-gate aliases).
 # First match wins. Unmatched source tensors, including vision and PLE key/value, stay BF16.
@@ -16,7 +17,9 @@ blk.47.ffn_*_exps.143.weight         cast dtype=bf16
 blk.47.ffn_*_exps.399.weight         cast dtype=bf16
 blk.47.ffn_*_exps.445.weight         cast dtype=bf16
 
-# Keep the IQ5R artifact's draft recipe unchanged for the controlled comparison.
+# The draft (MTP) layer, blk.48: its routed experts as u4 codes into the w4nl table, its attention
+# qg, k and v projections and its shared expert's gate/up as u4 trellis codes, all against
+# $MTP_CALIB.
 blk.48.ffn_*_exps.*.weight           gptq table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$MTP_CALIB
 blk.48.attn_qg.weight                gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.12 calib=$MTP_CALIB tcq_order=1
 blk.48.attn_k.weight                 gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.12 calib=$MTP_CALIB tcq_order=1

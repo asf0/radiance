@@ -1,9 +1,14 @@
-/* Derived from libr4d/r4d_moe_iqr.hip by the libhalo rename transform (2026-11-15),
- * then ported to gfx1151 (the tile path's fragments and accumulator rows); see libhalo/README.md. */
-// moe_gemm_q over routed experts stored as IQR weights (halo_iqr.h): every expert's codes in VRAM at
+/* Derived from libr4d/r4d_moe_iqr.hip by the libhalo rename transform (2026-11-17), then ported
+ * to gfx1151; see libhalo/README.md. The run walk, the dot path (no matrix instruction) and the
+ * launcher are libr4d's; the tile path's unit goes through gfx11's fragments (halo_wmma.h): each
+ * decoded 128-K unit is written row by row into the wave's LDS tile and read back as eight A
+ * fragments, a lane's sixteen consecutive k of row lane & 15; a token's B fragment is its sixteen
+ * consecutive activation bytes; accumulator slot t is weight row 2t + (lane >> 4) of token
+ * lane & 15. */
+// moe_gemm_q over routed experts stored as IQR weights (r4d_iqr.h): every expert's codes in VRAM at
 // their own width, decoded where they are read.
 //
-// One kernel, the dense 16-token narrow tile (halo_gemm_iqr.hip, iqr_m16_kernel) made run-aware. A
+// One kernel, the dense 16-token narrow tile (r4d_gemm_iqr.hip, iqr_m16_kernel) made run-aware. A
 // block serves one run of sorted rows of one expert against a group of 16-row tiles of that
 // expert's weight, and a wave decodes each 128-K unit of its tile where it reads it. Decode is the
 // cost (about 300 vector instructions a unit and lane, whatever the code width), so the kernel is
@@ -22,7 +27,7 @@
 // within f32 rounding.
 //
 // Two grids over x, and the weight's tile groups over y:
-//   decode   inside halo_moe.hip's decode band. x is (16-row tile of the sorted rows, run within
+//   decode   inside r4d_moe.hip's decode band. x is (16-row tile of the sorted rows, run within
 //            it), T slots in all since a tile of r rows holds at most r runs. The block's first
 //            wave finds the run from the expert offsets in one round of loads and the others take
 //            it from LDS, so a decode step issues no map. A wave takes a tile and a block four
@@ -39,6 +44,7 @@
 #include "halo.h"
 #include "halo_args.h"
 #include "halo_chain.h"
+#include "halo_common.h"
 #include "halo_emit.h"
 #include "halo_fp8_wmma.h"
 #include "halo_iqr.h"
@@ -48,34 +54,31 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <cstdlib>
 
-/* halo_moe.hip: the run map of a grouped GEMM at `fm` rows a block, built in `scratch` by one
- * launch; its entry count bound, and the bytes it takes. */
+/* halo_moe_gemm_q.hip: the run map of a grouped GEMM at `fm` rows a block, built in `scratch` by
+ * one launch; its entry count bound, and the bytes it takes. */
 long long halo_moe_blockmap_cap(long long T, long long n_expert, long long fm);
 long long halo_moe_blockmap_bytes(long long cap);
 int halo_moe_blockmap_emit(RadStream s, const int32_t* off, uint32_t n_expert, uint32_t T,
-                          uint32_t fm, uint32_t cap, uint32_t* map);
+                           uint32_t fm, uint32_t cap, uint32_t* map);
 /* Whether T sorted rows over n_expert experts are served by the decode grid. */
 bool halo_moe_in_decode_band(long long T, long long n_expert);
 
 namespace {
 
-/* gfx1151 int8 WMMA operand and accumulator vectors. */
-typedef int v4i11 __attribute__((ext_vector_type(4)));
-typedef int v8i11 __attribute__((ext_vector_type(8)));
+using namespace halo_fp8;
+using namespace halo_iqr;
+using namespace halo_iqr_dev;
+using halo_moesort::kMaxExpert;
+using halo_moesort::wave_incl_scan_i32;
 
-/* libr4d's r4d_chain.h tags: the chained form's template argument puts `r4dchain` in the kernel's
- * name, the AQL backend's marker (libhalo/PORTING.md section 1). */
-struct halo_r4dchain { static constexpr bool on = true; };
-struct HaloUnchained { static constexpr bool on = false; };
-/* libr4d r4d_common.h helpers this kernel uses. */
+typedef int v4i_t __attribute__((ext_vector_type(4)));
+typedef int v8i_t __attribute__((ext_vector_type(8)));
+typedef float v8f_t __attribute__((ext_vector_type(8)));
+
 __device__ __forceinline__ float halo_pick(bool c, float x, float y) { return c ? x : y; }
-__device__ __forceinline__ uint32_t red16_row(uint32_t lane) {
-    return (lane & 1u) << 3 | (lane & 2u) << 1 | (lane & 4u) >> 1 | (lane & 8u) >> 3;
-}
-/* libr4d's red16: sixteen values a lane, each summed over the wave; lane l ends with the wave's sum
- * of value red16_row(l). Same exchanges (row_xmask DPP, then the cross-row swap16). */
+/* Sixteen values a lane, each summed over the wave (libr4d's red16): lane l ends with the wave's
+ * sum of value red16_row(l). */
 __device__ __forceinline__ float red16(float (&a)[16], uint32_t lane) {
     const bool l1 = lane & 1u, l2 = lane & 2u, l4 = lane & 4u, l8 = lane & 8u;
     float b[8], c[4], d[2];
@@ -88,23 +91,18 @@ __device__ __forceinline__ float red16(float (&a)[16], uint32_t lane) {
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) d[j] = halo_dpp_xor_add<0x168>(halo_pick(l4, c[2 + j], c[j]));
     const float v = halo_pick(l8, d[1], d[0]);
-    return v + swap16(v);
+    return v + __shfl_xor(v, 16, 32);
 }
-/* A token's fragment column: lane & 15 on gfx11 as on gfx12. */
-__device__ __forceinline__ uint32_t frag_c(uint32_t lane) { return lane & 15u; }
-
-using namespace halo_fp8;
-using namespace halo_iqr;
-using namespace halo_iqr_dev;
-using halo_moesort::kMaxExpert;
-using halo_moesort::wave_incl_scan_i32;
+__device__ __forceinline__ uint32_t red16_row(uint32_t lane) {
+    return (lane & 1u) << 3 | (lane & 2u) << 1 | (lane & 4u) >> 1 | (lane & 8u) >> 3;
+}
 
 constexpr uint32_t kWave = 32, kBlock = 128;
 /* Sorted rows a block serves: one WMMA tile of tokens. */
 constexpr uint32_t kRows = 16;
-/* A run-map entry that owns no expert (halo_moe.hip's kMapTail): dropped slots, zeroed. */
+/* A run-map entry that owns no expert (r4d_moe.hip's kMapTail): dropped slots, zeroed. */
 constexpr uint32_t kTail = 0xffffffffu;
-/* The biased fold of the int8 tiles under one scale a block (halo_gemm_8a8_prefill.h): a unit's
+/* The biased fold of the int8 tiles under one scale a block (r4d_gemm_8a8_prefill.h): a unit's
  * int32 sums start at 0x4B400000, so a slot read as an f32 is 12582912 plus its sum and one fma
  * folds it; 12582912 times the folded factors leaves every kRbFlush units and at the store. */
 constexpr int kRbBias = 0x4B400000;
@@ -114,8 +112,8 @@ constexpr uint32_t kRbFlush = 8;
 #define HALO_MOEIQR_CHK() do { hipError_t e_ = hipGetLastError();                    \
                               if (e_ != hipSuccess) return -100 - (int)e_; } while (0)
 
-/* One class of experts (halo_moe.hip's MoeCls): expert e is entry e >> cshift of class
- * e & (2^cshift - 1), each entry the expert's weight buffer and scale buffer in halo_iqr.h's
+/* One class of experts (r4d_moe.hip's MoeCls): expert e is entry e >> cshift of class
+ * e & (2^cshift - 1), each entry the expert's weight buffer and scale buffer in r4d_iqr.h's
  * layout; `n` its rows and `k` its K on this rank. */
 struct IqrCls {
     const void* const* w;
@@ -145,7 +143,7 @@ __device__ __forceinline__ T* uniform(T* p) {
 /* A run of NR rows, NR at most kDotRows, without the WMMA tile: lane l holds columns 4l .. 4l + 3
  * of each unit, and a value's masked hash dotted with its column's activation byte, repeated in
  * each byte, sums the hash's bytes and multiplies in one instruction (the GEMV of
- * halo_gemm_iqr.hip). Nothing is packed, transposed through LDS or multiplied for token columns no
+ * r4d_gemm_iqr.hip). Nothing is packed, transposed through LDS or multiplied for token columns no
  * row owns: a unit costs its decode and one dot a value and row. A row's dot starts at 0x4B400000
  * less 126 times the lane's activation sum, so read as an f32 it is 12582912 plus the lane's sum
  * and one fma folds it; 12582912 times the factors leaves at the end. Returns lane l's share: row
@@ -258,7 +256,7 @@ __device__ __forceinline__ void moe_iqr_body(HALO_MOEIQR_PARAMS) {
     static_assert(TPW == 1u || KW == 1u, "several weight tiles a wave: a wave a tile's whole K");
     constexpr uint32_t NW = KW * RTB, NTHR = NW * kWave, kCols = RTB * TPW * 16u;
     /* `mode`: bit 0 `a_sorted`, bits 1-2 the class shift, bit 3 the activation's scale per 256 of
-     * K, bits 8+ `parts` (halo_moe.hip's). */
+     * K, bits 8+ `parts` (r4d_moe.hip's). */
     const uint32_t a_sorted = mode & 1u, cshift = (mode >> 1) & 3u, ash = (mode >> 3) & 1u;
     const uint32_t parts = mode >> 8;
     /* the waves' transpose tiles, then their partials (8 x 32 floats a wave, in its own tile) */
@@ -268,12 +266,7 @@ __device__ __forceinline__ void moe_iqr_body(HALO_MOEIQR_PARAMS) {
     auto red = [&](uint32_t w) { return (float*)(s_tr + w * kTrBytes); };
     const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
     const uint32_t wave = __builtin_amdgcn_readfirstlane(tid / kWave);
-    /* `mode` bit 4 (run-map grid only): the axes swapped, x the weight-tile group and y the map
-     * entry, so an entry's blocks are dispatched together and share its activation rows and its
-     * expert's codes in the caches (gate_up 5% at Flash-Next's 320 aux experts). */
-    const bool swp = MAP && (mode & 16u);
-    const uint32_t bx = swp ? blockIdx.y : blockIdx.x, by = swp ? blockIdx.x : blockIdx.y;
-    const uint32_t ycol0 = by * kCols;
+    const uint32_t ycol0 = blockIdx.y * kCols;
     /* Rows [ra, rb) of the block's columns, zeroed: dropped slots, which no run owns. */
     auto zero_rows = [&](uint32_t ra, uint32_t rb) {
         for (uint32_t x = tid; x < (rb - ra) * kCols; x += NTHR)
@@ -283,9 +276,9 @@ __device__ __forceinline__ void moe_iqr_body(HALO_MOEIQR_PARAMS) {
     /* ---- the block's run: expert e, sorted rows [rs, re). */
     uint32_t e, rs, re;
     if constexpr (MAP) {
-        if (bx >= map[0]) return;
-        e = map[1 + 2 * bx];
-        rs = map[2 + 2 * bx];
+        if (blockIdx.x >= map[0]) return;
+        e = map[1 + 2 * blockIdx.x];
+        rs = map[2 + 2 * blockIdx.x];
         if (e == kTail) {
             zero_rows(rs, rs + kRows * NT < T ? rs + kRows * NT : T);
             return;
@@ -365,7 +358,7 @@ __device__ __forceinline__ void moe_iqr_body(HALO_MOEIQR_PARAMS) {
     c.nkb = C.k / kBlock;
     c.run_tiles = run_tiles;
     /* A part of the output is as wide as the widest class's; a narrower class fills each part's
-     * leading columns and the rest are zero (halo_moe.hip's `parts`). */
+     * leading columns and the rest are zero (r4d_moe.hip's `parts`). */
     const uint32_t rtb = wave / KW, kph = wave % KW;
     /* `fy` is a part's rows at the widest class and `inv_ft` the reciprocal of its tiles (0: one
      * part), the launch's, so the wave's part and tile cost a multiply, not two divisions. */
@@ -377,7 +370,7 @@ __device__ __forceinline__ void moe_iqr_body(HALO_MOEIQR_PARAMS) {
      * column's sorted row, the run's last row past the run (those columns are not stored).
      * gate_up gathers the token's row, down reads the sorted row. */
     const bool dot = nrows <= kDotRows;
-    const uint32_t col = frag_c(lane);
+    const uint32_t col = lane & 15u;
     const int8_t* drow[kDotRows];
     const float* dsr[kDotRows];
     bool dok[kDotRows];
@@ -401,7 +394,7 @@ __device__ __forceinline__ void moe_iqr_body(HALO_MOEIQR_PARAMS) {
             const uint32_t srow = rs + (rj < nrows ? rj : nrows - 1u);
             const int32_t f = sorted[srow];
             const uint32_t tok = a_sorted ? srow : (f < 0 ? 0u : slot_token((uint32_t)f, inv_k));
-            xrow[j] = X + (size_t)tok * x_ld;   /* gfx11: a B fragment starts at K 0 in both halves */
+            xrow[j] = X + (size_t)tok * x_ld;
             xsr[j] = XS + (size_t)tok * xs_ld;
             okr[j] = a_sorted || f >= 0;
         }
@@ -442,47 +435,58 @@ __device__ __forceinline__ void moe_iqr_body(HALO_MOEIQR_PARAMS) {
     /* ---- the tile path. A unit is decoded and transposed once and then multiplied against each
      * token tile the run reaches, so a long run pays its decode once for NT * 16 rows. */
 
-    /* gfx1151: v_wmma_i32_16x16x16_iu8 takes sixteen bytes a lane for A and B and leaves element t
-     * of a lane's accumulator at weight row 2 t + (lane >> 4), token column lane & 15. */
-    v8f out[NT];
+    v8f_t out[NT];
     float corr[NT];   /* the units' fold factors since the last flush */
 #pragma unroll
     for (uint32_t j = 0; j < NT; ++j) {
-#pragma unroll
-        for (uint32_t t = 0; t < 8; ++t) out[j][t] = 0.0f;
+        out[j] = v8f_t(0.0f);
         corr[j] = 0.0f;
     }
     if (!pad) {
         uint32_t nflush = 0;
-        auto bload = [&](uint32_t j, uint32_t kb, v4i11 (&b)[8]) {
+        auto bload = [&](uint32_t j, uint32_t kb, v4i_t (&b)[8]) {
 #pragma unroll
-            for (uint32_t ks = 0; ks < 8; ++ks) {
-                const uint4 v = *(const uint4*)(xrow[j] + kb * kBlock + ks * 16u);
-                b[ks] = v4i11{ (int)v.x, (int)v.y, (int)v.z, (int)v.w };
-            }
+            for (uint32_t ks = 0; ks < 8; ++ks)
+                b[ks] = *(const v4i_t*)(xrow[j] + kb * kBlock + ks * 16u);
         };
-        /* The weight fragments are asked for a unit ahead; each token tile's activation
-         * fragments just before its WMMA steps (gfx11 fragments are twice libr4d's, so the
-         * activation is not double-buffered here). */
+        /* The weight and the first tile's activation fragments are asked for a unit ahead (16-token
+         * tile: 2-3 % behind without), each further tile's before the WMMA steps of the tile
+         * before it. */
         typename D::Raw cur = D::fetch(c, rt, kph, lane, kph < c.nkb), nxt;
-        v4i11 bq[8];
+        v4i_t bq[2][8], bn[8];
+        if (kph < c.nkb) bload(0u, kph, bq[0]);
         for (uint32_t kb = kph; kb < c.nkb; kb += KW) {
-            if (kb + KW < c.nkb) nxt = D::fetch(c, rt, kb + KW, lane, true);
+            if (kb + KW < c.nkb) {
+                nxt = D::fetch(c, rt, kb + KW, lane, true);
+                bload(0u, kb + KW, bn);
+            }
             uint32_t w[16];
             D::rows(cur, c, 1.0f, w);
-            uint4 a8[8];
-            frag11(w, s_tr + wave * kTrBytes, lane, a8);
+            /* the unit through the wave's LDS tile: row q's four bytes of each lane, then each
+             * lane's row (lane & 15), sixteen bytes a k step (gfx11's A fragment) */
+            uint8_t* const trw = s_tr + wave * kTrBytes;
+#pragma unroll
+            for (uint32_t q = 0; q < 16; ++q) *(uint32_t*)(trw + q * kTrPitch + 4u * lane) = w[q];
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
+            v4i_t a8[8];
+#pragma unroll
+            for (uint32_t ks = 0; ks < 8; ++ks)
+                a8[ks] = *(const v4i_t*)(trw + (lane & 15u) * kTrPitch + ks * 16u);
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
             const float fb = fold_f32<F>(c, row0, kb);
 #pragma unroll
             for (uint32_t j = 0; j < NT; ++j) {
                 if (j * kRows < nrows) {
-                    bload(j, kb, bq);
-                    v8i11 raw = (v8i11)(kRbBias);
+                    if (j + 1u < NT && (j + 1u) * kRows < nrows) bload(j + 1u, kb, bq[(j + 1u) & 1u]);
+                    v8i_t raw = v8i_t(kRbBias);
 #pragma unroll
-                    for (uint32_t ks = 0; ks < kBlock / 16u; ++ks)
-                        raw = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
-                            true, v4i11{ (int)a8[ks].x, (int)a8[ks].y, (int)a8[ks].z, (int)a8[ks].w },
-                            true, bq[ks], raw, false);
+                    for (uint32_t ks = 0; ks < 8; ++ks)
+                        raw = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a8[ks], true,
+                                                                         bq[j & 1u][ks], raw, false);
                     const float sb = fb * xsr[j][kb >> ash];
                     corr[j] += sb;
 #pragma unroll
@@ -501,6 +505,8 @@ __device__ __forceinline__ void moe_iqr_body(HALO_MOEIQR_PARAMS) {
                 nflush = 0;
             }
             cur = nxt;
+#pragma unroll
+            for (uint32_t ks = 0; ks < 8; ++ks) bq[0][ks] = bn[ks];
         }
     }
 #pragma unroll
@@ -523,51 +529,34 @@ __device__ __forceinline__ void moe_iqr_body(HALO_MOEIQR_PARAMS) {
             out[0][t] = a;
         }
     }
-    /* gfx11 rows interleave by half-wave: element t is weight row 2 t + (lane >> 4). Lane pairs
-     * (l, l ^ 16) swap four values so each lane stores eight consecutive rows as one 16-byte write:
-     * the low half rows 0-7 (its even rows, the partner's odd ones), the high half rows 8-15. */
-    const uint32_t hw = lane >> 4;
+    const uint32_t hh = lane >> 4;
     float rsc[8];
 #pragma unroll
-    for (uint32_t t = 0; t < 8; ++t) rsc[t] = pad ? 0.0f : row_scale<F>(c, row0 + 2u * t + hw);
+    for (uint32_t t = 0; t < 8; ++t) rsc[t] = pad ? 0.0f : row_scale<F>(c, row0 + 2u * t + hh);
 #pragma unroll
     for (uint32_t j = 0; j < NT; ++j) {
         const uint32_t rj = j * kRows + col;
-        float s[8];
+        if (rj < nrows) {
+            float v[8];
 #pragma unroll
-        for (uint32_t t = 0; t < 8; ++t) s[t] = okr[j] ? out[j][t] * rsc[t] : 0.0f;
-        /* low half keeps t 0-3 (rows 0,2,4,6) and takes the partner's t 0-3 (rows 1,3,5,7); the
-         * high half keeps t 4-7 (rows 9,11,13,15) and takes the partner's t 4-7 (rows 8,...,14) */
-        float g[4];
+            for (uint32_t t = 0; t < 8; ++t) v[t] = okr[j] ? out[j][t] * rsc[t] : 0.0f;
+            uint16_t* yr = Y + (size_t)(rs + rj) * y_ld + part * fy + tin * 16u;
 #pragma unroll
-        for (uint32_t i = 0; i < 4; ++i) {
-            const float send = hw ? s[i] : s[4u + i];
-            g[i] = __shfl_xor(send, 16, 32);
+            for (uint32_t t = 0; t < 8; ++t) yr[2u * t + hh] = f32_to_bf16(v[t]);
         }
-        float v[8];
-#pragma unroll
-        for (uint32_t i = 0; i < 4; ++i) {
-            const float mine = hw ? s[4u + i] : s[i];
-            v[2u * i]      = hw ? g[i] : mine;
-            v[2u * i + 1u] = hw ? mine : g[i];
-        }
-        if (rj < nrows)
-            *(uint4*)(Y + (size_t)(rs + rj) * y_ld + part * fy + tin * 16u + 8u * hw) =
-                make_uint4(bf16x2_rne(v[0], v[1]), bf16x2_rne(v[2], v[3]),
-                           bf16x2_rne(v[4], v[5]), bf16x2_rne(v[6], v[7]));
     }
     };
     /* A wave whose tile is all of its K (KW 1) takes TPW tiles in turn: the run search and the
      * rows above are paid once for them, which a narrow-K projection (two or three units a tile)
      * otherwise pays as a third of its work. */
-    for (uint32_t tw = 0; tw < TPW; ++tw) tile((by * RTB + rtb) * TPW + tw);
+    for (uint32_t tw = 0; tw < TPW; ++tw) tile((blockIdx.y * RTB + rtb) * TPW + tw);
 }
 
-/* The kernel around the body, whose blocks return where their work ends: CH `halo_r4dchain` is the
- * chained form (halo_chain.h), every block waiting before its first read and adding once after
+/* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
+ * chained form (r4d_chain.h), every block waiting before its first read and adding once after
  * its last write. */
 template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, class CH>
-__global__ __launch_bounds__(KW * RTB * kWave) HALO_WAVES(8)
+__global__ __launch_bounds__(KW * RTB * kWave)
 void moe_iqr_kernel(HALO_MOEIQR_PARAMS) {
     if (CH::on) halo_chain_wait();
     moe_iqr_body<F, KW, RTB, MAP, NT, TPW>(X, XS, c_0, c_1, c_2, c_3, sorted, off, Y, map, T, fy,
@@ -604,7 +593,7 @@ struct Launch {
     uint32_t* map;
     uint32_t T, N, n_expert, inv_k, x_ld, xs_ld, y_ld, mode, run_tiles, inv_ft;
     uint32_t gx, nkb;
-    bool chain;   /* the chained form (halo_chain.h) */
+    bool chain;   /* the chained form (r4d_chain.h) */
 };
 
 template <class F>
@@ -612,14 +601,12 @@ int launch_form(const Launch& g, RadStream stream) {
     int rc;
 #define HALO_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, ch_)                                             \
     rc = HALO_EMIT(stream, (moe_iqr_kernel<F, kw_, rtb_, map_, nt_, tpw_, ch_>),                   \
-                  (map_ && (g.mode & 16u)) ? dim3(g.N / (16u * rtb_ * tpw_), g.gx)              \
-                                           : dim3(g.gx, g.N / (16u * rtb_ * tpw_)),               \
-                  dim3(kw_ * rtb_ * kWave), 0, g.x, g.xs,                                         \
+                  dim3(g.gx, g.N / (16u * rtb_ * tpw_)), dim3(kw_ * rtb_ * kWave), 0, g.x, g.xs,  \
                   g.c[0], g.c[1], g.c[2], g.c[3], g.sorted, g.off, g.y, (const uint32_t*)g.map,   \
                   g.T, g.N / (g.mode >> 8), g.n_expert, g.inv_k, g.x_ld, g.xs_ld, g.y_ld, g.mode, \
                   g.run_tiles, g.inv_ft)
-#define HALO_MOEIQR_GO(kw_, rtb_, map_, nt_, tpw_)                                                 \
-    do { if (g.chain) HALO_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, halo_r4dchain);                         \
+#define HALO_MOEIQR_GO(kw_, rtb_, map_, nt_, tpw_)                                                \
+    do { if (g.chain) HALO_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, r4dchain);                        \
          else         HALO_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, HaloUnchained); } while (0)
     /* The run map's grid (prefill): a wave a weight tile down all of its K, four tiles a block,
      * kMapTiles token tiles a decode. The decode grid: a wave a tile and a block four, except that
@@ -638,7 +625,7 @@ int launch_form(const Launch& g, RadStream stream) {
     return rc;
 }
 
-/* moe_gemm_q's operands (halo_moe.hip's moe_gemm_launch): [0] a [1] a_scale [2] w [3] w_scale
+/* moe_gemm_q's operands (r4d_moe.hip's moe_gemm_launch): [0] a [1] a_scale [2] w [3] w_scale
  * [4] sorted [5] off, then the further classes' tables and y. */
 int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
     if (ncls != 2 && ncls != 4) return HALO_NO(RAD_E_INVAL);
@@ -676,7 +663,7 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
     if (a_group != (long long)kBlock && a_group != 2 * (long long)kBlock)
         return HALO_NO(RAD_E_UNSUPPORTED);
 
-    /* Every class holds one form: the tables' dtype is the layout's word (halo_iqr.h). */
+    /* Every class holds one form: the tables' dtype is the layout's word (r4d_iqr.h). */
     const uint32_t wdt = Wc[0] ? Wc[0]->dtype : 0u;
     if (!is_weight_dtype(wdt)) return HALO_NO(RAD_E_DTYPE);
     const uint32_t word_ = wdt & kWordMask;
@@ -759,6 +746,7 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
          * x % 16 of tile x / 16, and the last tile's slots end with its rows. */
         g.gx = (uint32_t)T;
         /* The band's one launch has a chained form; the run map's two launches stay plain. */
+        /* The band's one launch has a chained form; the run map's two launches stay plain. */
         g.chain = halo_geti_or(a, "chain", 0) != 0;
     } else {
         const long long cap = halo_moe_blockmap_cap(T, n_expert, kRows * kMapTiles);
@@ -769,9 +757,6 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
                                              (uint32_t)cap, g.map);
         if (rc != RAD_OK) return rc;
         g.gx = (uint32_t)cap;
-        /* The swapped run-map grid (the body's bit 4); HALO_IQR_SWAP=0 keeps the plain one. */
-        static const bool swap = [] { const char* e = std::getenv("HALO_IQR_SWAP"); return !(e && e[0] == '0'); }();
-        if (swap) g.mode |= 16u;
     }
 
     int rc = HALO_NO(RAD_E_DTYPE);

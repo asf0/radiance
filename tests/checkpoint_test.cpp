@@ -138,7 +138,7 @@ TEST(the_metadata_names_the_architecture_and_the_quantisation) {
 
 /* The index is checkpoint-supplied data like the tensors, and its weight_map values are paths:
  * a poisoned one must not lead the loader to open files outside the model dir as the serving
- * user. hfget screens the listing's names; nothing screened the index's until here. */
+ * user. */
 TEST(a_poisoned_index_cannot_lead_the_shard_list_out_of_the_model_dir) {
     auto dir_with_index = [](const char* shard) -> std::string {
         const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) }, kConfig);
@@ -160,6 +160,20 @@ TEST(a_poisoned_index_cannot_lead_the_shard_list_out_of_the_model_dir) {
         Checkpoint ck;
         CHECK(ck.open(dir_with_index(bad)) < 0);
     }
+}
+
+/* A Hugging Face cache snapshot is a directory of symbolic links into the cache's blob store,
+ * which lies outside it. The shard's name is under the model directory; where its link points is
+ * the operator's layout, and the loader follows it. */
+TEST(a_shard_that_is_a_link_out_of_the_model_dir_opens) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) }, kConfig);
+    const std::string blob = dir + ".blob";
+    REQUIRE(std::rename((dir + "/model.safetensors").c_str(), blob.c_str()) == 0);
+    REQUIRE(::symlink(blob.c_str(), (dir + "/model.safetensors").c_str()) == 0);
+    Checkpoint ck;
+    CHECK_EQ(ck.open(dir), RAD_OK);
+    std::remove((dir + "/model.safetensors").c_str());
+    std::remove(blob.c_str());
 }
 
 TEST(routed_expert_metadata_accepts_the_deepseek_and_glm_config_spellings) {

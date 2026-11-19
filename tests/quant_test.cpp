@@ -915,11 +915,10 @@ TEST(a_codebook_indexes_its_table_and_the_scale_multiplies_it) {
     }
 }
 
-/* A vq= codebook file is attacker data, and its loader appended every line to memory before
- * checking any count, while its "# unit" line parsed `inf` through %lf -- and the fallback
- * guard `!(unit > 0.0)` let infinity through, where a NaN falls back to the entries' rms. The
- * count is now checked while appending (the widest code is u12: past 4096 codewords could not
- * be indexed even with the memory), and only a finite positive names the unit. */
+/* A vq= codebook file is supplied data. Its entry count is checked while the loader appends
+ * (the widest code is u12, so codewords past 4096 could not be indexed), and its "# unit" line
+ * names the unit only with a finite positive value: `inf` parses through %lf and passes a
+ * `!(unit > 0.0)` guard, where a NaN falls back to the entries' rms. */
 TEST(the_codebook_loader_caps_while_reading_and_refuses_an_infinite_unit) {
     NEED_LIBQUANT();
     TempDir dir("vqcap");
@@ -941,8 +940,8 @@ TEST(the_codebook_loader_caps_while_reading_and_refuses_an_infinite_unit) {
 
     /* vq= is gptq's path -- rtn refuses it ("vq= is quantised by gptq") -- so every case here
      * goes through gptq and every refusal below is the LOADER's, not a quantizer mismatch. */
-    /* One past the cap: refused by name. 4097 entries used to build an encoding whose u12
-     * codes could not index its own last codeword. */
+    /* One past the cap: refused by name. The u12 codes of an encoding with 4097 entries could
+     * not index its own last codeword. */
     {
         Opts o;
         o.s("vq", write_cb("big.txt", "# unit 1.0", 4097).c_str()).i("group", 128).s("scale", "bf16");
@@ -954,8 +953,8 @@ TEST(the_codebook_loader_caps_while_reading_and_refuses_an_infinite_unit) {
         o.s("vq", write_cb("cap.txt", "# unit 1.0", 4096).c_str()).i("group", 128).s("scale", "bf16");
         CHECK_EQ(quantise(quantizer("gptq"), o, "x", R, C, w).status, RAD_OK);
     }
-    /* "# unit inf" used to multiply every decoded value by infinity; ignored now, the entries'
-     * own rms takes over and the decode stays finite. */
+    /* "# unit inf" would multiply every decoded value by infinity. The line is ignored, the
+     * entries' own rms takes over and the decode stays finite. */
     {
         Opts o;
         o.s("vq", write_cb("inf.txt", "# unit inf", 256).c_str()).i("group", 128).s("scale", "bf16");
@@ -967,8 +966,8 @@ TEST(the_codebook_loader_caps_while_reading_and_refuses_an_infinite_unit) {
         for (float x : d) bad += !std::isfinite(x);
         CHECK_EQ(bad, 0);
     }
-    /* tcq's sibling flow: a zero tcq_gain used to divide the unit by zero and every code
-     * became inf; the loader refuses it by name now. */
+    /* tcq's sibling flow: a zero tcq_gain would divide the unit by zero and turn every code
+     * into inf; the loader refuses it by name. */
     {
         Opts o;
         o.s("codes", "u2").i("tcq", 10).i("tcq_rows", 256).i("group", 128).s("scale", "bf16")

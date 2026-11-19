@@ -608,10 +608,14 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
                { gate_up }, { a.x });
         if (!op) return RAD_E_INVAL;
         if (bf16) return RAD_OK;
-        const char* qn = rot ? "had_quant_act_fp8" : a.q8_fed ? "quant_act_i8g" : "quant_act_fp8";
+        /* Fed rotated int8 (ActFP8::q8_rot: a rotated down projection under an int8 routed
+         * arm), had_quant_act_i8g at the pair's group. */
+        const char* qn = rot ? "had_quant_act_fp8"
+                       : a.q8_fed ? (a.q8_rot ? "had_quant_act_i8g" : "quant_act_i8g")
+                                  : "quant_act_fp8";
         op_q = rw(b, RAD_OP(b, qn,
                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                                RAD_INT("group", a.cg()), RAD_STR("dtype", g.dtype)),
                      RAD_NOWEIGHTS),
                  { a.x }, { a.cq(), a.cs() });
         return op_q ? RAD_OK : RAD_E_INVAL;

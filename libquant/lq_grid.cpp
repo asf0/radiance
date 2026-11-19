@@ -99,10 +99,11 @@ const std::vector<NamedTable>& named_tables() {
                     14.0f, 16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 30.0f,
                     -0.8125f, -2.5f, -4.0f, -5.5f, -7.5f, -9.0f, -11.0f, -12.0f,
                     -14.0f, -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -30.0f } },
-        /* Candidate W6NL: 32 positive E4M3-exact magnitudes followed by their negatives. Fitted
-         * to group-64 absmax-normalised FWHT-128 BF16 Flash-Next down-weight samples. This is a
-         * weight-error pilot, not a claim of improved model quality. The high code bit is the
-         * sign, and libr4d's layout verifies this complete table before serving it. */
+        /* The 64-level form for libr4d's w6nl64a8h: 32 positive E4M3-exact magnitudes followed
+         * by their negatives. Fitted to group-64 absmax-normalised FWHT-128 BF16 Flash-Next
+         * down-weight samples for least weight error, not against activations
+         * (tools/fit_w6nl.py). The high code bit is the sign, and libr4d's layout verifies this
+         * complete table before serving it. */
         { "w6nl", { 0.875f, 2.75f, 4.5f, 6.0f, 6.5f, 7.0f, 7.5f, 8.0f,
                     9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 16.0f,
                     18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f, 32.0f,

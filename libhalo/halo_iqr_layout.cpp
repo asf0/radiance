@@ -1,5 +1,9 @@
+/* Derived from libr4d/r4d_iqr_layout.cpp by the libhalo rename transform (2026-11-17);
+ * see libhalo/README.md. Op schemas, row names and stored weight layouts are
+ * shared with libr4d by design. Everything else in this file is libhalo's own
+ * and diverges as it is measured on gfx1151. */
 /* halo_iqr_layout.cpp -- the IQR weights' stored form (halo_iqr.h) from a container's planes, and
- * back. Pure host C++, as halo_fp8_layout.cpp.
+ * back. Pure host C++, as r4d_fp8_layout.cpp.
  *
  * The weight buffer is the codes reordered into lane segments plus the form's table or zero plane;
  * the scale buffer is the scale plane in tile-major order, with its second level and, on a tcq_rb
@@ -12,8 +16,6 @@
 #include "halo_iqr.h"
 #include "halo_fp8_frag.h"
 #include "halo_enc.h"
-#include "halo_hsimd.h"
-#include "halo_par.h"
 
 #include <algorithm>
 #include <atomic>
@@ -25,7 +27,7 @@
 
 using namespace halo_iqr;
 
-/* Operand indices of `gemm_nt_q` (halo_rows.cpp). */
+/* Operand indices of `gemm_nt_q` (r4d_rows.cpp). */
 enum { IL_B = 2, IL_BSCALE = 3 };
 
 namespace {
@@ -251,7 +253,47 @@ inline void put_bits(uint8_t* dst, long long o, uint64_t v, int n) {
     for (int i = 0; i < bytes; ++i) b[i] |= (uint8_t)(v >> (8 * i));
 }
 
-using halo_par::par_for;
+/* The load-time relayouts' split of one weight over the host's cores (libr4d's r4d_par.h). */
+template <typename F>
+void par_for(long long n, long long per_thread, F f) {
+    const long long hc = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    const long long nt = std::max(1ll, std::min(hc, n / std::max(1ll, per_thread)));
+    if (nt == 1) {
+        f(0ll, n);
+        return;
+    }
+    const long long per = (n + nt - 1) / nt;
+    std::vector<std::thread> th;
+    for (long long lo = 0; lo < n; lo += per) th.emplace_back(f, lo, std::min(n, lo + per));
+    for (std::thread& t : th) t.join();
+}
+
+/* One 16-row tile of an IQR trellis weight into its `nkb` stored units (halo_iqr.h, "the codes:
+ * lane segments"): `rows` is the tile's first row of B-bit codes, LSB first, rows `rb` bytes apart;
+ * unit kb, at `out` + kb * 256 * B, holds for each lane l and column e = 0..3 the 16 codes of
+ * column 128 kb + 4 l + e bottom-up (row 15 first), B bits each from the low bits. The scalar form
+ * of libr4d's iqr_trellis_tile, the same bytes. */
+void iqr_trellis_tile(const uint8_t* rows, int64_t rb, int B, int64_t nkb, uint8_t* out) {
+    const uint32_t m = (1u << B) - 1u;
+    for (int64_t kb = 0; kb < nkb; ++kb) {
+        uint8_t* u = out + kb * 256 * B;
+        std::memset(u, 0, (size_t)(256 * B));
+        uint64_t o = 0;   /* bit position in the unit */
+        for (int lane = 0; lane < 32; ++lane)
+            for (int e = 0; e < 4; ++e) {
+                const int64_t col = kb * 128 + 4 * lane + e;
+                for (int q = 0; q < 16; ++q, o += (uint64_t)B) {
+                    const uint8_t* row = rows + (15 - q) * rb;
+                    const uint64_t bo = (uint64_t)col * (uint64_t)B;
+                    const int64_t at = (int64_t)(bo >> 3);   /* the second byte only within the row */
+                    uint32_t v = (uint32_t)row[at] | (at + 1 < rb ? (uint32_t)row[at + 1] << 8 : 0u);
+                    v = (v >> (bo & 7u)) & m;
+                    for (int b = 0; b < B; ++b)
+                        if (v >> b & 1u) u[(o + (uint64_t)b) >> 3] |= (uint8_t)(1u << ((o + (uint64_t)b) & 7u));
+                }
+            }
+    }
+}
 
 /* 16-row tiles a relayout thread takes: about 16 MiB of codes. */
 long long tiles_a_thread(const Form& f, long long K) {
@@ -332,7 +374,7 @@ int scalar_value(const Form& f, const Planes& v, int64_t entries, long long r, l
     return 0;
 }
 
-/* The codes in halo_iqr.h's lane segments. A trellis tile goes to halo_hsimd::iqr_trellis_tile;
+/* The codes in halo_iqr.h's lane segments. A trellis tile goes to iqr_trellis_tile;
  * for the other forms, a segment at a time, each of the tile's 16 rows gives a lane its codes
  * 4l .. 4l + 3 (4/V for a grid) as one field read with a single load, and the segment is written
  * as a stream of dwords. walk_tile's order, which the unrelayout walks, element
@@ -370,9 +412,9 @@ int weight_relayout(const Form& f, const Geom& g, int64_t entries, const Planes&
         for (long long rt = lo; rt < hi; ++rt) {
             const uint8_t* rows = c0p + rt * 16 * rb;
             /* A trellis tile is a transpose of its codes, done a unit at a time in vector
-             * registers (halo_hsimd.h). */
+             * registers in libr4d (r4d_hsimd.h), a scalar walk here. */
             if (tr) {
-                halo_hsimd::iqr_trellis_tile(rows, rb, B, g.nkb, d + rt * g.nkb * ub);
+                iqr_trellis_tile(rows, rb, B, g.nkb, d + rt * g.nkb * ub);
                 continue;
             }
             for (long long kb = 0; kb < g.nkb; ++kb) {
@@ -907,7 +949,7 @@ extern "C" int halo_rad_unrelayout_iqr_vocab(const RadParam* p, int n_p, int ope
 /* ==================================================================== the routed experts
  *
  * moe_gemm_iqr's tables: every entry is one expert's IQR weight, relayouted by the dense hooks at
- * its class's geometry. The op's class operands (halo_layout.cpp's moe_view: `w` / `w_scale` at
+ * its class's geometry. The op's class operands (r4d_layout.cpp's moe_view: `w` / `w_scale` at
  * 2 / 3, the odd class at 6 / 7 with N_odd and K_odd; under four classes 6 .. 11 with N_q and K_q)
  * are answered as the dense GEMM's weight and scale operands with N and K set to the class's. */
 namespace {

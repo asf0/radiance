@@ -403,6 +403,7 @@ int Engine::park(int64_t drain_ms, const PageOut& req, PageResult* got, std::str
             spare.push_back({ (const char*)r->ctx.arena_base() + fixed, top - fixed });
     }
     if (!spare.empty()) dev_page_discard(owner_, spare);
+    xflex_restore_.clear();
     (void)xflex_settle();
     if (cfg_.prefix_cache) (void)sched_.reset_prefix_cache();
     const auto t2 = clk::now();
@@ -544,6 +545,7 @@ int64_t Engine::xflex_give(int64_t bytes) {
     }
     (void)rad_dev_set(ranks_[0]->device);
     const int64_t left = xflex_settle();
+    xflex_restore_.recalled(cur, left);
     xflex_retry_ns_ = rad_mono_ns() + 5000000000ull;
     const int64_t got = std::max<int64_t>(cur - left, 0);
     if (got > 0)
@@ -552,8 +554,10 @@ int64_t Engine::xflex_give(int64_t bytes) {
     return got;
 }
 
-/* Every tenth of a second on the step loop. While the engine has been busy in the last five
- * seconds, the slab grows a GiB at a time into memory the fleet says no model holds, and grows
+/* Every tenth of a second on the step loop. While recently busy, or restoring backing a
+ * peer's recall removed, the slab grows a GiB at a time into memory the fleet says no model
+ * holds. Idle restoration stops at its previous watermark and never advertises eviction demand.
+ * The slab grows
  * again only once the units fill what it already has, leaving no more than the turnover slots and
  * half a step empty (an empty slot is VRAM nothing uses). A refusal is remembered, so the fleet
  * can make room for it (expert_flex_wanted), and asked again a second later; a backing that fails
@@ -565,20 +569,27 @@ void Engine::xflex_tick(bool busy) {
     if (now - xflex_ns_ < 100000000ull) return;
     xflex_ns_ = now;
     const int64_t cur = xflex_bytes_.load(std::memory_order_acquire);
-    if (cur >= xflex_cap_ || now - xflex_busy_ns_ > 5000000000ull) {
+    const bool idle_restore = now - xflex_busy_ns_ > 5000000000ull;
+    const int64_t restore_limit = xflex_restore_.limit(cur, xflex_cap_);
+    const int64_t limit = idle_restore ? restore_limit : xflex_cap_;
+    // Clear a previous busy demand even when retry or occupancy stops this attempt.
+    // Background restoration must not ask the fleet to evict an idle peer.
+    if (idle_restore) xflex_want_.store(0, std::memory_order_release);
+    if (cur >= limit) {
         xflex_want_.store(0, std::memory_order_release);
         return;
     }
-    if (now < xflex_retry_ns_) return;
+    if (now < xflex_retry_ns_ || (idle_restore && !xflex_restore_.ready(now))) return;
     const Mover& m0 = ranks_[0]->mover;
     const int64_t g = std::max<int64_t>(VMem::granularity(), 1);
-    const int64_t step = std::min<int64_t>(((int64_t)1 << 30) / g * g, xflex_cap_ - cur);
+    const int64_t step = std::min<int64_t>(((int64_t)1 << 30) / g * g, limit - cur);
     /* Still filling: what the loans offer and no unit holds, past the slots kept free for swaps. */
     const int64_t kept = m0.turnover_bytes();
     if (m0.flex_offered_bytes() - m0.flex_used_bytes() > kept + step / 2) return;
     if (!broker_->flex_grow(rank_devices(), step)) {
-        xflex_want_.store(xflex_cap_ - cur, std::memory_order_release);
-        xflex_retry_ns_ = now + 1000000000ull;
+        xflex_want_.store(xflex_restore_.refused(now, idle_restore, xflex_cap_ - cur),
+                          std::memory_order_release);
+        if (!idle_restore) xflex_retry_ns_ = now + 1000000000ull;
         return;
     }
     struct Landed { VramBroker* b; ~Landed() { b->flex_done(); } } landed{ broker_ };
@@ -608,6 +619,10 @@ void Engine::xflex_tick(bool busy) {
     (void)rad_dev_set(ranks_[0]->device);
     xflex_bytes_.store(to, std::memory_order_release);
     xflex_want_.store(0, std::memory_order_release);
+    (void)xflex_restore_.limit(to, xflex_cap_);
+    if (idle_restore && to >= restore_limit)
+        RAD_INFO("expert flex: restored previous %s of backing a card while idle; "
+                 "cached expert fill continues", humanb(to).c_str());
     if (to >= xflex_cap_ || cur == 0)
         RAD_INFO("expert flex: the slab grows into memory no model holds: %s a card of up to %s",
                  humanb(to).c_str(), humanb(xflex_cap_).c_str());
@@ -762,6 +777,7 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
+    depth_log_stats("final");
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
      * allocator is per device. */
@@ -885,6 +901,8 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     sc.rank          = rank;
     sc.world_size    = cfg_.tp;
     sc.draft_coupling = cfg_.draft_coupling;
+    sc.draft_verify_block = cfg_.draft_verify_block;
+    sc.draft_verify_traversal = cfg_.draft_verify_traversal;
     RAD_TRY(smp.declare(b, sc));
 
     /* Where the chain writes the sampled ids. The engine declares it because rad-kbench drives the
@@ -1218,7 +1236,8 @@ int Engine::prepare_release(const RadBatch* b) {
      * parked, so no allocation races the read. */
     kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
     for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
-    return RAD_OK;
+    /* A checkpoint inside the step: every rank's Ctx copies into its stage (Ctx::set_ckpt_snap). */
+    return ckpt_stage_arm(b);
 }
 
 int Engine::issue_ahead(const RadBatch** out) {
@@ -1228,7 +1247,9 @@ int Engine::issue_ahead(const RadBatch** out) {
     if (flex_pending_.load(std::memory_order_acquire) || quiet_pending_.load(std::memory_order_acquire))
         return RAD_OK;
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
-        sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
+        /* --draft-depth adaptive: the row's own chain (Engine::depth_row_nodes); else the rounds
+         * every row ran. */
+        sched_.expect_draft(serial_row_[(size_t)i].seq, depth_row_nodes(i));
     for (int i = 0; i < block_rows_; ++i)
         sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
     const RadBatch* nb = sched_.step_next();
@@ -1673,6 +1694,8 @@ int Engine::step_loop() {
          * immediately for a kind that is not its own. */
         st = block_drafting() ? finish_block_drafter(so) : finish_serial_drafter(so);
         if (st < 0) return fail_loop(st);
+        /* --draft-depth-load: the step's time and tokens, for the rule's rate and prices. */
+        if (depth_load_on_) depth_step_note(b, so);
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */
         sched_.step_finished();
@@ -1910,6 +1933,45 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ the checkpoint stage */
+/* After the KV carve, the snapshot store and Scheduler::init. Every rank carved a stage or none
+ * did (KVManager::plan_groups decides on the same config and plans). */
+int Engine::ckpt_stage_open() {
+    bool staged = !ranks_.empty() && ck_store_.enabled();
+    for (auto& rk : ranks_) staged = staged && rk->kv.ckpt_stage() != nullptr;
+    if (!staged) return RAD_OK;
+    ranks_[0]->kv.ckpt_stage_layout(&ck_stage_off_, &ck_stage_lb_);
+    ckpt_inside_ = ckpt_snap_ok_;
+    sched_.set_ckpt_inside(ckpt_inside_);
+    RAD_INFO("checkpoint stage: %s a rank on the card; %s",
+             humanb(ranks_[0]->kv.ckpt_stage_bytes()).c_str(),
+             ckpt_inside_ ? "a prompt's tail snapshot is taken inside its last chunk"
+                          : "every snapshot at a chunk's end");
+    return RAD_OK;
+}
+
+int Engine::ckpt_stage_arm(const RadBatch* b) {
+    if (ck_stage_off_.empty()) return RAD_OK;
+    const StepEntry* in = nullptr;
+    if (b && b->ckpt_cut > 0)
+        for (const StepEntry& e : sched_.plan().e)
+            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && e.ckpt_tok + 1 < e.n_tokens) in = &e;
+    if (!in) {
+        for (auto& rk : ranks_) rk->ctx.set_ckpt_snap(nullptr, ckpt_slots_, ck_stage_off_, ck_stage_lb_);
+        return RAD_OK;
+    }
+    if (in->ckpt_tok + 1 != b->ckpt_cut || !state_slots_of(in->seq, &ckpt_slots_)) {
+        RAD_ERR("step %d: sequence %llu's checkpoint inside the step (row %d) is not the batch's "
+                "(%d), or its state slots are gone", b->step, (unsigned long long)in->seq,
+                (int)in->ckpt_tok, (int)b->ckpt_cut);
+        return RAD_E_STATE;
+    }
+    /* The step writes the stage; the last snapshot left it on the same stream (save_checkpoints). */
+    for (auto& rk : ranks_)
+        rk->ctx.set_ckpt_snap(rk->kv.ckpt_stage(), ckpt_slots_, ck_stage_off_, ck_stage_lb_);
+    return RAD_OK;
+}
+
 /* Snapshot after the step that produced the state. Linear state is what the chunk's last token
  * leaves, so the chunker ended the chunk at the checkpoint and copy 0 holds exactly that state; a
  * window snapshot is the window's rows behind the checkpoint, which may lie inside the chunk
@@ -1938,12 +2000,26 @@ int Engine::save_checkpoints() {
                             (unsigned long long)e.seq, (int)(e.ctx_len + e.ckpt_tok + 1));
                     return RAD_E_STATE;
                 }
-                for (auto& rk : ranks_) {
+                /* A checkpoint inside the step is in the stage already (rad_ckpt_snap) and goes
+                 * to the host slot from there in one copy; one at the chunk's end is copied from
+                 * the live slots. */
+                const bool inside = e.ckpt_tok + 1 < e.n_tokens && !ck_stage_off_.empty();
+                for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                    auto& rk = ranks_[ri];
                     if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
-                    const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
-                                                         (int)ckpt_slots_.size(),
-                                                         e.ckpt_slot, rk->ctx.stream(),
-                                                         &ckpt_win_);
+                    int s = RAD_OK;
+                    if (!inside) {
+                        s = rk->kv.checkpoint_save(ckpt_slots_.data(), (int)ckpt_slots_.size(),
+                                                   e.ckpt_slot, rk->ctx.stream(), &ckpt_win_);
+                    } else {
+                        /* The layers the step did not snapshot (rad_ckpt_snap) are the ones it did
+                         * not change: a drafter head's state, which moves only in the drafter's
+                         * passes behind this copy. */
+                        s = rk->kv.checkpoint_stage_rest(
+                            ckpt_slots_.data(), (int)ckpt_slots_.size(), rk->ctx.stream(),
+                            [&](size_t g, int64_t li) { return rk->ctx.ckpt_snapped(g, li); });
+                        if (s >= 0) s = rk->kv.checkpoint_stage_out(e.ckpt_slot, rk->ctx.stream());
+                    }
                     if (s < 0) {
                         RAD_ERR("rank %d could not snapshot sequence %llu into checkpoint slot "
                                 "%d: %s", rk->index, (unsigned long long)e.seq,
@@ -1953,6 +2029,30 @@ int Engine::save_checkpoints() {
                     }
                 }
                 if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                /* RADIANCE_DEBUG_CKPT_HASH=1: wait for the snapshot and log a digest of each
+                 * rank's shard, to compare two builds' snapshots byte for byte. A debugging aid:
+                 * it drains the streams. */
+                static const bool hash_on = [] {
+                    const char* h = std::getenv("RADIANCE_DEBUG_CKPT_HASH");
+                    return h && h[0] == '1';
+                }();
+                if (hash_on) {
+                    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                        auto& rk = ranks_[ri];
+                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                        (void)rad_stream_sync(rk->ctx.stream());
+                        const unsigned char* p = (const unsigned char*)rk->kv.checkpoint_ptr(e.ckpt_slot);
+                        uint64_t h = 0xcbf29ce484222325ull;
+                        const int64_t nb = rk->kv.checkpoint_bytes();
+                        for (int64_t j = 0; p && j < nb; ++j) { h ^= p[j]; h *= 0x100000001b3ull; }
+                        RAD_INFO("ckpt-hash seq=%llu pos=%lld rank=%zu inside=%d bytes=%lld %016llx",
+                                 (unsigned long long)e.seq,
+                                 (long long)(e.ctx_len + e.ckpt_tok + 1), ri,
+                                 (int)(e.ckpt_tok + 1 < e.n_tokens), (long long)nb,
+                                 (unsigned long long)h);
+                    }
+                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                }
             }
             return RAD_OK;
         });
@@ -2001,15 +2101,13 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
         score_ids_.erase(std::unique(score_ids_.begin(), score_ids_.end()), score_ids_.end());
     }
     bool host_failed = false;
-    /* Step-wide sibling of the scheduler's kMaxScoredCandidates: that cap bounds one request's
-     * candidate list; nothing bounded the step's UNION, which grows toward the whole vocabulary.
-     * The pinned readback's size used to be discovered by ATTEMPTING it -- the cancel path below
-     * fired only when a gigabyte-scale page-locked allocation failed, so on a box that survives
-     * the attempt the bytes stay pinned forever (the buffer is grow-only). The cap is sixteen
-     * maximally-loaded requests -- d1's questions name a few dozen ids each, so every real
-     * scored step lands far under it. A step past it is refused the way an allocation failure
-     * refuses: the scored requests cancel, the engine does not, and the box is never asked to
-     * pin anything to find out. */
+    /* The step-wide sibling of the scheduler's kMaxScoredCandidates. That cap bounds one
+     * request's candidate list; this one bounds the step's union of them, which otherwise grows
+     * toward the whole vocabulary. The readback below is pinned host memory sized by the union and
+     * never shrinks, so a step is refused by its count before the allocation is tried: a
+     * gigabyte-scale pin that succeeds would stay pinned. The cap is sixteen requests at the
+     * per-request maximum; a scored request names a few dozen ids. A step past it is refused the
+     * way an allocation failure is: the scored requests cancel and the engine goes on. */
     static const size_t kMaxScoredStepIds = 1u << 16;
     if (score_only_ && score_ids_.size() > kMaxScoredStepIds) {
         RAD_ERR("scored rows: the step names %zu candidate rows, over the step budget of %zu; "
@@ -2221,11 +2319,11 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
              * drive the KV rollback, the conv cursor and the emitted text) say how far the step
              * really got. */
             acc = accept_cut_at_eog(out, acc,
-                                    [&](int32_t t) { return is_eog(t); });
+                                    [&](int32_t t) { return vocab_ && vocab_->is_eog(t); });
 
             so.accepted[i] = acc;
             so.token[i]    = out[acc];
-            so.eos[i]      = is_eog(so.token[i]) ? 1 : 0;
+            so.eos[i]      = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
             if (tree) {
                 if (so.path.empty()) so.path.assign(plan.e.size() * RAD_SCHED_MAX_SPEC, 0);
                 for (int32_t t = 0; t < acc; ++t) so.path[i * RAD_SCHED_MAX_SPEC + t] = path[t];
@@ -2262,7 +2360,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             continue;
         }
         so.token[i] = so.rows[(size_t)so.first_row[i]];
-        so.eos[i]   = is_eog(so.token[i]) ? 1 : 0;
+        so.eos[i]   = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
         if (e.req && e.req->sp.n_probs >= 0)
             RAD_TRY(row_logprobs(so, so.first_row[i], so.token[i]));
         /* Advance the grammar on every rank: each builds the mask for its own vocabulary shard from
@@ -2845,9 +2943,13 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
          * the card there is no such cost and every lone prefill spans. */
         /* Local: beside an aux device a span pays from its first spanned interval (the pieces
          * overlap the two cards, qwen4exp step_auxpipe). */
-        sched_.set_span_min(stage_rows > 0 && arena_span_rows_ > 0 && cfg_.aux_device < 0
-                                ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
+        const int64_t span_auto = stage_rows > 0 && arena_span_rows_ > 0 && cfg_.aux_device < 0
+                                      ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0;
+        /* --prefill-span-min N says it for the deployment: where the routed pass covers the whole
+         * spanned step (--prefill-span-pass step) the span pays from the second interval on. */
+        sched_.set_span_min(cfg_.prefill_span_min >= 0 ? cfg_.prefill_span_min : span_auto);
     }
+    RAD_TRY(ckpt_stage_open());
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 
@@ -3160,6 +3262,26 @@ SamplingParams Engine::sampling_defaults() const {
     return resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);
 }
 
+/* A token the model's chat format writes as one of its call delimiters is a call boundary, not a
+ * turn's: a reply that closes a call with it must be able to write the next call and text after
+ * it. A checkpoint that also lists the token in generation_config.json's eos ids would end every
+ * tool-calling turn there, so the id leaves the vocabulary's end-of-generation set. This runs
+ * once the vocabulary and the plugins are both loaded (the reply format can be the architecture
+ * plugin's) and before anything reads the set: the scheduler and the cards' step state, which cut
+ * accepted drafts at it, the grammar index and the reply parser's terminators. */
+int Engine::demote_call_delimiters() {
+    if (!vocab_own_ || vocab_own_->chat_template().empty()) return RAD_OK;
+    const std::vector<int32_t> dropped = vocab_own_->drop_named_eog(
+        server::ChatTemplateBridge::eog_call_markers(*vocab_own_,
+                                                     rad_tools_chat_format(plugins_, meta_)));
+    if (dropped.empty()) return RAD_OK;
+    for (int32_t id : dropped)
+        RAD_WARN("vocab: token %d \"%s\" is listed as end-of-generation by the checkpoint's "
+                 "generation_config.json and is one of this model's tool-call delimiters; a turn "
+                 "does not end on it", id, vocab_->text(id).c_str());
+    return build_vocab_view();
+}
+
 /* The HTTP server over the engine. `/v1/completions`, `/v1/chat/completions`, `/v1/models`,
  * `/metrics` and `/health` are live. `/v1/embeddings` answers 501 unless the program is an
  * embedding program, and so do image, video and audio content parts unless the program declared an
@@ -3403,15 +3525,6 @@ int Engine::run_server() {
     const bool have_tpl = !gen_ && vocab_ && !vocab_->chat_template().empty() &&
                           chat_bridge.init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
                           chat_bridge.ready();
-    /* A token this format writes as one of its own call delimiters is a call boundary, not a
-     * turn's: a reply that closes a call with it must be able to write the next one, and text
-     * after it. A container that also declares it end-of-generation would cut every tool-calling
-     * turn there, so the id leaves the decoder's stop set. */
-    eog_demoted_ = chat_bridge.eog_call_markers();
-    for (int32_t id : eog_demoted_)
-        RAD_WARN("vocab: token %d \"%s\" is end-of-generation and one of this model's "
-                 "tool-call delimiters; a turn no longer ends on it", id,
-                 vocab_->text(id).c_str());
     if (embedding_) {
         /* No chat endpoint: the model's template, when it has one, renders a `messages` input. */
         if (have_tpl) embed_info.tpl = &chat_bridge;
@@ -3619,6 +3732,31 @@ int Engine::run_server() {
             return RAD_E_INVAL;
         }
         if (vc.family == mm::Family::Gemma4) {
+            /* A two-sided paged window is exact for image spans no longer than the window.
+             * Limit what the processor admits if a rank cannot run the long-span variant. */
+            if (encd.bidirectional) {
+                for (const auto& rank : ranks_) {
+                    long long window = 0;
+                    bool ahead = false;
+                    for (const OpInfo& op : rank->program.ops) {
+                        if (op.op == "attn_paged_ahead" || op.op == "attn_paged_qrow_ahead")
+                            for (const Band& b : op.bands)
+                                ahead = ahead || b.dom[RAD_DOMAIN_HOST] || b.dom[RAD_DOMAIN_DEVICE];
+                        if (op.op == "attn_paged" || op.op == "attn_paged_qrow") {
+                            long long causal = 1, w = 0;
+                            if (op.base.get_i("causal", &causal) && causal == 0 &&
+                                op.base.get_i("window", &w) && w > 0)
+                                window = window > 0 ? std::min(window, w) : w;
+                        }
+                    }
+                    if (!ahead && window > 0 && window < vc.max_patches / encd.merge)
+                        vc.max_patches = window * encd.merge;
+                }
+                if (vc.max_patches < encd.max_patches)
+                    RAD_INFO("media: image spans are limited to %lld soft tokens because the "
+                             "loaded kernels cannot attend beyond the sliding window",
+                             (long long)(vc.max_patches / encd.merge));
+            }
             if (cfg_.image_min_pixels || cfg_.image_max_pixels || cfg_.video_min_pixels ||
                 cfg_.video_max_pixels || cfg_.video_min_frames) {
                 RAD_ERR("media: this model's processor sizes images and video frames by a token "
@@ -3698,10 +3836,11 @@ int Engine::run_server() {
         }
         if (vc.family == mm::Family::Gemma4 &&
             (int64_t)std::max(vc.image_soft_tokens, vc.video_soft_tokens) * vc.merge * vc.merge >
-                encd.max_patches) {
-            RAD_ERR("media: an image of %d soft tokens or a video frame of %d is more patches than "
-                    "one encoder pass holds (--mm-max-patches %lld)", vc.image_soft_tokens,
-                    vc.video_soft_tokens, (long long)encd.max_patches);
+                vc.max_patches) {
+            RAD_ERR("media: an image of %d soft tokens or a video frame of %d exceeds this "
+                    "deployment's limit of %lld soft tokens per segment; lower --image-tokens "
+                    "or --video-max-frame-tokens", vc.image_soft_tokens, vc.video_soft_tokens,
+                    (long long)(vc.max_patches / encd.merge));
             return RAD_E_INVAL;
         }
         mm_proc = std::make_unique<mm::Processor>();

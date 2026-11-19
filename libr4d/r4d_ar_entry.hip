@@ -295,6 +295,13 @@ int build(ArInst* in, long long group, int rank, int world, long long max_numel,
     in->esize = r4d_ar_esize(dtype_code);
     in->max_numel = (long)max_numel;
     in->slot_bytes = align16((long)max_numel * in->esize);
+    /* A two-rank bf16 slot over P2P also holds the coded form of its largest message (the fused
+     * writes' coded push, r4d_ar_oneshot_2rank_exact.hip): 16.125 bytes a 16-byte word, 1/128
+     * more than the message. */
+    if (world == 2 && dtype_code == 0 && !host) {
+        const long coded = align16(r4d_ar_coded2_bytes(in->slot_bytes / 16));
+        if (coded > in->slot_bytes) in->slot_bytes = coded;
+    }
     in->slot16 = in->slot_bytes / 16;
     if (world == 8) {
         const int rc8 = ar8_settle(in, rank, world);
@@ -934,6 +941,51 @@ enum { R4D_AR_WHT6_NB_CAP = 48 };
  * many resident blocks of half the size is 5-9% faster per call, while 96 or 192 blocks of 1024
  * do not help. */
 enum { R4D_AR_WHT6_FUSED_THREADS = 512 };
+
+/* The two-rank fused writes' coded push (r4d_ar_hc_write_coded_kernel: ~12.1 bits a bf16 value
+ * instead of 16, the same bytes out) from this message size. Coding costs each block its encode and
+ * the peer's decode and saves a quarter of the bytes, so it pays where a message's time is the
+ * link's. On 2x R9700 (PCIe 4.0 P2P), rows of 2560 with four streams, N x [producer, reduction]
+ * chained on both cards, coded against plain time a reduction, each at its grid below (the gather
+ * form in brackets):
+ *
+ *     20 KiB  1.48 (1.48)    240 KiB  1.01 (1.04)    960 KiB  0.89 (0.75)      5 MiB  0.84 (0.82)
+ *     65 KiB  1.14 (1.11)    320 KiB  0.97 (0.99)   1.25 MiB  0.86 (0.71)     10 MiB  0.82 (0.82)
+ *    120 KiB  1.11 (1.08)    480 KiB  0.92 (0.95)    2.5 MiB  0.83 (0.84)   11.7 MiB  0.84 (0.84)
+ *    160 KiB  1.05 (1.05)    640 KiB  0.89 (0.89)
+ *
+ * (20 KiB is the register form's step, 3.7 us against 5.5; 10 MiB a 2048-row chunk's, 533 us
+ * against 436 and 627 against 513), and the same crossing with the link idle 100 us between
+ * reductions, as in a decode step. The forms meet near 280 KiB, so the floor sits at 512 KiB,
+ * where coding has begun to pay: a prefill chunk from 103 rows of 2560 is coded, and a decode or
+ * verify step of eight streams (48 rows, 240 KiB) is not. A message that does not code at all
+ * (every group raw) costs 14% more than plain at 240 KiB, 7% at 640 KiB and 1% at 10 MiB;
+ * Qwen3.8-Flash-Next's prefill sends 0.8% (the mixers) and 0.02% (the experts) of its words raw,
+ * 12.16 and 12.13 bits a value.
+ *
+ * `coded` (0 or 1), a launch parameter no declaration carries, pins one launch: r4d_selftest's
+ * arms. */
+enum { R4D_AR_CODED_MIN_BYTES = 512 * 1024 };
+
+/* The coded form's grid. Its blocks code and decode in waves of 32 words, so it runs 1024 threads
+ * a block whatever the row's tuned `nthreads` (at 512 a 10 MiB reduction takes 536 us against 435),
+ * and with a quarter of the bytes off the link the memory behind it shows: up to 48 blocks instead
+ * of 24 (the gather form at 2048 rows 559 us at 24 blocks and 513 at 48, at 192 rows 53 and 42;
+ * 3% slower at 384 to 512 rows, nothing else). Part of the table's 0.75 and 0.71 is that grid: the
+ * plain gather at 192 rows takes 59 us at 24 blocks and 49 at 48, where coding alone gives 0.87. */
+enum { R4D_AR_CODED_NB_CAP = 48, R4D_AR_CODED_THREADS = 1024 };
+
+static long long ar_coded_min_bytes() { return (long long)R4D_AR_CODED_MIN_BYTES; }
+
+/* Whether a fused write of `words16` 16-byte words takes the coded push: asked for (the floor, or
+ * the launch's `coded`) and fitting the form (r4d_ar_coded2_ok; the gather's launcher adds its
+ * table's bound). Both ranks decide from the same M and n. */
+static long ar_coded(const RadArgs* a, const ArInst* in, long words16) {
+    if (in->host || !r4d_ar_coded2_ok(words16, in->slot16, in->my_stage)) return 0;
+    const long long pin = r4d_geti_or(a, "coded", -1);
+    if (pin >= 0) return pin != 0;
+    return (long long)words16 * 16 >= ar_coded_min_bytes();
+}
 
 extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
     ArCall c;
@@ -1736,7 +1788,9 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
         if (rc != 0) return RAD_E_SHAPE;
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
-    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
+    const long coded = ar_coded(a, in, words16);
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks
+                                   : nb_for(words16, coded ? R4D_AR_CODED_NB_CAP : in->nb_cap);
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
 
     const long gate = link_gate(a), early = in->host ? 0L : gate;
@@ -1745,9 +1799,10 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
         in->slot16, r4d_addr(y), r4d_addr(inj), r4d_addr(h), (long)M, (long)n, (long)hc,
         (long)irow, (long)hrow, r4d_addr(ye), r4d_addr(ew), r4d_addr(so),
         sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld, (long)ew_ld, (long)sh_ld,
-        (long)sg_ld, (long)top_k, (long)sig, (long)(uintptr_t)s, nblocks, cfgv.nthreads,
+        (long)sg_ld, (long)top_k, (long)sig, (long)(uintptr_t)s, nblocks,
+        coded ? R4D_AR_CODED_THREADS : cfgv.nthreads,
         cfgv.drain, cfgv.acq, has_inv ? (long)(uintptr_t)a->scratch : 0L, early,
-        early ? in->gate_ctr : 0L, in->my_stage, (long)r4d_geti_or(a, "chain", 0));
+        early ? in->gate_ctr : 0L, in->my_stage, (long)r4d_geti_or(a, "chain", 0), coded);
     if (rc != 0) return RAD_E_SHAPE;
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
@@ -1867,7 +1922,9 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
         if (rc != 0) return RAD_E_SHAPE;
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
-    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
+    const long coded = ar_coded(a, in, words16);
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks
+                                   : nb_for(words16, coded ? R4D_AR_CODED_NB_CAP : in->nb_cap);
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
 
     const long gate = link_gate(a), early = in->host ? 0L : gate;
@@ -1875,9 +1932,9 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
         r4d_ar_hc_write(in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags,
                         in->my_seq, in->slot16, r4d_addr(y), r4d_addr(inj), r4d_addr(h),
                         (long)M, (long)n, (long)hc, (long)irow, (long)hrow, (long)(uintptr_t)s,
-                        nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq, early,
-                        early ? in->gate_ctr : 0L, in->my_stage,
-                        (long)r4d_geti_or(a, "chain", 0)));
+                        nblocks, coded ? R4D_AR_CODED_THREADS : cfgv.nthreads, cfgv.drain,
+                        cfgv.acq, early, early ? in->gate_ctr : 0L, in->my_stage,
+                        (long)r4d_geti_or(a, "chain", 0), coded));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 

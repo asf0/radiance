@@ -269,13 +269,14 @@ static TileFn pick_tile(uint32_t da, uint32_t db) {
 
 /* ------------------------------------------------------------------ the codebook experts
  *
- * Qwen3.8-Flash-Next's experts (docs/MOE-W4.md) are u4 or u5 codes indexing a table of 16 or 32
- * f32 levels, with a scale per (row, group of K): bf16 per 128 (`w4nla8h`), or E4M3 per 64 or 32
- * times one fixed f32 (`w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h`). Element (n, k) of an expert is
- * table[code(n, k)] * scale(n, k / group), times `scale.1` where there is one. The codes view takes
- * the planes `codes,table` and the two-level forms' scale view `scale,scale.1`; such a weight is
- * stored in the joined form of abi/rad_planes.h, which these rows' layout hooks ask for. A view of
- * one plane (w4nla8h's bf16 scale, every view of the other dtypes) is stored as it is.
+ * Qwen3.8-Flash-Next's experts (docs/MOE-W4.md) are u4, u5 or u6 codes indexing a table of 16, 32
+ * or 64 f32 levels, with a scale per (row, group of K): bf16 per 128 (`w4nla8h`), or E4M3 per 64
+ * or 32 times one fixed f32 (`w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h`, `w6nl64a8h`). Element (n, k)
+ * of an expert is table[code(n, k)] * scale(n, k / group), times `scale.1` where there is one. The
+ * codes view takes the planes `codes,table` and the two-level forms' scale view `scale,scale.1`;
+ * such a weight is stored in the joined form of abi/rad_planes.h, which these rows' layout hooks
+ * ask for. A view of one plane (w4nla8h's bf16 scale, every view of the other dtypes) is stored as
+ * it is.
  *
  * The arithmetic is quant_dot's: per weight group, the sub-sum of table values times activation
  * codes, then `(sub * sa) * sb` with sb the scale times its level in f32. The logical form the
@@ -382,9 +383,9 @@ struct LdCb {
 };
 
 /* An expert's codes when its entry is the joined form: 1 with `out` filled, 0 for a plain plane
- * (any dtype but u4 and u5), RAD_E_DTYPE for a form these kernels do not read and RAD_E_SHAPE for
- * codes not covering [n, k]. A u4 or u5 entry is always joined: only its table says what a code
- * means. */
+ * (any dtype but u4, u5 and u6), RAD_E_DTYPE for a form these kernels do not read and RAD_E_SHAPE
+ * for codes not covering [n, k]. A u4, u5 or u6 entry is always joined: only its table says what a
+ * code means. */
 static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbTensor* out) {
     if (w.dtype != RAD_U4 && w.dtype != RAD_U5 && w.dtype != RAD_U6) return 0;
     const RadPlanesHeader* h = rad_planes_header(w.data);

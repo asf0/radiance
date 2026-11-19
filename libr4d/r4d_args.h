@@ -324,12 +324,12 @@ static constexpr float kW6nlTable[64] = {
     -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f, -32.0f,
     -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f, -64.0f };
 
-/* The fixed second-level scale of `w4nl64a8h`, `w4nl32a8h` and `w5nl64a8h`: it multiplies a
- * weight's per-(row, 64 or 32 of K) E4M3 scale. A container states it (libquant's scale2_value=),
- * and the layout hook compares it with this before serving. Fixed rather than per row because the
- * experts' scales (with the rotation's 1/128 folded in) lie between 2^-15 and 2^-10.6 on
- * Qwen3.8-Flash-Next at group 64 (slightly lower at 32, half a binade lower for w5nl). Under
- * 2^-13 each is a normal E4M3 value, and E4M3 has three mantissa bits in every binade. */
+/* The fixed second-level scale of `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h` and `w6nl64a8h`: it
+ * multiplies a weight's per-(row, 64 or 32 of K) E4M3 scale. A container states it (libquant's
+ * scale2_value=), and the layout hook compares it with this before serving. Fixed rather than per
+ * row because the experts' scales (with the rotation's 1/128 folded in) lie between 2^-15 and
+ * 2^-10.6 on Qwen3.8-Flash-Next at group 64 (slightly lower at 32, half a binade lower for w5nl).
+ * Under 2^-13 each is a normal E4M3 value, and E4M3 has three mantissa bits in every binade. */
 static constexpr float kW4G64Scale = 0x1p-13f;
 
 

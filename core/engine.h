@@ -29,6 +29,7 @@
 #include "runtime/ctx.h"   /* KVStageRun */
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
+#include "sched/draft_depth.h"       /* --draft-depth adaptive: the stop rule */
 #include "sample/vocab_view.h"
 #include "runtime/rank_barrier.h"
 #include "text/tokenizer.h"
@@ -38,9 +39,11 @@
 #include "lora/adapter.h"
 #include "lora/slots.h"
 #include "fleet/broker.h"
+#include "place/expert_restore.h"
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -272,7 +275,7 @@ private:
     /* The first of this engine's instance slots (RadBuildCtx::slot_base), held from load_plugins
      * to the destructor (rad_engine_claim); -1 while none is held. */
     int slot_base_ = -1;
-    bool cards_claimed_ = false;    /* rad_dev_cards_claim, for an engine of more than one rank */
+    bool cards_claimed_ = false;    /* rad_dev_cards_claim, balanced during teardown */
 
     /* RadModelMeta holds bare char*, so the strings behind its key/value table must outlive
      * every declare. */
@@ -419,15 +422,9 @@ private:
     /* The text frontend, loaded from the container. The sampler's grammars walk `vocab_view_`,
      * which references `vocab_` and must not outlive it. */
     std::shared_ptr<const Vocab> vocab_;
-    /* End-of-generation ids the chat format also writes as a call delimiter: a call boundary is
-     * not a turn's, so the decoder does not stop on them (run_server demotes them). */
-    std::vector<int32_t> eog_demoted_;
-    /* End-of-generation as the decoder sees it: the vocabulary's set, minus the demoted ids. */
-    bool is_eog(int32_t id) const {
-        if (!vocab_ || !vocab_->is_eog(id)) return false;
-        for (int32_t d : eog_demoted_) if (d == id) return false;
-        return true;
-    }
+    /* `vocab_` itself, writable: bring-up takes call delimiters out of its end-of-generation set
+     * (demote_call_delimiters) before anything is built from the set. Not written after that. */
+    std::shared_ptr<Vocab> vocab_own_;
     std::unique_ptr<VocabView>   vocab_view_;
     /* The container's second vocabulary (rad-convert --tokenizer2), which an image generator that
      * declares `aux_tokens` reads its prompt through; null without one. */
@@ -496,10 +493,12 @@ private:
     void                          flex_room_tick(uint64_t now_ns);
     /* Expert flex (§6.7). Each rank's slab borrows from its own reserved range (Rank::xflex), the
      * top `xflex_bytes_` of it backed; the ceiling is the loan that covers every slot carved there.
-     * xflex_tick grows it on the step loop while the engine is busy, a GiB at a time once the
+     * xflex_tick grows it while busy, or restores surrendered backing while idle, a GiB
+     * at a time once the
      * slab has filled what it holds; xflex_give recalls and unbacks it, between steps. */
     std::atomic<int64_t>          xflex_bytes_{0};
     std::atomic<int64_t>          xflex_want_{0};
+    ExpertFlexRestore             xflex_restore_;  /* step-loop state, reset on park */
     int64_t                       xflex_cap_ = 0;
     int64_t                       xflex_claimed_ = 0;       /* the claim's expert bytes a card */
     uint64_t                      xflex_ns_ = 0, xflex_busy_ns_ = 0, xflex_retry_ns_ = 0;
@@ -549,6 +548,8 @@ private:
     bool state_slots_of(uint64_t seq, std::vector<int32_t>* out) const;
 
     int  load_vocab();
+    int  build_vocab_view();
+    int  demote_call_delimiters();
     int  declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool sizing = false);
     /* The build context for every declare of rank `rank` at `max_tok`; the real declare and the
      * arena's sizing declares differ only in max_tok. */
@@ -677,6 +678,70 @@ private:
     bool couple_evidence_ = false;   /* the completed-verify line was written (once a process) */
     bool couple_host_note_ = false;  /* the host-domain counterpart was written (once) */
     bool couple_malformed_note_ = false;   /* a status -1 round was reported (once) */
+    int64_t couple_planes_ = 0;            /* the rounds the state plane holds */
+    /* --draft-depth adaptive (sched/draft_depth.h, engine_draft.cpp): the chain of a step stops by
+     * the head's own laws, so its rounds are issued one decision at a time. After the pass of
+     * round r the engine copies that round's state rows to depth_rb_ and records depth_ev_[r - 1];
+     * the driver waits for the event of the round a decision needs, reads the statistic and issues
+     * the next round or ends the chain. depth_of_[i] is drafting row i's final depth, which
+     * expect_draft, set_draft and the coupling's bind all take in place of the rounds that ran. */
+    DraftDepthCfg depth_cfg_;
+    RadEvent      depth_ev_[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    bool          depth_issued_[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    RadMtpCoupleState* depth_rb_ = nullptr;             /* pinned [rounds, couple_rows_] */
+    std::vector<DraftDepthRow> depth_row_;
+    std::vector<int32_t>       depth_of_;
+    int           depth_seen_ = 0;                      /* rounds observed this step */
+    static constexpr int64_t kDepthSpinUs = 3000;      /* poll this long for a round, then block */
+    struct DepthStats {
+        uint64_t steps = 0, rows = 0, rounds = 0, drafts = 0, lawless = 0, waits = 0, blocked = 0;
+        uint64_t hist[RAD_MTP_COUPLE_MAX_ROUNDS + 1] = {};
+        double   wait_us = 0;
+        uint64_t late = 0;
+        /* By the drafts a step made (d): the card's cycle from that step's first statistic to the
+         * next step's (its later rounds, the verify of d + 1 rows, the sampler, the next history
+         * pass), and what the verify of d drafts accepted. */
+        double   cyc_us[RAD_MTP_COUPLE_MAX_ROUNDS + 1] = {};
+        uint64_t cyc_n[RAD_MTP_COUPLE_MAX_ROUNDS + 1] = {};
+        uint64_t acc[RAD_MTP_COUPLE_MAX_ROUNDS + 1] = {}, acc_n[RAD_MTP_COUPLE_MAX_ROUNDS + 1] = {};
+    } depth_stats_;
+    std::chrono::steady_clock::time_point depth_e1_{};   /* the last step's first statistic */
+    uint64_t      depth_logged_ = 0;                     /* depth_stats_.rows at the last line */
+    int           depth_last_ = 0;                       /* and the deepest chain that step made */
+    /* --draft-depth-load (sched/draft_depth.h): the load-aware rule and the late choice of the
+     * verify's rows, for a step that drafts for depth_cfg_.load_from sequences or more, and the
+     * online calibration of the tables they read. */
+    DraftDepthOnline depth_online_;
+    bool          depth_online_on_ = false;              /* --draft-depth-load-calib online */
+    int           depth_other_rows_ = 0;                 /* the next verify's token rows that draft nothing */
+    bool          depth_load_step_ = false;              /* this step's chains were decided by the load-aware rule */
+    bool          depth_load_on_ = false;                /* --draft-depth-load on: the tables exist */
+    /* A chain between the step that drafted it and the verify that settles it, by card slot: what
+     * the online calibration counts once the accepted count is known. */
+    struct DepthPend {
+        uint64_t seq = 0;
+        int32_t  depth = 0, rule = 0, n_s = 0;           /* depth 0: nothing pending */
+        float    s[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    };
+    std::vector<DepthPend> depth_pend_;
+    /* The step before this one, for the rule's rate and prices: when its passes ended, and whether
+     * it was a pure decode step of how many drafting rows. */
+    std::chrono::steady_clock::time_point depth_note_t_{};
+    int           depth_note_step_ = -2, depth_note_rows_ = 0;
+    uint64_t      depth_note_n_ = 0;
+    void          depth_step_note(const RadBatch* b, const StepOut& so);
+    void          depth_load_log(const char* when) const;
+    /* RADIANCE_DEBUG_CONC_LOG=<file>, diagnostics of the load-aware rule: one line a decode step (rows,
+     * rounds, each chain's depth and statistics, what the verify accepted) and one a refresh of
+     * the tables. */
+    std::FILE*    depth_log_ = nullptr;
+    void          depth_log_step(const RadBatch* b, const StepOut& so);
+    /* Drafting row i's depth after issue_serial_drafter: its own under the adaptive rule, else the
+     * rounds every row ran. */
+    int  depth_row_nodes(int i) const;
+    int  depth_readback_issue(int round, int n);
+    int  depth_observe_upto(int round, int n, const StepOut& so);
+    void depth_log_stats(const char* when);
     /* `rows` are serial_row_ or block_row_ (Scheduler::SerialRow / BlockRow). */
     template <class Row> int stage_couple_draws(const Row* rows, int n);
     int  bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t card);
@@ -716,6 +781,20 @@ private:
      * the checkpoint save waits for its context pass (save_checkpoints). */
     bool drafter_snap_ = false;
     int  save_checkpoints();
+    /* Checkpoints through the stage (KVManager::ckpt_stage).
+     *
+     * ckpt_snap_ok_: the plugin snapshots inside a step (RadArchProbe::ckpt_snap_ok); with a
+     * stage on every rank the scheduler then takes a prompt's tail snapshot inside its last chunk
+     * (Scheduler::set_ckpt_inside). Such a
+     * snapshot is the stage's one contiguous copy to the host slot rather than a pitched copy a
+     * group. */
+    bool ckpt_snap_ok_ = false;
+    bool ckpt_inside_ = false;
+    std::vector<int64_t>   ck_stage_off_, ck_stage_lb_;
+    int  ckpt_stage_open();
+    /* Before a step: a step with a checkpoint inside it arms every rank's Ctx
+     * (Ctx::set_ckpt_snap); every other step disarms them. */
+    int  ckpt_stage_arm(const RadBatch* b);
     /* A tree drafter (rad_drafter_tree), driven on the card only: ADV_BTAKE takes its parents,
      * ADV_COMPACT moves the accepted path's K and V after the acceptance, and ADV_CTXTREE stages
      * the context pass by that path. */

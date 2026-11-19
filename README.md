@@ -21,6 +21,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | model | container | get it | fleet file |
 |---|---|---|---|
 | Qwen3.8-Flash-Next: IQR-V4 experts, int8 trunk, MTP, vision | `qwen3.8-next-flash-iqr-v4.rad` (113 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4) | `tp1.yaml`, `tp2.yaml` |
+| Qwen3.8-Flash-Next abliterated (refusals removed): IQR-V4 trunk (GPTQ), codebook experts (round to nearest), MTP, vision | `qwen3.8-flash-next-uncensored-iqr-v4.rad` (113 GiB) | [download](https://huggingface.co/davetha/qwen3.8-flash-next-uncensored-iqr-v4) | — |
 | Qwen3.8-27B IQ8R (rotated int8), DFlash2 drafter, vision | `qwen3.8-27b-iq8r-dflash.rad` (29 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-iq8r-dflash) | `tp2.yaml` |
 | Qwen3.8-27B IQR-V4, 2.5 to 8 bits a weight ([docs/IQR.md](docs/IQR.md)), DFlash2 drafter, vision | `qwen3.8-27b-iq2r-v4.rad` .. `qwen3.8-27b-iq8r-v4.rad` (10 to 28 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4) | `tp1.yaml` (IQ4R-L) |
 | Qwen3.6-35B-A3B IQ8R, MTP | `qwen3.6-35b-a3b-iq8r.rad` (35 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-iq8r) | — |

@@ -15,7 +15,7 @@
 # depending on core/build/'s builder. With the archive linked, a new ABI call missing from the fake
 # would pull in rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a
 # single undefined reference.
-set(RAD_TESTS_NO_CORE arch_test bailing_hybrid_arch_test breeze_arch_test flint_arch_test glm5next_test museglimmer_test nemotron35_test spark25_arch_test nemotronh_test)
+set(RAD_TESTS_NO_CORE minimaxh3_limits_test arch_test bailing_hybrid_arch_test breeze_arch_test flint_arch_test glm5next_test museglimmer_test nemotron35_test spark25_arch_test nemotronh_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -89,6 +89,7 @@ set_target_properties(harness_fixture PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAK
 # Binaries registered as several entries, <bin>_shard<k> running `<bin> --shard k/n`, so their
 # cases run in parallel and no entry is the fast tier's long pole.
 set(RAD_TEST_SHARDS_gbnf_test 4)
+set(RAD_TEST_SHARDS_mtp_rrs_test 14)  # chi-square statistics: ~5 CPU minutes in all (the adaptive depth's rules and their controls are ~2 of them); fourteen ctest entries of under a minute and a half each
 
 # ------------------------------------------------------------------ the environment of every test
 #
@@ -132,6 +133,8 @@ set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 
 # Binaries that need more CPU than the default budget, and what costs it. Lower an entry when its
 # cost comes down, so the tripwire stays tight.
+set(RAD_TEST_CPU_BUDGET_mtp_rrs_test 100)  # chi-square over 2e5..4e5 seeds a case
+set(RAD_TEST_CPU_BUDGET_mtp_block_test 40)  # exact enumeration (g up to 4) plus ~1.6e6 chi-square steps over the real shared verify code
 set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid searches, ~13 s
 set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
 set(RAD_TEST_CPU_BUDGET_arch_test 15)  # every plugin's graph declared; ~10.8 s with the batched-tower case
@@ -280,7 +283,17 @@ foreach(t ${RAD_TESTS})
   if(n STREQUAL "mem_test")
     set_target_properties(${n} PROPERTIES ENABLE_EXPORTS ON)
   endif()
-  if(n STREQUAL "dspark_device_test")
+  if(n STREQUAL "spechub_device_test")
+    # The device verify rows against their host rows: on a card, so it carries the gpu label and
+    # the card environment (without either it would pass having checked nothing).
+    if(RAD_HIP_FOUND AND TARGET spechub)
+      add_test(NAME ${n} COMMAND ${n})
+      set_tests_properties(${n} PROPERTIES
+        LABELS gpu
+        TIMEOUT ${RAD_TEST_TIMEOUT}
+        ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+    endif()
+  elseif(n STREQUAL "dspark_device_test")
     if(RAD_HIP_FOUND AND TARGET libr4d)
       add_dependencies(${n} libr4d)
       add_test(NAME ${n} COMMAND ${n} ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
@@ -336,6 +349,7 @@ endif()
 # so a one-card build for another family skips those cases instead of failing strict mode.
 if(TARGET libr4d)
   target_compile_definitions(plugin_test PRIVATE RAD_TEST_HAS_LIBR4D=1)
+  target_compile_definitions(shipped_plugins_test PRIVATE RAD_TEST_HAS_LIBR4D=1)
   add_dependencies(plugin_test libr4d)
 endif()
 
@@ -350,6 +364,12 @@ if(TARGET spechub)
     target_compile_definitions(spechub_wiring_test PRIVATE RAD_SPECHUB_WITH_DEVICE=1)
   endif()
   add_dependencies(spechub_wiring_test spechub)
+  # spechub_device_test runs the plugin's device verify rows against their host rows on a card
+  # (skips without one); it needs the same library path.
+  target_link_libraries(spechub_device_test PRIVATE ${CMAKE_DL_LIBS})
+  target_compile_definitions(spechub_device_test PRIVATE
+    RAD_SPECHUB_LIB="${RAD_PLUGIN_OUT}/kernels/spechub.so")
+  add_dependencies(spechub_device_test spechub)
   # sample_test's coupling case declares a Sampler with draft_coupling set and needs the verify
   # op the spechub plugin carries (its host row); it skips when the library is absent.
   add_dependencies(sample_test spechub)
@@ -872,6 +892,8 @@ add_test(NAME artifact_sums
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/artifact_sums.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(artifact_sums PROPERTIES LABELS "fast;unit" TIMEOUT ${RAD_TEST_TIMEOUT})
 if(RAD_PYTHON3)
+  add_test(NAME vhead_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/vhead_test.py)
+  set_tests_properties(vhead_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77 TIMEOUT ${RAD_TEST_TIMEOUT})
   add_test(NAME rad_export_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/rad_export_test.py)
   set_tests_properties(rad_export_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
   add_test(NAME spark25_validation_test

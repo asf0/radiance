@@ -187,28 +187,35 @@ static int64_t tiles_of(int64_t lat_h, int64_t lat_w) {
 }
 
 /* Whether a frame of w x h pixels is one this model makes. */
-static bool size_ok(int64_t w, int64_t h) {
+static int64_t video_area(int64_t requested) {
+    return requested > 0 ? std::min<int64_t>(requested, kMaxArea) : kMaxArea;
+}
+
+static bool size_ok(int64_t w, int64_t h, int64_t area) {
     return w % kMult == 0 && h % kMult == 0 && w >= kMinSide && h >= kMinSide &&
-           w * h <= kMaxArea && std::max(w, h) <= kMaxAspect * std::min(w, h);
+           w * h <= area && std::max(w, h) <= kMaxAspect * std::min(w, h);
 }
 
 /* The most tiles a decode pass carries, over every size. */
-static int64_t max_tiles() {
+static int64_t max_tiles(int64_t area) {
     int64_t best = 0;
-    for (int64_t w = kMinSide; w <= (int64_t)kMaxArea / kMinSide; w += kMult)
-        for (int64_t h = kMinSide; h * w <= kMaxArea; h += kMult)
-            if (size_ok(w, h)) best = std::max(best, tiles_of(h / kScale, w / kScale));
+    for (int64_t w = kMinSide; w <= area / kMinSide; w += kMult)
+        for (int64_t h = kMinSide; h * w <= area; h += kMult)
+            if (size_ok(w, h, area)) best = std::max(best, tiles_of(h / kScale, w / kScale));
     return best;
 }
 
-static int64_t max_lat_frames() { return (int64_t)kLpc * kMaxChunks + kLtail; }
-static int64_t max_patches() { return (int64_t)kMaxArea / (kScale * kPatch * kScale * kPatch); }
-static int64_t max_video_rows() { return max_lat_frames() * max_patches(); }
-static int64_t max_audio() {
-    const int64_t frames = (int64_t)kFpc * kMaxChunks + kFtail;
+static int64_t max_lat_frames(int64_t chunks = kMaxChunks) { return kLpc * chunks + kLtail; }
+static int64_t max_video_rows(int64_t area, int64_t chunks = kMaxChunks) {
+    return max_lat_frames(chunks) * (area / (kMult * kMult));
+}
+static int64_t max_audio(int64_t chunks = kMaxChunks) {
+    const int64_t frames = (int64_t)kFpc * chunks + kFtail;
     return (frames * kAudioRate + kFps / 2) / kFps + 1;
 }
-static int64_t max_step_rows() { return kMaxText + kAudioCh * max_audio() + max_video_rows(); }
+static int64_t max_step_rows(int64_t area, int64_t chunks = kMaxChunks) {
+    return kMaxText + kAudioCh * max_audio(chunks) + max_video_rows(area, chunks);
+}
 
 /* Video sparse attention's video tiles over a grid of F x ph x pw patches, and the ones a video
  * query keeps at `sparsity`: ceil((1 - sparsity) V) in f64, at least one. */
@@ -225,7 +232,7 @@ static void vsa_bounds(double sparsity, int64_t* tiles, int64_t* keep) {
     int64_t best = 0;
     for (int64_t w = kMinSide; w <= (int64_t)kMaxArea / kMinSide; w += kMult)
         for (int64_t h = kMinSide; h * w <= kMaxArea; h += kMult)
-            if (size_ok(w, h))
+            if (size_ok(w, h, kMaxArea))
                 best = std::max(best, vsa_video_tiles(max_lat_frames(), h / (kScale * kPatch),
                                                       w / (kScale * kPatch)));
     const int64_t prefix = ((int64_t)kMaxText + kVsaRows - 1) / kVsaRows +
@@ -387,7 +394,9 @@ struct Model {
     int64_t D = 0, S = kMaxSteps;
     int64_t W = 1, Ws = 0;       /* ranks, and a rank's share of a modality's six vectors */
     int64_t maxV = 0, maxA = 0;  /* a lane's video and soundtrack latent rows */
+    int64_t max_area = kMaxArea;
     int64_t tiles = 0, tpr = 0;  /* the most tiles a decode carries, and a rank's share of them */
+    int64_t enc_tiles = 0;      /* reference images have their own bounds */
 
     /* ---- the text encoder */
     rad_weight w_tok = 0;
@@ -1708,7 +1717,7 @@ static int declare_video(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     }
     m.v_mean = join_list(mean);
     m.v_std = join_list(sd);
-    const int64_t maxhw = (int64_t)kMaxArea / (kScale * kScale);
+    const int64_t maxhw = m.max_area / (kScale * kScale);
     const int64_t vox = (int64_t)kDecLat * maxhw;
     const int64_t R = m.tpr * kPeriod;               /* this rank's tile rows */
     const int64_t RA = (int64_t)m.W * R;             /* every rank's, gathered */
@@ -1891,11 +1900,11 @@ static int declare_video(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         if (!m.op_vgather) return RAD_E_INVAL;
     }
     const int64_t fmax = (int64_t)kFpc + kFtail;
-    m.b_prev = decl_b(b, nm.f("lane.prev"), RAD_BF16, { (int64_t)kMaxLanes * kFtail * kMaxArea, 3 },
+    m.b_prev = decl_b(b, nm.f("lane.prev"), RAD_BF16, { (int64_t)kMaxLanes * kFtail * m.max_area, 3 },
                       RAD_BUF_PERSIST);
-    m.b_frames = decl_b(b, nm.f("frames_out"), RAD_U8, { fmax * kMaxArea, 3 }, RAD_BUF_PERSIST);
+    m.b_frames = decl_b(b, nm.f("frames_out"), RAD_U8, { fmax * m.max_area, 3 }, RAD_BUF_PERSIST);
     m.op_stitch = rw(b, RAD_OP(b, "vtile_stitch",
-                               RAD_PARAMS(RAD_RANGE("M", 1, fmax * kMaxArea), RAD_INT("tile", kTile),
+                               RAD_PARAMS(RAD_RANGE("M", 1, fmax * m.max_area), RAD_INT("tile", kTile),
                                           RAD_INT("overlap", kOverlap), RAD_INT("scale", kScale),
                                           RAD_INT("pt", 4), RAD_INT("skip", 3), RAD_INT("keep", kFpc),
                                           RAD_INT("blend", kFtail), RAD_INT("period", kPeriod),
@@ -1955,7 +1964,7 @@ static int declare_ups(RadBuilder* b, const RadModelMeta* meta, Model& m) {
 
     /* The most voxels a frame of latents and a video hold, before or after: the small size is
      * never larger than the full one. */
-    const int64_t V = max_lat_frames() * ((int64_t)kMaxArea / (kScale * kScale));
+    const int64_t V = max_lat_frames() * (m.max_area / (kScale * kScale));
     const int64_t P = m.maxV;
     const int acc = RAD_ACCESS_PER_TOKEN;
     auto wt = [&](const char* name, uint32_t dt, std::initializer_list<int64_t> shape) {
@@ -2358,15 +2367,16 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
      * tiled pass reruns the whole trunk once a tile while `b_vtile` holds every tile's pixels and
      * `b_eqt` the finished tiles' moments, so both lifetimes must span the trunk's ops (from
      * op_ve_pix's and op_ve_q's use to op_vt_crop and op_vt_join). */
-    m.b_tplan = decl_b(b, nm.f("venc.tplan"), RAD_I32, { m.tiles, 22 },
+    m.enc_tiles = max_tiles(kMaxArea);
+    m.b_tplan = decl_b(b, nm.f("venc.tplan"), RAD_I32, { m.enc_tiles, 22 },
                        RAD_BUF_PERSIST, RAD_DOMAIN_HOST);
     m.b_vtile = decl_b(b, nm.f("venc.vtile"), RAD_F32,
-                       { m.tiles * (int64_t)kEncMaxSide * kEncMaxSide, 3 });
+                       { m.enc_tiles * (int64_t)kEncMaxSide * kEncMaxSide, 3 });
     m.b_eq48 = decl_b(b, nm.f("venc.q48"), RAD_BF16, { R[5], 48 },
                       RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
     m.b_eq2 = decl_b(b, nm.f("venc.q"), RAD_BF16, { R[5], 48 },
                      RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
-    m.b_eqt = decl_b(b, nm.f("venc.qt"), RAD_BF16, { m.tiles * (int64_t)kTile * kTile, 48 },
+    m.b_eqt = decl_b(b, nm.f("venc.qt"), RAD_BF16, { m.enc_tiles * (int64_t)kTile * kTile, 48 },
                      RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
     m.ve_qw = wh(nm.f("venc.q.weight"), nm.ckpt("vae.quant_conv.weight"), { 48, 48, 1, 1, 1 });
     m.ve_qb = wh(nm.f("venc.q.bias"), nm.ckpt("vae.quant_conv.bias"), { 48 });
@@ -2518,13 +2528,13 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     /* The tiled encode's ops, declared last: b_vtile and b_eqt then live across the whole trunk,
      * which the tiled pass runs once a tile, so no trunk buffer shares their bytes. */
     m.op_vt_plan = rw(b, RAD_OP(b, "vtile_plan",
-                                RAD_PARAMS(RAD_RANGE("M", 1, m.tiles), RAD_INT("tile", kTile),
+                                RAD_PARAMS(RAD_RANGE("M", 1, m.enc_tiles), RAD_INT("tile", kTile),
                                            RAD_INT("overlap", kOverlap),
                                            RAD_INT("ratio", kVaeRatio)),
                                 RAD_NOWEIGHTS),
                      {}, { m.b_tplan });
     m.op_vt_crop = rw(b, RAD_OP(b, "vtile_crop",
-                                RAD_PARAMS(RAD_RANGE("M", 1, m.tiles * (int64_t)kEncMaxSide * kEncMaxSide),
+                                RAD_PARAMS(RAD_RANGE("M", 1, m.enc_tiles * (int64_t)kEncMaxSide * kEncMaxSide),
                                            RAD_INT("tile", kTile), RAD_INT("overlap", kOverlap),
                                            RAD_INT("ratio", kVaeRatio), RAD_STR("dtype", "f32")),
                                 RAD_NOWEIGHTS),
@@ -2895,6 +2905,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_INVAL;
     Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
+    m.max_area = video_area(ctx->gen_max_pixels);
+    if (m.max_area < kMinSide * kMinSide) {
+        fprintf(stderr, "radiance: minimaxh3: the video pixel limit must allow a %dx%d frame\n",
+                kMinSide, kMinSide);
+        return RAD_E_INVAL;
+    }
     m.nm = Names(ctx->scope);
     Names& nm = m.nm;
     RAD_ARCH_TRY(check_format(meta));
@@ -2982,21 +2998,29 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     m.gr = gd;
     m.gr.max_tok = kMaxText;
-    m.maxV = max_video_rows();
+    m.maxV = max_video_rows(m.max_area);
     m.maxA = kAudioCh * max_audio();
-    m.tiles = max_tiles();
+    m.tiles = max_tiles(m.max_area);
     m.tpr = (m.tiles + m.W - 1) / m.W;
     if (gd.n_layer >= kGrpAda - kGrpDit - 1 || gd.n_layer > kGrpVae - kGrpAda ||
         m.gt.n_layer >= kGrpRefiner) {
         fprintf(stderr, "radiance: minimaxh3: the networks are too deep for the weight groups\n");
         return RAD_E_UNSUPPORTED;
     }
-    if (ctx->max_tok < max_step_rows() || ctx->max_tok < m.tpr * kPeriod) {
-        fprintf(stderr, "radiance: minimaxh3: a pass carries %lld rows; the longest video's step "
-                        "needs %lld and its decode %lld\n", (long long)ctx->max_tok,
-                (long long)max_step_rows(), (long long)(m.tpr * kPeriod));
+    /* The driver checks the full decode row count, even though each rank issues only its share. */
+    const int64_t decode_max_rows = m.tiles * kPeriod;
+    const int64_t min_step_rows = max_step_rows(m.max_area, kMinChunks);
+    if (ctx->max_tok < min_step_rows || ctx->max_tok < decode_max_rows) {
+        fprintf(stderr, "radiance: minimaxh3: a pass carries %lld rows; the shortest video's step "
+                        "needs up to %lld and a decode up to %lld\n", (long long)ctx->max_tok,
+                (long long)min_step_rows, (long long)decode_max_rows);
         return RAD_E_INVAL;
     }
+    /* An explicit row cap can shorten the video while keeping enough room for every canvas.
+     * Keep the original bounds for codecs and reference buffers. References consume the
+     * remaining step rows and the driver checks the complete packed sequence per request. */
+    int64_t max_chunks = kMaxChunks;
+    while (max_step_rows(m.max_area, max_chunks) > ctx->max_tok) --max_chunks;
 
     /* The vision tower, when the checkpoint or container has its weights: every MiniMax-H3 config
      * names one. */
@@ -3046,16 +3070,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         d.latents_tail = kLtail;
         d.dec_latents = kDecLat;
         d.min_chunks = kMinChunks;
-        d.max_chunks = kMaxChunks;
+        d.max_chunks = max_chunks;
         d.latent_scale = kScale;
         d.latent_channels = kC;
         d.patch = kPatch;
         d.size_multiple = kMult;
         d.min_side = kMinSide;
-        d.max_area = kMaxArea;
+        d.max_area = m.max_area;
         d.max_aspect = kMaxAspect;
-        d.default_width = kDefW;
-        d.default_height = kDefH;
+        const double shrink = std::sqrt(static_cast<double>(m.max_area) / static_cast<double>(kMaxArea));
+        const int64_t scaled_h = static_cast<int64_t>(static_cast<double>(kDefH) * shrink);
+        const int64_t scaled_w = static_cast<int64_t>(static_cast<double>(kDefW) * shrink);
+        d.default_height = std::max<int64_t>(kMinSide, (scaled_h / kMult) * kMult);
+        const int64_t fit_w = std::min(scaled_w, m.max_area / d.default_height);
+        d.default_width = std::max<int64_t>(kMinSide, (fit_w / kMult) * kMult);
         d.default_chunks = kDefChunks;
         d.sample_rate = kRate;
         d.audio_rate = kAudioRate;
@@ -3655,7 +3683,7 @@ static void step_video(RadCtx* c, const RadBatch* batch, const Model& m) {
     const int64_t hp = lh * kScale, wp = lw * kScale, n = (int64_t)V->n_frames_out * hp * wp;
     RAD_ISSUE_N(c, m.op_stitch, n, brows(pix, nt * kPeriod),
                 praw(V->geom_d + RAD_VGEOM_CHUNK_FRAMES, RAD_I32, 5),
-                brow_slice(m.b_prev, lane * kFtail * (int64_t)kMaxArea, (int64_t)kFtail * hp * wp, 3),
+                brow_slice(m.b_prev, lane * kFtail * m.max_area, (int64_t)kFtail * hp * wp, 3),
                 brows(m.b_frames, n));
 }
 
@@ -3738,7 +3766,7 @@ static int64_t step_venc_tiled(RadCtx* c, const RadVideoGenBatch* V, const Model
     const int64_t lat_h = H / kVaeRatio, lat_w = W / kVaeRatio;
     const std::vector<int64_t> ty = tile_starts(lat_h), tx = tile_starts(lat_w);
     const int64_t nh = (int64_t)ty.size(), nw = (int64_t)tx.size(), nt = nh * nw;
-    if (nt > m.tiles) {
+    if (nt > m.enc_tiles) {
         rad_step_fail(c, "minimaxh3: a Vencode pass whose picture splits into more tiles than "
                          "the encoder declares room for");
         return row0;
@@ -4076,7 +4104,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
  * the most tiles. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
-    out->gen_rows = std::max<int64_t>(max_step_rows(), max_tiles() * kPeriod);
+    const int64_t area = video_area(out->gen_max_pixels);
+    if (area < kMinSide * kMinSide) return RAD_E_INVAL;
+    out->gen_rows = std::max<int64_t>(max_step_rows(area), max_tiles(area) * kPeriod);
     out->gen_video = 1;
     return RAD_OK;
 }

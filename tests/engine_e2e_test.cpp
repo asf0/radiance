@@ -91,10 +91,12 @@ std::vector<std::string> serving_argv(const std::string& model,
 /* The shape the preemption cases run in: four sequences of at most 512 tokens, 256 a step. Their
  * small KV pool comes from a small device, whose size small_device() finds. --prefill-interleave 0
  * pins the schedule these cases are sized for: the bring-up default auto:1 follows measured step
- * times, so on a loaded host the four sequences may never overlap enough to preempt. */
+ * times, so on a loaded host the four sequences may never overlap enough to preempt. The room
+ * gate is off: it admits a prompt only when the whole of it fits, which is what keeps a serving
+ * pool from preempting, and these cases exercise the preemption. */
 std::vector<std::string> small_pool_args() {
     return { "--max-num-seqs", "4", "--max-num-batched-tokens", "256", "--max-model-len", "512",
-             "--prefill-interleave", "0" };
+             "--prefill-interleave", "0", "--prefill-room-gate", "off" };
 }
 std::vector<std::string> device_env(int device_mib) {
     return { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(device_mib) };
@@ -685,6 +687,33 @@ TEST(qwen35_a_prefill_span_changes_no_logit) {
     CHECK(log.find("spans up to 4 intervals from its second interval on; every other step is "
                    "planned at 64 tokens") != std::string::npos);
     CHECK(log.find("prefill n_seq=1 n_tok=256") != std::string::npos);
+}
+
+/* --prefill-span-min is the deployment's own bound on the prompts that span: at 0 every document
+ * alone in the engine spans from its second interval on and the scheduler says so; above every
+ * document's length none does, and every step stays one interval. --prefill-span-pass step rides
+ * along: this plugin has no routed pass to widen and ignores it, so no logit changes either way. */
+TEST(qwen35_the_span_minimum_decides_which_prompts_span) {
+    std::string log;
+    check_recording_matches(world().qwen35, world().corpus,
+                            { "--max-num-batched-tokens", "256", "--max-num-seqs", "1",
+                              "--checkpoint-interval", "64", "--prefill-span", "4",
+                              "--prefill-span-pass", "step", "--prefill-span-min", "0" },
+                            { "RADIANCE_LOG_STEPS=1" }, &log);
+    CHECK(log.find("--prefill-span-min 0: every prefill alone in its step spans from its second "
+                   "interval on") != std::string::npos);
+    CHECK(log.find("prefill n_seq=1 n_tok=256") != std::string::npos);
+
+    std::string none;
+    check_recording_matches(world().qwen35, world().corpus,
+                            { "--max-num-batched-tokens", "256", "--max-num-seqs", "1",
+                              "--checkpoint-interval", "64", "--prefill-span", "4",
+                              "--prefill-span-min", "100000" },
+                            { "RADIANCE_LOG_STEPS=1" }, &none);
+    CHECK(none.find("--prefill-span-min 100000: a prefill spans when it is 100000 tokens or "
+                    "longer") != std::string::npos);
+    CHECK(none.find("prefill n_seq=1 n_tok=256") == std::string::npos);
+    CHECK(none.find("prefill n_seq=1 n_tok=64") != std::string::npos);
 }
 
 /* Documents batched together share every step's GEMMs and occupy other state slots and KV
@@ -3370,6 +3399,38 @@ TEST(nemotron35_rerank_real_weights_match_native_scores_and_rankings) {
         REQUIRE_EQ(s.stop(), 0);
         if (const char* output = std::getenv("RAD_NEMOTRON_RERANK_SERVER_LOG"))
             REQUIRE(tiny::write_text(output, s.output()));
+    }
+}
+
+
+TEST(undersized_guidance_is_rejected_without_blocking_the_image_server) {
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    const QwenImageContainers& model = qwen_image();
+    REQUIRE(!model.bf16.empty());
+    const json guided = {{"prompt", "a red mug"}, {"negative_prompt", "a blue mug"},
+                         {"size", "64x64"}, {"seed", 7}, {"num_inference_steps", 1},
+                         {"true_cfg_scale", 3.0}, {"output_format", "png"}};
+    for (const int entries : {1, 2}) {
+        Server server;
+        REQUIRE(server.start(model.bf16, {"--max-num-seqs", std::to_string(entries)},
+                             device_env(2048)));
+        int status = 0;
+        const json result = post(server.port, "/v1/images/generations", guided, &status);
+        CHECK_EQ(status, entries == 1 ? 400 : 200);
+        if (entries == 1) {
+            CHECK(result.dump().find("--max-num-seqs") != std::string::npos);
+            json plain = guided;
+            plain["true_cfg_scale"] = 1.0;
+            plain.erase("negative_prompt");
+            const json recovered = post(server.port, "/v1/images/generations", plain, &status);
+            REQUIRE_EQ(status, 200);
+            REQUIRE(recovered.contains("data") && recovered["data"].size() == 1);
+            CHECK(!recovered["data"][0].value("b64_json", std::string()).empty());
+        } else {
+            REQUIRE(result.contains("data") && result["data"].size() == 1);
+            CHECK(!result["data"][0].value("b64_json", std::string()).empty());
+        }
+        CHECK_EQ(server.stop(), 0);
     }
 }
 

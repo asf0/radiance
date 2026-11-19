@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <limits>
 #include <regex>
 #include <thread>
 #include <unordered_map>
@@ -133,16 +134,27 @@ void mm_tn(const float* A, const float* B, float* C, int64_t m, int64_t k, int64
 void orth(float* Y, int64_t n, int64_t l) {
     std::vector<double> col((size_t)n);
     for (int64_t j = 0; j < l; ++j) {
+        double original_norm2 = 0.0;
+        for (int64_t r = 0; r < n; ++r) {
+            col[(size_t)r] = Y[r * l + j];
+            original_norm2 += col[(size_t)r] * col[(size_t)r];
+        }
+        // Keep both projection passes in double scratch. Rounding each subtraction
+        // to float can turn a dependent column's residue into a spurious basis vector.
         for (int pass = 0; pass < 2; ++pass)
             for (int64_t i = 0; i < j; ++i) {
-                double d = 0.0;
-                for (int64_t r = 0; r < n; ++r) d += (double)Y[r * l + i] * Y[r * l + j];
-                for (int64_t r = 0; r < n; ++r) Y[r * l + j] -= (float)(d * Y[r * l + i]);
+                double dot = 0.0;
+                for (int64_t r = 0; r < n; ++r) dot += Y[r * l + i] * col[(size_t)r];
+                for (int64_t r = 0; r < n; ++r) col[(size_t)r] -= dot * Y[r * l + i];
             }
-        double nn = 0.0;
-        for (int64_t r = 0; r < n; ++r) nn += (double)Y[r * l + j] * Y[r * l + j];
-        const double inv = nn > 1e-30 ? 1.0 / std::sqrt(nn) : 0.0;
-        for (int64_t r = 0; r < n; ++r) Y[r * l + j] = (float)(Y[r * l + j] * inv);
+        double norm2 = 0.0;
+        for (const double value : col) norm2 += value * value;
+        // The tolerance follows the original column's scale and projection count,
+        // rather than the number of zero rows used to pad the matrix.
+        const double tolerance = std::numeric_limits<float>::epsilon() * std::max<int64_t>(1, j);
+        const double inverse = norm2 > original_norm2 * tolerance * tolerance
+                                   ? 1.0 / std::sqrt(norm2) : 0.0;
+        for (int64_t r = 0; r < n; ++r) Y[r * l + j] = (float)(col[(size_t)r] * inverse);
     }
 }
 
@@ -532,7 +544,7 @@ void truncate(const Delta& d, int64_t r, std::vector<float>* B, std::vector<floa
         mm_tn(d.B.data(), Y, t.data(), d.r, N, l);
         mm_tn(d.A.data(), t.data(), X, K, d.r, l);
     };
-    const int64_t l = std::min({ r + 8, N, K });
+    const int64_t l = std::min({ r + 8, N, K, d.rank_bound > 0 ? d.rank_bound : r + 8 });
     /* A fixed sketch: the same adapter composes to the same bytes on every rank and every load. */
     std::vector<float> Om((size_t)(K * l));
     uint64_t st = 0x2545F4914F6CDD1Dull ^ (uint64_t)(N * 1315423911ull + K);

@@ -682,7 +682,7 @@ A key sits at one of these levels:
 | level | holds |
 |---|---|
 | `server:` | the listener and the process: `host`, `port`, `api-key`, `api-key-env`, `allow-host`, `trusted-proxy`, `http-threads`, `read-timeout`, `write-timeout`, `keep-alive-timeout`, `max-body-mib`, `retry-after`, `no-cors`, `live`, `radiance-home`, `kernels`, `download-dir`, `log` (`info`, `debug` or `trace`), `proceed-with-incompatible-configuration`, `debug-accept-reference-kernels` |
-| `memory:` | the per-card budgets: `gpu-headroom-mib`, `gpu-memory-mib`, `host-headroom-mib`; and `host-mib`, the pinned host memory the process may hold, and `disk-tier`, a directory for parked models' copies |
+| `memory:` | the per-card budgets: `gpu-headroom-mib`, `gpu-memory-mib`, `host-headroom-mib`; `card-headroom-mib: {CARD: MiB}`, a reserve for one card in place of `gpu-headroom-mib` (the card that drives a desktop); and `host-mib`, the pinned host memory the process may hold, and `disk-tier`, a directory for parked models' copies |
 | `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive` |
 | `cards:` | `all` or a list of card indices the models may use |
 | `groups:` | `together` and `exclusive` lists of model names |
@@ -1068,8 +1068,8 @@ one for one with the key); a larger headroom that lost part of itself is reporte
 What the engine allocates after reading the card is charged before the split, not to the headroom:
 the step staging, the KV tiers' copy staging and the hardware queues. The driver backs each queue
 with VRAM beyond its ring (33 MiB on an R9700), so startup measures one and the receipt's `hardware
-queues` line shows the count and price. It also includes the queue scratch the runtime keeps once a kernel with a private
-segment has run (5 MiB a compute unit, 160 MiB on an R9700).
+queues` line shows the count and price. It also includes the queue scratch the runtime keeps once a
+kernel with a private segment has run (5 MiB a compute unit, 160 MiB on an R9700).
 
 ### 4.4 Long context
 
@@ -1320,9 +1320,14 @@ models:
 ```
 
 a prefill that is alone in its step carries up to N intervals a step, from the prompt's second
-interval on (the first is never spanned). Every other step -- one with decode rows, another prefill,
-or a request waiting to be admitted -- is planned at the shared budget, `max-num-batched-tokens`
-less the extra intervals (here 2048), as without the span, `busy-prefill-chunk` included. The
+interval on (the first is never spanned). Several prompts prefilling at once with nothing decoding
+and no request to admit take such steps one at a time: the one with the fewest prompt tokens left
+has the step to itself and the others wait for it, so the first of them answers first and none
+runs at the shared budget's lower rate. Every other step -- one with decode rows, a request
+waiting to be admitted, or the one step after a request finished while others still prefill (its
+client's next turn, sent at once, then waits for that step and not for a span) -- is planned at
+the shared budget, `max-num-batched-tokens` less the extra
+intervals (here 2048), as without the span, `busy-prefill-chunk` included. The
 checkpoints at a span's end and at a prompt's tail are written where a span of 1 writes them, so a
 follow-up turn resumes where it did. Startup states both budgets:
 
@@ -1359,6 +1364,68 @@ pool), the same span took 2.61 s against 2.56 s to the first token of an 18K-tok
 10.72 s against 10.55 s at 75K, and `max-num-batched-tokens: 8192`, `prefill-span: 4` took 3.30 s
 and 10.82 s. Measure the prompts you serve before turning it on at two ranks.
 
+**The routed pass of a spanned step: `prefill-span-pass: step`.** Where a spanned step runs as one
+wider step (Flash-Next at one and two ranks), its routed block still takes it a 2048-row pass at a
+time: the step sorts its slots twice and reads every expert's weight -- and decodes a trellis-coded
+expert -- once a piece. That is why the span alone gains nothing at two ranks on a container whose
+routed GEMMs are bound by the bytes they read (the IQR-V4 container above). With
+
+```yaml
+    max-num-batched-tokens: 4096
+    prefill-span: 2
+    prefill-span-pass: step        # default: piece
+    prefill-span-min: 0            # default: auto
+```
+
+the routed block takes the whole spanned step in one pass, so each expert's run is the step's and
+its weight is read once for twice the rows. The connection reads, the indexer's windows and the
+delta net keep their pieces. Flash-Next serves it where it does not pipeline the step, at one and
+two ranks; above two ranks a piece's pass runs beside the other piece's all-reduce, the passes stay
+a piece tall, and startup notes that the key was declined. A step that carries a chunk and decode
+rows (2048 tokens and the decode headroom) is one pass too, where it was a pass and a remainder.
+
+`prefill-span-min: N` is the shortest prompt, in tokens, a prefill spans for. `auto` is the rule
+below (eight intervals where routed experts are staged from host memory, every prompt elsewhere);
+with step-tall passes the span pays from the second interval on, hence `0`.
+
+`prefill-span-first: on` lets the span start at the prompt's first token as well (default `off`:
+the first interval is a step of its own). Its rows then read QSA's selection where the dense pass
+served them -- below the indexer's exactness bound the same keys, summed in another order -- and
+the first interval's experts are read once with the rest of the span. The output differs from
+`off` as another chunking does (greedy text can flip at a near-tie). On Flash-Next at TP2 with
+`max-num-batched-tokens: 8192, prefill-span: 4`, cold prompts of documentation text (whose routing
+spreads over most experts) 6.7K tokens 1002 -> 857 ms, 14K 2137 -> 1905 ms, 24K 3160 -> 3074 ms;
+BetterBench's filler text, whose routing is narrow, gains 0-4%.
+
+On Qwen3.8-Flash-Next IQR-V4 (2x R9700 at 210 W, TP2, `expert_tiered`, 12 GiB host pool, MTP 5 with
+adaptive depth), prefill of one cold prompt with the four keys above against
+`max-num-batched-tokens: 2048`, in tokens a second (prompt tokens over the time to the first token,
+the median of eight prompts of shuffled filler a depth):
+
+| prompt tokens | 2048 budget | span 2, step pass, min 0 | |
+|---|---|---|---|
+| 1.6K | 5780 | 5860 | +1.4 % |
+| 6K | 6220 | 6340 | +2.0 % |
+| 12K | 6190 | 6400 | +3.3 % |
+| 24K | 6150 | 6500 | +5.8 % |
+| 47K | 6060 | 6470 | +6.7 % |
+
+A prompt of one interval (under 2048 tokens) is not spanned; its figure is within the run-to-run
+spread. Single prompts of documentation text measured +4 % at 28K and +5 % at 42K.
+
+What `prefill-span-pass: step` costs beside the span's own costs below:
+
+- **Activation memory.** The planes that hold a row per (token, expert slot) are a step tall. On
+  Flash-Next at a 4096 budget that is 186 MiB more arena a rank than the span with piece
+  passes; with the span's own rows the KV pool goes from 4.58 GiB a card (4.18 with the span at
+  piece passes) to 4.02 on a 32 GiB R9700 at `host-pool-mib: 12288`: 3.4 sessions of 70000 tokens
+  where the 2048 budget holds 4.0.
+- **Bytes.** Every op of the pass is per row, but the grouped trellis GEMM takes a run of one or two
+  rows through its dot path and a longer one through its tiles, which agree only within f32
+  rounding before the bf16 store. The step's longer runs move rows between the two, so the output
+  differs from piece passes at tie level -- the difference a spanned step at one or two ranks
+  already has from 2048-token chunks, and any other chunk size has. It is deterministic.
+
 What it costs:
 
 - **The checkpoints inside a span are not written.** A later request that shares only part of a
@@ -1373,7 +1440,8 @@ What it costs:
   span's extra rows are VRAM the expert slab does not get (320 MiB a card on Flash-Next at TP2).
   Every step but a spanned one runs at an arena level of the shared size, which lends those rows to
   the slab and keeps the prefill stager's ring right above its own buffers. A prefill there spans
-  only from eight intervals (16K tokens on), where the span starts to win. Startup says so:
+  only from eight intervals (16K tokens on), where the span starts to win with piece-tall passes
+  (`prefill-span-min: auto`; `prefill-span-min: N` sets the bound). Startup says so:
 
   ```
   scheduler: --prefill-span: a prefill spans when it is 16384 tokens or longer -- routed experts
@@ -1411,6 +1479,36 @@ its tail in other chunks than a cold prefill can flip a near-tie in greedy text.
   the turn added.
 - `nearest`: a hit resumes at the deepest snapshot or block, and a prompt's tail snapshot is at
   its last quantum boundary. A turn re-prefills up to one chunk less than under `exact`.
+
+Under `nearest` the tail snapshot cuts the prompt's last chunk there (linear state is what a
+chunk's last token leaves), and the last tokens -- under a quantum, or under a quarter interval
+where a spanned last chunk is cut at the last interval boundary it crosses -- are a step of their
+own. On a routed model that small step reads most of the experts once more: some 60 ms a prompt on
+Flash-Next at two ranks, whatever the prompt's length. `prefill-tail-snapshot: off` leaves the
+last chunk whole (one step fewer; a prompt that ends on its tail keeps the snapshot, which cuts
+nothing); a next turn then resumes from the deepest snapshot a chunk end left, the last interval or
+span boundary, and re-prefills up to an interval more. For single-shot prompts (benchmarks, one
+question per document) off is the faster schedule; for conversations that come back, on.
+
+Where the model's plugin can snapshot inside a step (Flash-Next, `qwen4exp_fp8`) and a hit resumes
+at the nearest snapshot (`prefix-resume: nearest`), a prefill alone in its spanned step
+(`prefill-span` above 1) gets both: its last chunk runs to the prompt's end
+and the tail snapshot is taken inside it, at the same position. Everything that carries state
+across the snapshot -- the delta net's recurrence and convolution, the indexer's key ring, the PLE
+windows -- runs over the rows before it and the rows after it as two pieces, each what a chunk of
+those rows computes, and copies its slot to a stage on the card between them; the connection reads
+are cut there too, and the routed GEMMs give each expert's rows before it a run of their own. The
+snapshot holds the bytes a step cut at the snapshot leaves (a next turn resumes and answers as it
+would from that step), and no step of the last tokens is needed. Cutting nothing, it also needs no
+quarter interval past the boundary below it: a prompt whose last quantum boundary lies less far
+past it, which a cut schedule leaves at that boundary, takes its tail snapshot at that last quantum
+boundary all the same, and a next turn re-prefills under a quantum rather than up to a quarter
+interval. The stage is one snapshot a rank on the card (57.1 MiB a rank on Flash-Next at TP2),
+taken from the KV pool only where all of that holds and the prefix cache is on; such a snapshot goes
+to its host slot from there in one copy. A step shared with other work is cut at the snapshot
+instead. Prompts of documentation text (whose
+last tokens read most experts) at 4.8-6.6K tokens: 843 -> 785 ms, 896 -> 850, 1110 -> 1007; filler
+text 6-24K: about -1%.
 
 Under `exact` an interval larger than the chunk must be a multiple of it; otherwise it is rounded
 up, and startup says so:
@@ -1625,6 +1723,153 @@ the head's window. At temperature 0 the text
 is that of a fixed depth wherever fixed depths agree; above 0 it is distribution-exact.
 `radiance:draft_depth_adaptive` and `radiance:draft_verify_depth_total` (§6.3) show the windows.
 
+**Adaptive chain depth: `draft-depth: adaptive`.** `draft-window: adaptive` picks the window of the
+next step from the acceptance and the cost of the steps before it. A coupled serial head can also
+stop the chain of a step within that step, from the head's own laws: a fixed chain drafts N tokens
+every step and its verify pays for N + 1 rows whatever the head thought of them. With `draft-depth:
+adaptive` (`draft-coupling: on` and a serial head; `draft-window` stays `fixed`, since both decide
+the depth and the engine refuses them together) `num-speculative-tokens` (or `draft-depth-max`) is
+the deepest chain, and round j runs only while the product of the earlier rounds' probabilities is at
+least `draft-depth-stop` -- each round's largest probability (`draft-depth-stat: top`, the default)
+or the probability of the token it drew (`path`). The next verify then carries exactly the drafts
+made (1 to N, each row count its own recorded pass), so a step whose head is unsure costs one or two
+rows and a confident one drafts deep.
+
+```yaml
+    num-speculative-tokens: 5      # the deepest chain
+    draft-coupling: on
+    draft-verify: traversal
+    draft-depth: adaptive
+    draft-depth-stop: 0.85
+```
+
+The next verify is issued before the drafts exist (it runs behind them on the card), so its row count
+has to be known when it is issued. The host therefore reads one state row back after a round and
+decides the round after the next one (`draft-depth-lag: 1`, the default): the card is running the
+round in between, so the readback, the decision and the issue of the next round or of the verify
+(about 0.1 ms to the first packet) hide behind it and nothing waits. `draft-depth-lag: 0` decides
+every round from all the rounds before it; the card then waits for the host between two rounds. The
+step's tokens are streamed after the chain's last decision rather than right after the sampler (up
+to a millisecond or so later; the rate is the same). The rule reads the draft's side only -- the laws
+the rounds drew from and, for `path`, the tokens drawn before the one a decision admits -- never the
+target and never the admitted token itself, so the row-wise and the traversal verify stay exact
+(`core/sched/draft_depth.h` has the argument, `tests/mtp_rrs_test.cpp` the chi-square and the two
+rules that fail it). A greedy request has no law to read and drafts min(3, N). Shutdown logs the
+depths taken, and per depth the card's cycle and the drafts its verify accepted (`draft depth
+adaptive (final)`). On Qwen3.8-Flash-Next (2x R9700, traversal verify) a cap of 5 at stop 0.85 took
+2.79 tokens a step where the fixed chain of 3 took 2.70, at the same mean of 3.0 drafts and a step
+0.7% longer: +3.0% tokens a second (95% interval +1.0 to +5.0%) over temperatures 0.7 and 1.0; a
+cap of 7 gained no more, a deep verify row costing more than a shallow one. The stop is not
+sensitive between 0.80 and 0.90. The engine keeps 48 recorded passes instead of 24 (an adaptive
+chain makes more pass shapes than 24 hold: 3352 recordings per benchmark became 1472, +1.7% tokens a
+second for this mode); the other modes make no more pass shapes than 24 hold.
+
+**Several sequences in one step: `draft-depth-load: on`.** The stop rule prices a draft as one stream pays
+for it: its verify row and the head round that makes it. With several sequences drafting in one step the
+prices part. A round is one pass for every row, a verify row is each row's own, the row that takes the
+verify past a kernel tile (more than 16, 32, 48 or 64 query rows) pays for the tile, and a millisecond is
+worth more tokens. From `draft-depth-load-from` drafting sequences on (default 5) the load-aware rule
+decides the chain instead: round j runs for the rows of largest p that maximise
+
+    sum of p  -  rate x (what their verify rows and the tiles they open cost + the round)
+
+with p the chance that the row's draft j is accepted, read off the chain's confidence so far, and the rate
+the tokens a millisecond the engine makes at that many sequences: a draft is made when it yields more than
+the same time does on average. `draft-depth-load-min` rounds (default 2) always run. When the next verify is
+issued the host has read one more law of every chain than the rule had, and `draft-depth-load-late: on` (the
+default) chooses each row's verified drafts again from those -- draft j by the laws up to its own, never
+the one after it -- so a chain that turned unsure after its round was issued costs the round but no verify
+row, and the rows are cut back to a tile where the tile costs more than the drafts past it yield. A step
+with fewer sequences is decided by the stop rule exactly as without the key, so a single stream is served
+bit for bit as the stop rule serves it.
+
+```yaml
+    max-num-seqs: 8
+    draft-depth: adaptive
+    draft-depth-load: on           # the stop rule up to 4 drafting sequences, the load-aware rule from 5
+```
+
+The tables the rule reads -- each draft's acceptance by confidence, the tokens a millisecond, and a verify
+row's, a round's and a tile's milliseconds by drafting sequences -- start from ones measured on
+Qwen3.8-Flash-Next (IQR-V4, two R9700, temperature 1.0), or from the `draft-depth-load-*-ms` lists, and with
+`draft-depth-load-calib: online` (the default) follow the running server. Every verified chain is counted,
+for each draft it carried, at the confidence its decisions read (on top of 48 pseudo-observations of the
+built-in table a knot, the estimate kept monotone in the confidence, the counts halving every 4000 steps or
+so); the rate is a moving average of the pure decode steps' tokens and milliseconds; and the prices are
+those steps' milliseconds regressed on verify rows, rounds and tiles, with the built-in prices as the
+prior, so a price the steps do not tell apart (a round from the rows that come with it) stays near the
+table and one they do (a row, a tile) follows them. A lower temperature, which accepts more at the same
+confidence, another card or another model therefore needs no table of its own; `static` serves the tables
+as given. The output law is the target's either way: within a step the rule reads draft-side laws only (its
+own chain's up to the draft it admits, and the other sequences'), and the tables move between steps, from
+verifies and step times that are over -- draws at coordinates the step in hand never reads again
+(`core/sched/draft_depth.h` has the argument, `tests/mtp_rrs_test.cpp` the chi-square with tables that
+follow the run, and the two controls that fail it: a choice that reads the law after the draft, and tables
+made from the step's own verify). Requests that share a seed share those coordinates, as under
+`draft-calib: online`. Shutdown logs what was measured (`draft depth load-aware (final)`), and
+`RADIANCE_DEBUG_CONC_LOG=<file>` writes one line a decode step (rows, rounds, each chain's depth and confidences,
+the accepted counts) for study; nothing reads it back. On Qwen3.8-Flash-Next (2x R9700, traversal
+verify, `max-num-seqs: 8`, BetterBench's concurrency sweep, 48 requests a run) eight streams in one server
+session, the rule switched between runs, made 565 tokens a second against the stop rule's 557 at
+temperature 1.0 (+1.5%, two runs each) and 572 against 556 at 0.7 (+2.9%); one, two and four streams are
+the stop rule's. Those runs had `hc_read`'s 48-row tile for 33..48 rows (a separate
+change), under which a verify past 32 rows costs about a millisecond more; with a dearer tile the rule has
+more to avoid.
+
+**SuffixDecoding as a step selector: `draft-suffix`.** `draft-suffix: on` (default off: every step
+is the head's) lets a serial head's chain give a step to the sequence's own history.
+After each commit the engine looks, in the sequence's prompt and output, for an earlier occurrence of
+its last `draft-suffix-min-match` tokens (default 6; the longest of that length and three more wins,
+the latest occurrence of it). If there is one, the next step is a pure verify of what followed it (a
+chain of at most `draft-suffix-max` rows, default 7) in place of the head's draft, cut where the path
+score falls under `draft-suffix-min-score` (default 0.3): SuffixDecoding's frequency rule (Oliaro et
+al., arXiv 2411.04975), the product along the chain of how often that token followed that context in
+the history. Otherwise the step is the head's. It pays where the reply copies its context (code
+edits, quoting, agent and tool loops, pasted text, structured output) and does nothing on free chat.
+The history searched is the request's own: a tree over other requests is not built.
+
+It works with the normal fixed MTP chain, with `draft-depth: adaptive` (the adaptive chain stays within
+the head's `num-speculative-tokens` rounds; the suffix window only widens the verify) and with
+`draft-verify: traversal` (a suffix row carries no coupled state, so it is a leaf of the walk). It is
+refused with `draft-verify: block` (the block verify decides a head chain as a whole), with
+`draft-window: adaptive`, and on a block drafter.
+
+How it is built: the verify window (`num-speculative-tokens` for every buffer, ring and kernel band)
+becomes `max(num-speculative-tokens, draft-suffix-max)` while the head keeps drafting its own
+`num-speculative-tokens` rounds, so the head's passes (and `draft-coupling`'s draws) do not change. A
+suffix step is built after the commit, where the lookup can read the committed end, so a sequence whose
+history ended in a recurring pattern at the last commit is **not issued ahead** (the step ahead is made
+on the card from the head's drafts, before the commit; deciding on the last readback costs one step of
+lag when a copy starts and one built-after-commit step when it ends, where the card-side alternative
+would need a per-sequence token history and a hash table in the advance kernels). The head still drafts
+behind every step, a suffix step included: its history pass covers all 1 + rows positions the step
+verified, so the head's cache has no hole behind it and its next draft is as good as after a head step;
+the draft pass behind a suffix step is the price of that.
+
+Exactness: the choice reads the committed text and nothing else, never a draw. A suffix step carries no
+coupled row (`Request::draft_suffix`): the sampler binds none of the head's staged states to its rows (a
+proposal that equals the head's unused draw `x` would otherwise select the coupling by the value of that
+draw). Each row is the target's plain draw from `(seed, position)` and the walk follows the proposal iff
+the draw equals it: greedy text is the head-only run's (up to the last-bit differences a different row
+count makes to the logits, as between any two window sizes) and the sampled law is the target's.
+`tests/mtp_rrs_test.cpp` checks the law (chi-square over the first three tokens, alone and mixed with
+adaptive-depth steps, under the row-wise and the traversal verify, with a negative control that exposes
+the variant in which the coupled rows see the suffix chain), `tests/sched_test.cpp` the selection, the
+issue-ahead rule and the head's catch-up, `tests/arch_test.cpp` the issue pattern of a nine-row verify.
+The window is bounded by the model's kernels: Flash-Next's fused conv + recurrent update serves at most 8
+query rows (a register window), so `draft-suffix-max` is at most 7 there; a larger window makes the first
+step fail with `unsupported`. `/metrics` has `radiance:suffix_steps_total`, `suffix_rows_total`,
+`suffix_accepted_total` and `suffix_held_ahead_total`.
+
+```yaml
+    num-speculative-tokens: 3
+    draft-coupling: on
+    draft-suffix: on
+    draft-suffix-min-match: 6
+    draft-suffix-max: 7
+    draft-suffix-min-score: 0.3
+```
+
 **Chained launches.** Where the model's plugin measured its step faster with them, the AQL backend
 lets a kernel that depends on the one before it on its queue wait in its own prologue instead of
 behind the packet processor's barrier bit, which saves most of the launch gap between dependent
@@ -1745,6 +1990,27 @@ depth 4998 to 5278) and 1.3% of the eight-stream decode step, and one-stream dec
 four ranks only the exact wire has a fused form, used for decode and verify steps of up to
 `max-num-seqs` x (1 + `num-speculative-tokens`) rows; prefill chunks and tiered-int8 messages run
 the unfused chain.
+
+At two ranks the exact wire's fused writes send a message of 512 KiB or more coded, at about 12.1
+bits a bf16 value instead of 16, and losslessly: a value keeps its sign and its mantissa and takes a
+4-bit offset from a base exponent its 64 neighbours share, and a group whose exponents span more
+than 14 (or that holds a subnormal, an inf or a NaN) travels raw. The peer decodes the bf16 words it
+would have been sent and folds them in the same order, so every byte of the result is the plain
+kernels' and nothing is configured. A prefill chunk's reductions are bound by the link (2048 rows of
+2560 are 10.5 MB each way, 96 times a chunk on Qwen3.8-Flash-Next, where the code is 12.13 to 12.16
+bits a value): coded, a long prompt's prefill gains 2.6 to 2.9% on 2x R9700 (24K tokens 6297 to 6479
+tok/s, 47K 6251 to 6414). A message under the floor stays plain: the two forms cost the same near
+280 KiB, an eight-stream decode or verify step is 240 KiB, and a one-stream step, bound by its
+handshake and not its bytes, is slower coded (a 20 KiB reduction 3.7 us plain and 5.5 coded, 3.8% of
+decode throughput).
+
+A large coded message would otherwise take the link's time and then the card memory's time (every
+block pushes its range, then decodes the peer's and writes the streams). From 4 MiB (the write) and
+6 MiB (the gather form) each block cuts its range into parts with their own handshake and folds part
+j - 1 while part j crosses the link (8 parts for the write, 6 for the gather): the same bytes, about
+the longer of the two times instead of their sum. An 8192-row chunk's write takes 1639 instead of
+2015 us and its gather 2015 instead of 2235 us on 2x R9700; decode and verify messages stay far
+below.
 
 **Cards without peer access.** The all-reduce kernels normally write into the other card's memory
 directly (P2P). At launch radiance asks the driver whether each pair of cards can, and logs the
@@ -2348,6 +2614,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | key | default | |
 |---|---|---|
 | `max-num-batched-tokens: N` | 2048 | largest token count one step may carry |
+| `prefill-room-gate: MODE` | off | `on`: a fresh prompt is admitted only when the whole prompt and one decode position fit the KV cache beside every running sequence and every prompt admitted ahead of it, and the requests behind it wait with it; a prompt that cannot fit even with nothing running fails (`idle_admission`) instead of waiting; long prompts then run one after another. `off`: a prompt is admitted when its first chunk fits, so a long one may fill the cache mid-prompt and be preempted, recomputing from its start |
 | `prefill-interleave: N` | auto:1 (0 under `deterministic: true`, KL mode, generators) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time, `auto:SHARE` in SHARE of it (0 < SHARE <= 4); `0` lets every step carry a chunk |
 | `mixed-step-target-ms: N` | 0 (off) | soft completed-service-time target for mixed prefill/decode steps; learns one aggregate prefill cap while decoders are active and leaves uncontended prefill unchanged (§4.5) |
 | `preempt-wait-ms: N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step. A preempted request publishes what it computed to the prefix cache, as a finished one does, so its recompute adopts its prompt instead of computing it again; under pressure the cache gives those blocks back, the newest last, before another request is preempted |
@@ -2396,9 +2663,13 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `placement: MODE` | auto | `all_vram`, `layer_offload`, `expert_tiered`, `auto` |
 | `deterministic: true` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
 | `checkpoint-interval: N` | 2048 | linear-attention state checkpoint interval, in tokens |
-| `prefill-span: N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on; needs `max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
+| `prefill-span: N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on (several prompts prefilling with nothing decoding take such steps one at a time, the fewest tokens left first); needs `max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
+| `prefill-span-pass: MODE` | piece | the routed (MoE) block's pass of a spanned step: `piece`, a pass a checkpoint interval; `step`, one pass over the whole step where the model runs such a step serially (Flash-Next at one and two ranks), so each expert's weight is read once for all the step's rows. More arena (the expert planes are a step tall) and output that differs from piece passes at tie level; needs `prefill-span` above 1 (§4.5) |
+| `prefill-span-min: N` | auto | the shortest prompt, in tokens, a prefill spans for. `auto`: eight intervals where routed experts are staged from host memory, 0 elsewhere; `0` spans every lone prefill from its second interval on (§4.5) |
+| `prefill-span-first: MODE` | off | `on`: a lone prefill may span from its first token, the first interval no step of its own (its rows read QSA's selection, the dense pass's keys below the exactness bound, summed in another order); `off`: from its second interval on (§4.5) |
 | `checkpoint-slots: N` | auto | linear-state (hybrid) or sliding-window snapshots the server may hold at once, in total, not per sequence. They live in pinned host memory, allocated at startup: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `tp: 2`, 144 MiB on Qwen3.8-27B; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB, and with its DFlash2 drafter that drafter's 2048-token window too, 487 MiB). `auto` gives each of `max-num-seqs` what `checkpoint-policy` keeps for a `max-model-len` session plus one (10 at 200K tokens under geometric backoff), within an eighth of host memory and what the host can pin; a floor of 8 (or what the policy wants, if fewer) outranks `memory.host-headroom-mib`, which gives back exactly the shortfall down to 1 GiB rather than take the store to none, and the startup line says so. The startup line and the report say what it chose and why (§4.8). A full store retires its least recently used snapshot. A count is taken as given: a store the host memory cannot hold or pin stops the start, and a table placed in host memory leaves room for it; `0` serves with none, every prefix hit then prefilling from the start |
 | `checkpoint-policy: NAME` | geometric-backoff | also `tip-only`, `keep-all` |
+| `prefill-tail-snapshot: MODE` | on | `on`: under `prefix-resume: nearest` a prompt's last chunk is cut at its tail snapshot (last quantum boundary, or a spanned chunk's last interval boundary), its last tokens a step of their own -- or, a prefill alone in its spanned step on a plugin that snapshots inside a step (Flash-Next), the snapshot taken inside the last chunk and no extra step; `off`: the last chunk runs to the prompt's end, one step fewer, and a next turn resumes up to an interval earlier (§4.5) |
 | `prefix-resume: MODE` | exact | `exact`: a prefix hit resumes only where an idle server's cold prefill of the prompt starts a chunk, and a prompt's tail snapshot is taken where its last chunk starts, so a hit answers bit-identically to a cold run; an interval past the chunk is rounded up to a multiple of it. `nearest`: the deepest snapshot or block, up to a chunk less re-prefilled a turn |
 | `no-prefix-cache: true` | prefix cache on | disable prefix caching |
 
@@ -2421,8 +2692,26 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `spec-ngram: K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; a container that declares a draft head is refused; sets the window to K (§4.6) |
 | `spec-ngram-min: N`, `spec-ngram-max: N` | 2, 4 | the pattern lengths prompt lookup tries, longest first (at most 15), wherever it drafts |
 | `draft-window: MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a serial draft head or prompt lookup alone (§4.6) |
+| `draft-depth: MODE` | fixed | `adaptive` stops a coupled serial chain within the step once the product of the head's probabilities along it falls below `draft-depth-stop`; the next verify carries only the drafts made (§4.6). Needs `draft-coupling: on` and `draft-window: fixed` |
+| `draft-depth-max: N` | auto | `draft-depth: adaptive`: the deepest chain (auto: `num-speculative-tokens`) |
+| `draft-depth-min: N` | 1 | `draft-depth: adaptive`: rounds that always run |
+| `draft-depth-stop: P` | 0.85 | `draft-depth: adaptive`: the chain goes on while its confidence is at least P |
+| `draft-depth-lag: K` | 1 | `draft-depth: adaptive`: rounds the decision trails the chain (0 or 1); 1 hides the host's decision behind a running round |
+| `draft-depth-stat: S` | top | `draft-depth: adaptive`: `top` multiplies each round's largest probability, `path` the probability of the token it drew |
+| `draft-depth-load: MODE` | off | `on`: a step that drafts for `draft-depth-load-from` sequences or more runs draft round j only for the rows whose expected accepted drafts pay their verify rows, the kernel tile they open and the round, at the measured throughput (§4.6). Needs `draft-depth: adaptive` with `draft-depth-stat: top`. Same output law; fewer sequences keep the stop rule |
+| `draft-depth-load-from: N` | 5 | `draft-depth-load: on`: the fewest drafting sequences of a step the load-aware rule decides (2..64) |
+| `draft-depth-load-min: N` | 2 | `draft-depth-load: on`: rounds a load-aware step always runs, and drafts its late choice never cuts |
+| `draft-depth-load-late: MODE` | on | `draft-depth-load: on`: choose each row's verified drafts again when the next verify is issued, from the laws read by then |
+| `draft-depth-load-calib: MODE` | online | `draft-depth-load: on`: `online` keeps the rule's tables (acceptance by confidence, tokens a millisecond, row / round / tile prices) on the running server's own verifies and step times; `static` serves the built-in or given tables |
+| `draft-depth-load-tok-ms: LIST` | built in | `draft-depth-load: on`: tokens a millisecond by drafting sequences 1..8, comma-separated (a short list repeats its last number); where the online calibration starts |
+| `draft-depth-load-row-ms: LIST` | built in | `draft-depth-load: on`: a verify row's milliseconds by drafting sequences 1..8 |
+| `draft-depth-load-round-ms: LIST` | built in | `draft-depth-load: on`: a draft round's milliseconds by drafting sequences 1..8 |
+| `draft-depth-load-jump-ms: LIST` | built in | `draft-depth-load: on`: what a verify of more than 16, 32, 48, 64 query rows costs on top, in milliseconds (up to four numbers) |
+| `draft-suffix: MODE` | off | SuffixDecoding as a step selector on a serial head's chain: a step whose sequence's own history recurs (the last `draft-suffix-min-match` tokens occurred before) verifies the earlier continuation instead of the head's draft; lossless; with the fixed chain, `draft-verify: traversal` and `draft-depth: adaptive`, not `draft-verify: block` (§4.6) |
+| `draft-suffix-min-match: L`, `draft-suffix-max: N`, `draft-suffix-min-score: D` | 6, 7, 0.3 | the shortest match (1..12), the most rows of a suffix step (1..32; widens the verify window to max(`num-speculative-tokens`, N); at most 7 on Flash-Next), and the path score under which the chain is cut |
 | `draft-short-from: N` | auto | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below or at one sequence; 0 never; auto never for a chain and 2 for a tree drafter, which then verifies the short block's nodes (§4.6) |
-| `draft-coupling: MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged. A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (fixed in `qwen35_fp8`, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
+| `draft-coupling: MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged by coupling. Qwen35's native U2 head couples its global top eight without reranking ([IQR-V4 conversion](IQR.md#keeping-the-native-mtp-head-with-a-split-target)). A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (fixed in `qwen35_fp8`, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
+| `draft-verify: MODE` | token | how a coupled draft chain is verified: `token` decides each row on its own (maximal coupling); `block` decides the whole chain at once (Block Verification, arXiv 2403.10444) and switches `draft-coupling` on; `traversal` walks the chain bottom-up (Traversal Verification, arXiv 2505.12398) and needs `draft-coupling: on`. The output distribution is the same in all three, every draft a step accepts is one the target's own law would have produced, and `block` and `traversal` accept at least as many drafts a step as `token`. Sampled rows only: a greedy row is verified as before. The verify runs as one workgroup a request, with no scratch (§6) |
 | `draft-model: PATH` | | not implemented: merge the drafter at convert time |
 
 **Server**
@@ -2553,7 +2842,7 @@ keys are refused on it, and so are the pixel bands.
 | `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client (§5.9) |
 | `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and clients of llama-server's own API (§5.9) |
 | `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves) and `root` (the `model` path) as vLLM reports them, and `capabilities` (the same object `/server_info` reports); `:id` returns the entry itself, as OpenAI's retrieve does |
-| `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness; 503 with `"status": "stuck"` once the device has advanced nothing for a minute. A device stuck for `scheduler.stuck-exit` (60s; `0` never) ends the process (exit status 70, the queues it is stuck on in the log), so a restart policy brings the server back |
+| `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness; 503 with `"status": "stuck"` once the device has advanced nothing for a minute. A device stuck for `scheduler.stuck-exit` (60s; `0` never) ends the process (exit status 70, the queues it is stuck on in the log), so a restart policy brings the server back. The exit is armed once the first model has finished loading: a stall during that first load is logged with the queue state and reported by `/health`, and does not end the process |
 | `GET /load` | current load |
 | `GET /version` | server version |
 | `GET /props` | llama-server's props: `n_ctx`, `total_slots`, `modalities`, `model_path`, the chat template and its capabilities, `bos_token`/`eos_token`, and the request defaults under llama-server's names. Keyless, `model_path` and the template source answer the local operator only (§6.6); the capability flags stay open — clients build requests from them |
@@ -4013,6 +4302,8 @@ curl -s http://localhost:8000/generate -H 'Content-Type: application/json' \
     -d "{\"image\": \"$(base64 -w0 penguin.png)\"}" -o penguin.glb
 ```
 
+- **`model`** names the shape model where the process serves several (the front routes by it, as
+  for every route); `?model=NAME` in the query does the same. A one-model process ignores it.
 - **`image`** is the picture as base64 (a data URL is taken too). Give it an alpha channel that cuts
   the object out: the reference removes an opaque picture's background with rembg first, which this
   server does not, so an opaque picture is taken whole, background and all. The picture is prepared
@@ -4416,7 +4707,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 2.1.0
+I STARTUP REPORT -- radiance 2.2.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [models.flashnext.model]
 I   --tp                               2                                           [models.flashnext.tp]
@@ -4481,6 +4772,46 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 ```
 
 ---
+
+### 7.3 Moving a 1.x deployment to 2.x
+
+A 1.x server was one model configured by flags. A 2.x server reads one YAML file that names every
+model it serves ([`docs/MULTIMODEL.md`](MULTIMODEL.md) §4). Moving over takes three steps.
+
+**1. The settings.** Start the 2.x binary with the 1.x command line, or hand the flags to
+`rad-yaml`: both print the same settings as a file and start nothing.
+
+```sh
+rad-yaml --model /models/m.rad --tp 2 --max-num-seqs 8 --kv-cache-dtype fp8 > radiance.yaml
+radiance --config radiance.yaml --check        # reads and validates the file, serves nothing
+```
+
+The printed file is the command line, key for key; it is not yet a file 2.x accepts if the command
+line used something 2.x no longer serves. `--served-model-name` becomes the entry's name under
+`models:`, and `aliases:` adds more ids. The compose files of 1.x are replaced by
+`deploy/compose/tp1.yaml` and `tp2.yaml`, with the server's file beside each
+(`tp1.radiance.yaml`, `tp2.radiance.yaml`).
+
+**2. The KV cache.** `kv-cache-dtype: fp8_v4` and `k6_v4` are refused, and `fp8` is refused by
+every model but the few whose plugin keeps an E4M3 cache. `i8` is the 8-bit cache (int8 keys and
+values with a scale per token and head) and `bf16` the other. An `i8` token costs more memory than
+a `k6_v4` token did, so the pool holds fewer of them: the `kv:` line of the startup log says which
+share of `max-num-seqs` sequences at `max-model-len` the pool backs. Below 100%, lower one of the
+two or, on a tiered model, raise `host-pool-mib`, which leaves the cache more of the card.
+
+**3. The container.** 2.x serves int8 and bf16 weights. A container whose weights are block FP8,
+MXFP4, M2XFP4 or ParoQuant, or whose experts read E4M3 activations, is refused at startup by the
+name of the first such weight; the file names of those containers mostly end in `-fp8.rad` or
+`-mxfp4.rad`, and the Flash-Next container of 1.x is `...-fp8-iq4r-moe.rad`. The README's model
+table lists the container that serves each model now (`...-iq8r.rad`, `...-iqr-v4.rad`,
+`...-i8.rad`), with its download. A model with no such container is converted again from its bf16
+checkpoint with an IQ8R recipe from `data/recipes` (README, "Convert a checkpoint"). A container
+with an int8 or bf16 trunk and a block-FP8 drafter serves without the drafter under
+`num-speculative-tokens: 0`.
+
+Two more things changed that a deployment can meet. An out-of-tree plugin is rebuilt against the
+release's ABI. And a device that advances nothing for `scheduler.stuck-exit` (60s) ends the
+process, so that a restart policy brings the server back; `0` turns that off.
 
 ## 8. Environment
 

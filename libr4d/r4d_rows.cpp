@@ -25,6 +25,9 @@
 #include "r4d_plugin.h"
 #include "rad_abi_layout.h"
 
+#include <dirent.h>
+
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -1139,6 +1142,7 @@ static const RadOperandSpec oMoeGemmQ[] = {
     { "w_odd",         RAD_OPD_WTAB, 0 },
     { "w_odd_scale",   RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
+    { "split",         RAD_OPD_IN,   1 },
 };
 /* The same GEMM over four classes by expert number mod 4: `w`/`w_scale` hold class 0 at [N, K],
  * `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry e / 4 of class e % 4. Four ranks
@@ -1165,6 +1169,7 @@ static const RadOperandSpec oMoeGemmQMod4[] = {
     { "w_3",           RAD_OPD_WTAB, 0 },
     { "w_3_scale",     RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
+    { "split",         RAD_OPD_IN,   1 },
 };
 static const RadParamSpec pMoeGather[] = {
     P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
@@ -4373,13 +4378,14 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
  * 1024-token window, its full layers h512 at gqa 8 (TP1/TP2), 4 (TP4) or 2 (TP8), the 12B's at
  * gqa 16 (TP1); h128/gqa1 is Unlimited-OCR's MHA decoder; h128/gqa4 is LFM3 (full layers, and
  * sliding ones with a 256-token window), whose decode band (q_len <= 16) stays on the h128/gqa4
- * decode leg, which ranks above these rows. One kernel serves every q_len (splitting
- * the key range when there are too few tiles to fill the card), so `q_len` cuts no band. `causal` and `window` are runtime fields; block_size
- * is derived: 16.
+ * decode leg, which ranks above these rows. One kernel serves every q_len (splitting the key
+ * range when there are too few tiles to fill the card), so `q_len` cuts no band. `causal` and
+ * `window` are runtime fields; block_size is derived: 16.
  *
  * h256 at gqa 4 and 8 take a window only (C_GE 1), leaving the window-0 band to the gqa4 / gqa8
  * legs above. At h256/gqa2 these rows overlap the sliding leg's bands and rank below it
- * (R4D_PRIO_ATTN_WINDOW); every other geometry here is theirs alone. */
+ * (R4D_PRIO_ATTN_WINDOW), as they do below the h128/gqa4 decode leg; every other geometry here
+ * is theirs alone. */
 #define R4D_WIN_C(NAME, HD, G, KV, WMIN)                                                           \
     static const RadConstraint NAME[] = {                                                          \
         C_EQ("head_dim", HD), C_EQ("gqa", G), C_EQ("block_size", 16), C_GE("causal", 0),           \
@@ -5108,7 +5114,12 @@ static const RadConstraint cMoeMx[] = {
  *
  * `w5nl64a8h` is w4nl64a8h at five bits: codes index libquant's 32-level w5nl table, whose high bit
  * is the sign; the kernel expands the low four as a w4nl magnitude and sets the sign from a bit
- * plane stored after each row's nibbles. */
+ * plane stored after each row's nibbles.
+ *
+ * `w6nl64a8h` is w4nl64a8h at six bits: codes index libquant's 64-level w6nl table, whose high bit
+ * is the sign; the kernel expands the low four against each half of the 32 magnitudes, selects
+ * between the halves by bit 4 and sets the sign, both from bit planes stored after each row's
+ * nibbles. */
 static const RadConstraint cMoeGemmW4[] = {
     C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536),
     C_GE("top_k", 1), C_EQ("group", 128),
@@ -5117,7 +5128,7 @@ static const RadConstraint cMoeGemmW4[] = {
 /* The op against an int8 activation with an f32 scale per (row, 128 of K): int8 experts with a
  * bf16 scale per (row, 128 of K), `i8a8h` rotated 128 wide along K as its activation is; and the
  * four-bit experts' planes under the `a8i8` names of their E4M3 rows. The codebook with a bf16
- * scale per 128 (w4nla8h) and the five-bit one have no int8 row. */
+ * scale per 128 (w4nla8h) and the five- and six-bit ones have no int8 row. */
 static const RadConstraint cMoeGemmI8[] = {
     C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536),
     C_GE("top_k", 1), C_EQ("group", 128), C_IN("dtype", "i8a8 i8a8h"),
@@ -10830,6 +10841,41 @@ extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
 RAD_PLUGIN_ABI_LAYOUT_EXPORT
 extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 
+/* libr4d declines a machine whose cards are all another family's. The loader would leave its
+ * device rows out there (no code object fits), but the library would still load and declare its
+ * schemas, and an architecture plugin that asks whether an op is declared (rad_op_declared) would
+ * then pick a fused form only libr4d implements, a startup hole on that card: on a Strix Halo,
+ * Qwen3.8-Flash-Next's IQR-V4 container asked for ngram_hint, gate_had_quant_i8g and
+ * attn_paged_gate_had_quant.
+ *
+ * The test reads the KFD topology (gfx_target_version 120000..129999 is the gfx12 family) rather
+ * than asking a runtime, which open must not initialise. Unlike libr3d and libhalo, libr4d stays
+ * loaded where no card is listed at all (no topology, or a container given no /dev/kfd): it is
+ * the library rad-convert lays containers out for, and the host-only tests open it, on machines
+ * with no card. It declines only where KFD lists a card and none is gfx12. */
+extern "C" int rad_plugin_open(void) {
+    const char* root = "/sys/class/kfd/kfd/topology/nodes";
+    DIR* d = opendir(root);
+    if (!d) return RAD_OK;
+    bool card = false, gfx12 = false;
+    while (const dirent* e = readdir(d)) {
+        if (e->d_name[0] == '.') continue;
+        const std::string path = std::string(root) + "/" + e->d_name + "/properties";
+        FILE* f = std::fopen(path.c_str(), "r");
+        if (!f) continue;
+        char key[64];
+        unsigned long long v = 0;
+        while (std::fscanf(f, "%63s %llu", key, &v) == 2) {
+            if (std::strcmp(key, "gfx_target_version") || v == 0) continue;   /* 0: a CPU node */
+            card = true;
+            if (v >= 120000ull && v < 130000ull) gfx12 = true;
+        }
+        std::fclose(f);
+    }
+    closedir(d);
+    return card && !gfx12 ? RAD_E_UNSUPPORTED : RAD_OK;
+}
+
 extern "C" int rad_kernel_schema_count(void) {
     return (int)(sizeof(kSchemas) / sizeof(kSchemas[0]));
 }
@@ -11066,7 +11112,7 @@ extern "C" int rad_kernel_chain(int i) {
          * the split-KV decode and merge at four and eight query heads a KV head (Qwen3.5-0.8B
          * and siblings, MiniCPM5), and the windowed attention at head_dim 128 (Unlimited-OCR).
          * Not rope_rows_bf16, rmsnorm_rows_bf16 or causal_conv1d_bf16, though their launches have
-         * chained forms: the 3B LFM2 is the one model that issues them, and with them chained its
+         * chained forms: LFM2 and LFM3 issue them, and with them chained the 3B LFM2's
          * step was 1% slower (11.31 to 11.44 ms on one R9700), the long bf16 GEMMs between them
          * losing more to the kernels launched ahead than the launch gaps returned. */
         "rope_bf16", "sigmoid_bf16",

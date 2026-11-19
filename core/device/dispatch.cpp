@@ -937,8 +937,9 @@ void rad_dev_host_wrote(void)                     { dev()->host_wrote(); }
 /* The VRAM the runtime keeps as queue scratch on `p`'s card once kernels with a private segment
  * (spill, or a local array: step_advance's) have been dispatched: the runtime hands a queue
  * scratch memory at the first such dispatch, and the card showed +114 MiB after the first
- * speculative step and kept it, 150 MiB with a larger segment. The budget did not count it, so
- * serving left 27-65 MiB free. 5 MiB a CU (the R9700 reports 32), 160 MiB, over the measured. */
+ * speculative step and kept it, 150 MiB with a larger segment. Left out of the budget, it is
+ * taken from the margin: serving ran with 27-65 MiB of a card free. 5 MiB a CU (the R9700 reports
+ * 32), 160 MiB, over the measured. */
 extern "C" int64_t rad_dev_resident_scratch_bytes(const RadDeviceProps* p) {
     if (!p || p->is_host_backend || p->unified) return 0;
     return (int64_t)p->n_cu * (5LL * 1024 * 1024);

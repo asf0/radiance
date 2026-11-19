@@ -524,8 +524,8 @@ struct MoeFP8 {
     /* The format `e` names: 0 block fp8, 1 four-bit, 2 four-bit rotated, 3 plain bf16, 4 the
      * rotated w4nl codebook, 5 and 6 that codebook at E4M3 scales per 64 and 32 of K, 7 its
      * five-bit form per 64, 8 OCP MXFP4, 9 block fp8 at f32 scales, 10 rotated int8, 11 the rotated
-     * computed trellis under one f32 scale a row (an IQR weight an expert); RAD_E_DTYPE
-     * otherwise. */
+     * computed trellis under one f32 scale a row (an IQR weight an expert), 12 the codebook's
+     * six-bit form per 64; RAD_E_DTYPE otherwise. */
     static int format_of(const RadEncoding& e);
     /* format_of's numbers as the grouped GEMMs' dtype strings against an E4M3 activation, and
      * against an int8 one (null: the format has no such row). Int8 experts read int8 only. */
@@ -540,6 +540,11 @@ struct MoeFP8 {
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
+    /* A checkpoint inside the step (RadBatch::ckpt_cut): its token on the card, for the routed
+     * GEMMs' `split` operand, while step() issues a step that is one pass; null otherwise. Each
+     * expert's rows before the checkpoint are then a run of their own, as a step ending there
+     * gives them (moe_gemm_iqr's packed map), so they take the same paths. */
+    mutable const int32_t* split_tok = nullptr;
     /* The block over the first `T` rows of its buffers, for passes that need fewer rows than the
      * batch (the MTP head's history pass reads its output only at drafting rows). */
     void step_rows(RadCtx* c, int64_t T) const;
@@ -612,7 +617,7 @@ inline int MoeFP8::format_of(const RadEncoding& e) {
     if (!rad_enc_is(&e, "affine")) return RAD_E_DTYPE;
     const RadEncPlane* sc = rad_enc_plane(&e, "scale");
     /* The codebook at E4M3 scales per 64 or 32 of K under one fixed f32 (w4nl64a8h, w4nl32a8h),
-     * and its five-bit form per 64 (w5nl64a8h). */
+     * and its five- and six-bit forms per 64 (w5nl64a8h, w6nl64a8h). */
     if (e.n_planes == 4 && sc && sc->dtype == RAD_F8E4M3) {
         const RadEncPlane* s2 = rad_enc_plane(&e, "scale.1");
         const RadEncPlane* t  = rad_enc_plane(&e, "table");
@@ -873,7 +878,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             if (fe[0] == 3 && fe[1] == 3) continue;
             for (int i = 0; i < 2; ++i) {
                 /* A trellis gate_up reads rotated int8, but the down projection can use the
-                 * W5NL E4M3 kernel: its gated intermediate is quantised independently below. */
+                 * W5NL or W6NL E4M3 kernel: its gated intermediate is quantised independently
+                 * below. */
                 const bool mixed_codebook_down = a8f && want == 11 && i == 1 &&
                                                      (fe[i] == 7 || fe[i] == 12);
                 if (family(want) && (family(fe[i]) || mixed_codebook_down)) fmt[i] = fe[i];
@@ -1102,9 +1108,9 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     struct EFmt { uint32_t cdt; const char* cplanes; uint32_t sdt; int64_t sgk; const char* splanes; };
     auto efmt_of = [](int f, const RadEncoding& fe) -> EFmt {
         switch (f) {
+        case 12: return { RAD_U6, "codes,table", RAD_F8E4M3, 1, "scale,scale.1" };
         /* An IQR weight: the codes at their stored width with the code's planes, and the row and
          * block scales as one view at the weight's extents (LinearFP8's views of the same form). */
-        case 12: return { RAD_U6, "codes,table", RAD_F8E4M3, 1, "scale,scale.1" };
         case 11: return { fe.plane[0].dtype, "codes,trellis,trellis.mad", RAD_F32, 1,
                           "scale,scale.col" };
         case 10: return { RAD_I8, "codes", RAD_BF16, RAD_FP8_BLOCK, "scale" };
@@ -1152,12 +1158,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         const bool pair = w.eff.q8 && w.eff.s8 && w.eff.q8_rot && w.eff.g8 == RAD_FP8_BLOCK;
         const bool down_supported = down_codebook_fp8 ? (w.eff.q && w.eff.s && kServed[fmt[1]])
                                                 : kServed8[fmt[1]] != nullptr;
-        /* A clamped layer is served too: GateQuantFP8 clamps into the bf16 plane, then
-         * quantises it into the rotated codes. Not before a W5NL down projection, which reads
-         * rotated E4M3: no clamp writes those codes. */
-        const bool clamp_w5 = down_codebook_fp8 && c.swiglu_limit > 0;
+        /* A clamped layer: GateQuantFP8 clamps into the bf16 plane, then quantises it into the
+         * rotated codes. A codebook (W5NL, W6NL) down projection reads rotated E4M3, which no
+         * clamp writes, so it is served unclamped only. */
+        const bool clamp_codebook = down_codebook_fp8 && c.swiglu_limit > 0;
         if (!pair || !c.expert_rot || !kServed8[fmt[0]] || !down_supported || c.calib ||
-            clamp_w5) {
+            clamp_codebook) {
             fprintf(stderr, "radiance: layer %d: int8 activations meet rotated experts (int8, "
                             "four-bit, or the codebook at E4M3 scales a 64 or 32 of K) through "
                             "rotated codes at one scale a 128 of K, outside calibration; these "
@@ -1165,7 +1171,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                     kServed[fmt[0]] ? kServed[fmt[0]] : kServed8[fmt[0]],
                     kServed[fmt[1]] ? kServed[fmt[1]] : kServed8[fmt[1]],
                     pair ? "" : ", and the gated product's int8 pair is not that",
-                    clamp_w5 ? ", and a W5NL down projection is served unclamped only" : "");
+                    clamp_codebook ? ", and a W5NL or W6NL down projection is served unclamped only"
+                                   : "");
             return RAD_E_UNSUPPORTED;
         }
     }
@@ -1396,8 +1403,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * which takes the codes alone (no bf16 product is written), so the gated quantiser resolves to
      * the rotated op at no extra launch. */
     gq_exp.fuse_clamped = c.swiglu_quant != 0;
-    /* Gate_up and down are separate GEMMs. A trellis gate uses int8 input while W5NL down
-     * reads rotated E4M3: select the latter pair only for the gated intermediate. */
+    /* Gate_up and down are separate GEMMs. A trellis gate uses int8 input while a codebook (W5NL,
+     * W6NL) down reads rotated E4M3: select the latter pair only for the gated intermediate. */
     ActFP8 down_eff = w.eff;
     if (down_codebook_fp8) down_eff.q8_fed = down_eff.q8_rot = false;
     RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, down_eff, c.n_ff_exp, gact, c.rows * c.top_k,
@@ -2035,6 +2042,9 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * in turn. Flash-Next's 16- and 32-row verify passes on two R9700: 22.1 -> 21.9 ms and
      * 31.6 -> 30.95 ms. Below, the arm fits inside the routed GEMM's time and stays beside it. */
     const bool sh_first = shared && gu_trellis && rows * k >= kSharedFirstRows;
+    /* The routed GEMMs' `split` (split_tok), on a pass that is the whole step. */
+    const bool split_on = split_tok && r0 == 0 && rows == T;
+    const RadOperand sp = split_on ? praw(split_tok, RAD_I32, 1) : RAD_NONE;
     if (sh_first)
         shared_up(c_, T, r0, rows,
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
@@ -2045,24 +2055,29 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
                     brows(w.egu, rows * k));
-    else if (ncls == 4)
-        RAD_ISSUE_N(c_, op_gu, rows,
-                    brow_slice(gin_q, r0, rows, g.n_embd),
-                    brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
-                    RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]),
-                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
-                    RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]),
-                    RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]),
-                    RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
-                    brows(w.egu, rows * k));
-    else
-        RAD_ISSUE_N(c_, op_gu, rows,
-                    brow_slice(gin_q, r0, rows, g.n_embd),
-                    brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
-                    RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
-                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
-                    RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
-                    brows(w.egu, rows * k));
+    else if (ncls == 4) {
+        /* `split` only where set, so every other step's operand list carries none. */
+        const RadOperand o_[] = {
+            brow_slice(gin_q, r0, rows, g.n_embd),
+            brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
+            RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]),
+            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+            RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]),
+            RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]),
+            RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
+            brows(w.egu, rows * k), sp };
+        rad_issue(c_, op_gu, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
+    } else {
+        /* `split` only where set, so every other step's operand list carries none. */
+        const RadOperand o_[] = {
+            brow_slice(gin_q, r0, rows, g.n_embd),
+            brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
+            RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
+            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+            RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
+            brows(w.egu, rows * k), sp };
+        rad_issue(c_, op_gu, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
+    }
     if (shared && !sh_first)
         shared_up(c_, T, r0, rows,
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
@@ -2084,22 +2099,27 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
-    else if (ncls == 4)
-        RAD_ISSUE_N(c_, op_dn, rows,
-                    brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
-                    RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
-                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
-                    RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]),
-                    RAD_WTAB(w_dn[2], n4[2]), RAD_WTAB(w_dns[2], n4[2]),
-                    RAD_WTAB(w_dn[3], n4[3]), RAD_WTAB(w_dns[3], n4[3]),
-                    brows(w.edn, rows * k));
-    else
-        RAD_ISSUE_N(c_, op_dn, rows,
-                    brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
-                    RAD_WTAB(w_dn[0], n_reg / 2), RAD_WTAB(w_dns[0], n_reg / 2),
-                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
-                    RAD_WTAB(w_dn[1], n_reg / 2), RAD_WTAB(w_dns[1], n_reg / 2),
-                    brows(w.edn, rows * k));
+    else if (ncls == 4) {
+        /* `split` only where set, so every other step's operand list carries none. */
+        const RadOperand o_[] = {
+            brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
+            RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
+            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+            RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]),
+            RAD_WTAB(w_dn[2], n4[2]), RAD_WTAB(w_dns[2], n4[2]),
+            RAD_WTAB(w_dn[3], n4[3]), RAD_WTAB(w_dns[3], n4[3]),
+            brows(w.edn, rows * k), sp };
+        rad_issue(c_, op_dn, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
+    } else {
+        /* `split` only where set, so every other step's operand list carries none. */
+        const RadOperand o_[] = {
+            brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
+            RAD_WTAB(w_dn[0], n_reg / 2), RAD_WTAB(w_dns[0], n_reg / 2),
+            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+            RAD_WTAB(w_dn[1], n_reg / 2), RAD_WTAB(w_dns[1], n_reg / 2),
+            brows(w.edn, rows * k), sp };
+        rad_issue(c_, op_dn, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
+    }
     /* This layer's streamed experts are consumed; the next layer's copies may start. */
     (void)rad_expert_prefetch_mark(c_);
     /* The protected experts, over the trailing offsets: the quantised down GEMM zeroed their
@@ -2366,7 +2386,25 @@ inline void MoeFP8::calib_experts_pass(RadCtx* c_, int64_t slots) const {
 }
 
 inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch) const {
-    step_rows(c_, batch->n_tok);
+    const int64_t T = batch->n_tok, ck = batch->ckpt_cut;
+    const bool cut = ck > 0 && ck < T && batch->ckpt_cu;
+    if (cut && T > c.rows) {
+        /* A checkpoint inside a step wider than a pass: the passes start again at the checkpoint
+         * (as HyperConn::read_pieces does), so the rows before it are passed as a chunk ending
+         * there passes them, and the rows after it as the next chunk would. */
+        for (int64_t a = 0; a < T; a = ck > a ? ck : T) {
+            const int64_t b = ck > a ? ck : T;
+            for (int64_t r0 = a; r0 < b; r0 += c.rows)
+                pass(c_, T, r0, b - r0 < c.rows ? b - r0 : c.rows);
+        }
+        route_report(c_);
+        return;
+    }
+    /* One pass over the whole step: `split` gives the rows before the checkpoint runs of their
+     * own (split_tok). */
+    split_tok = cut ? batch->ckpt_cu + 1 : nullptr;
+    step_rows(c_, T);
+    split_tok = nullptr;
 }
 
 inline void MoeFP8::step_rows(RadCtx* c_, int64_t T) const {

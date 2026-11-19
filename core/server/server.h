@@ -24,6 +24,8 @@
 #include "sink.h"
 
 #include <atomic>
+#include <condition_variable>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -482,6 +484,10 @@ private:
     Metrics        metrics_;
     HttpTransport  transport_;
 
+    // HTTP admission bounds this queue. Only the front waiter tries the GPU adapter slots.
+    std::mutex image_adapter_mutex_;
+    std::condition_variable image_adapter_turn_;
+    std::list<int> image_adapter_waiters_;
     std::atomic<int64_t> in_flight_{0};
     /* Generation jobs (an image, a shape, speech): they do not pass through the scheduler, so
      * its figures say nothing about them. A job ends when its response has been sent. */

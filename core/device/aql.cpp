@@ -682,7 +682,15 @@ uint32_t                  g_queue_gen[kMaxQueues];
  * card takes them over. A kept queue holds its context save area on the card, about 41 MiB on an
  * R9700 (24 of them 0.99 GiB, measured). The queues of a card are destroyed at process exit, and
  * where the caller answers for nothing computing on the card (a_stream_trim). Keyed by card and
- * priority. */
+ * priority.
+ *
+ * Handed out oldest first. The firmware puts a card's queues on its pipes in the order they were
+ * created, alternating; an engine's two compute lanes on one pipe run ~50% slower in decode than on
+ * two (2x R9700 under MES, read from the driver's queue table: slow if and only if lane 0 and lane 1
+ * shared a pipe, 119 of 119 requests). Bring-up keeps queues in an order where the newest two share
+ * a pipe and the two oldest do not, so last-in first-out paired the lanes. Measured on jarvis with
+ * the stock plugins (27B with DFlash2, Gemma 4 31B with MTP, tp 2): the same step times either way,
+ * the second lane being nearly idle in decode there. */
 std::mutex                g_spare_mu;
 std::vector<Stream*>      g_spare[kMaxDevices][2];
 
@@ -1032,9 +1040,9 @@ struct Stall {
             g_stuck_progress.store(p, std::memory_order_relaxed);
             g_stuck_at.store(steady_ns() - (uint64_t)kStallMs * 1000000u, std::memory_order_release);
             dump_queues(where);
-            /* The verdict says what the verdict will DO (L-02's rule: never a silent difference):
-             * before the first engine finished bringup the exit is not armed -- a stall standing
-             * during a load is a slow load (device.h's dev_engine_ready). */
+            /* The line says what follows the verdict. Before the first engine has finished
+             * bring-up the exit is not armed: a stall standing during a load is taken for a slow
+             * load (device.h's dev_engine_ready). */
             if (rad::dev_engine_ready.load(std::memory_order_acquire))
                 RAD_ERR("device: nothing has advanced in the %u s since: the GPU is not running the "
                         "packet named above -- a hung kernel, or a queue the driver evicted and could "
@@ -1124,8 +1132,8 @@ inline int reserve(Stream* s, uint64_t* out) {
  * launch behind it waits for good), then, behind its wait, its arguments.
  *
  * On an R9700 "soon enough" is a microsecond or two. The packet processor's acquire holds a
- * launch 0.9 us and an ordered launch waits for the kernel in front, which is all that kept
- * launches from it; a chained launch whose packet goes without the acquire starts that much
+ * launch 0.9 us and an ordered launch waits for the kernel in front, which is all that keeps
+ * such a launch from it; a chained launch whose packet goes without the acquire starts that much
  * sooner behind its doorbell. Runs of fourteen 256 KiB card-side copies issued one by one that
  * way: back to back, six runs in nine of 300 000 ended with a unit moved by another launch's
  * arguments; with the host quiet for 50 us behind each doorbell the queue stalled in its first
@@ -1282,18 +1290,18 @@ inline int acquire_scope(Stream* s, uint64_t idx, bool forced, bool* asked) {
  * rad_dev_chain_unfenced; `s_dcache_inv` in r4d_chain.h and chain_kernel.h), which also closes
  * the window the fenced packets leave.
  *
- * What stays as it was: the release (dropping it as well measured nothing), a packet that keeps
- * its bit, a plain kernel, every barrier packet, and every acquire acquire_scope asks for: the
- * argument ring's half lap, the first dispatch after a host wait, a copy over the link. Those
- * guard what the kernel reads of its own slot, its arguments and chain record, which the host
- * wrote where some launch read a lap ago and which the L2 would still hold; they are kept at
- * whichever scope they come. The prefetch stream keeps the acquire on every packet, as before:
- * its half-lap acquire is an agent-scope one, and nothing waits for its launches.
+ * Everything else keeps its acquire or release: the release (dropping it as well measured
+ * nothing), a packet that keeps its bit, a plain kernel, every barrier packet, and every acquire
+ * acquire_scope asks for: the argument ring's half lap, the first dispatch after a host wait, a
+ * copy over the link. Those guard what the kernel reads of its own slot, its arguments and chain
+ * record, which the host wrote where some launch read a lap ago and which the L2 would still
+ * hold; they are kept at whichever scope they come. The prefetch stream keeps the acquire on
+ * every packet: nothing waits for its launches, so there is nothing to gain.
  *
  * The acquire did a second thing by the way: it held the launch until the slot the host had
- * just written was in VRAM, which nothing else saw to (host_writes_out). A first cut of this
- * change, without the flush there, stopped a server once: a chained card-side copy on a card's
- * second queue never finished, and the queue stood on it with 14 packets written behind. So a
+ * just written was in VRAM, which nothing else saw to (host_writes_out). Without the flush
+ * there, a bare chained launch stopped a server: a chained card-side copy on a card's second
+ * queue never finished, and the queue stood on it with 14 packets written behind. So a
  * card whose arguments are in VRAM and that gives no flush register keeps the acquire on its
  * chained launches. RADIANCE_AQL_CHAIN_FENCE=1 keeps it on every chained launch, to rule this
  * out. */
@@ -1319,7 +1327,7 @@ inline bool chain_bare(const Stream* s) {
  * once. Nothing advances from there: Qwen3.8-27B prefilling beside Gemma 4 12B decoding, both on
  * the same two R9700, stopped within 12 s.
  *
- * So on a card that more than one multi-card engine has claimed (a_cards_claim), a chained packet
+ * So on a card that more than one engine has claimed (a_cards_claim), a chained packet
  * keeps its barrier bit while a collective's packet may be running on its queue. Only the
  * collectives' own blocks then wait on the card for another card; everything else waiting there
  * waits for kernels that finish by themselves. An engine alone on its cards pays nothing. */
@@ -1869,7 +1877,7 @@ int a_stream_create(RadStream* out, int high_priority) {
         {
             std::lock_guard<std::mutex> lk(g_spare_mu);
             auto& v = g_spare[ord][high_priority ? 1 : 0];
-            if (!v.empty()) { r = v.back(); v.pop_back(); }
+            if (!v.empty()) { r = v.front(); v.erase(v.begin()); }
         }
         if (r) {
             /* Every packet it held has completed (a_stream_destroy drained it), so its counters

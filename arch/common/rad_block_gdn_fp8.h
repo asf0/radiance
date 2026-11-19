@@ -557,7 +557,43 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * gated norm, quantiser and out projection are per row, so a pure prefill step can finish them
      * a piece at a time and hand off each piece's reduction behind it. */
     const bool cut = !own_ar && pieces && pieces->cuts(T) && D == 0 && P > 0 && !op_add;
+    /* A checkpoint inside the step (RadBatch::ckpt_cut): the convolution, solve and scan run over
+     * [0, cut) and [cut, T) as two pieces, each the chunk of those rows (the state handed on
+     * through the cache, the second piece's context its first row's position, as ArPieces' pieces
+     * do), and the state and convolution slots go to the checkpoint stage between them. The first
+     * piece is issued at the band a chunk of its rows takes, so the snapshot holds the bytes a
+     * step ending at the checkpoint leaves. */
+    const int64_t ck = batch->ckpt_cut;
+    const bool ck_split = P == 1 && D == 0 && ck > 0 && ck < T && batch->ckpt_cu;
+    if (ck_split) {
+        for (int64_t p = 0; p < 2; ++p) {
+            const int64_t n = p == 0 ? ck : T - ck;
+            const int32_t* cu = batch->ckpt_cu + p;
+            RAD_ISSUE_N(c, op_conv_prep, n,
+                        bcol(w.in.x, 0, conv_dim, T), RAD_W(w_conv), RAD_NONE, RAD_W(w_a_log),
+                        RAD_W(w_dt_bias), kv_cache(kv_conv, layer), praw(cu, RAD_I32, 2),
+                        bcol(w.ab, 0, H, T), bcol(w.ab, H, H, T),
+                        praw(cv_idx, RAD_I32, 1),
+                        praw(p == 0 ? batch->ctx_lens : batch->positions + ck, RAD_I32, 1),
+                        brows(w.q, T), brows(w.k, T), brows(w.v, T),
+                        brows(w.gdec, T), brows(w.beta, T));
+            RAD_ISSUE_N(c, op_kkt, n,
+                        brows(w.k, T), brows(w.beta, T), brows(w.gdec, T),
+                        praw(cu, RAD_I32, 2), brows(w.kkt, T));
+            RAD_ISSUE_N(c, op_scan, n,
+                        brows(w.q, T), brows(w.k, T), brows(w.v, T), brows(w.kkt, T),
+                        brows(w.gdec, T), brows(w.beta, T),
+                        kv_cache(kv_state, layer), praw(cu, RAD_I32, 2),
+                        brows(w.o.x, T), kv_cache(kv_state, layer),
+                        praw2(st_idx, RAD_I32, 1, st_w));
+            if (p == 0) {
+                rad_ckpt_snap(c, kv_state, layer);
+                rad_ckpt_snap(c, kv_conv, layer);
+            }
+        }
+    }
     if (P > 0) {
+        if (!ck_split) {
         RAD_ISSUE(c, op_conv_prep,
                   bcol(w.in.x, 0, conv_dim, T), RAD_W(w_conv), RAD_NONE, RAD_W(w_a_log), RAD_W(w_dt_bias),
                   kv_cache(kv_conv, layer), praw(batch->cu_seqlens + D, RAD_I32, P + 1),
@@ -575,6 +611,7 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                   kv_cache(kv_state, layer), praw(batch->cu_seqlens + D, RAD_I32, P + 1),
                   brows(w.o.x, T), kv_cache(kv_state, layer),
                   praw2(st_idx ? st_idx + D * st_w : nullptr, RAD_I32, P, st_w));
+        }
         if (cut) {
             for (int64_t r0 = 0; r0 < T; r0 += pieces->rows) {
                 const int64_t n = T - r0 < pieces->rows ? T - r0 : pieces->rows;

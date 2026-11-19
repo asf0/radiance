@@ -16,8 +16,7 @@ namespace server {
 
 namespace {
 
-/* Requests that name a job by its id in the path. Without a model they are asked of every model,
- * and the one that knows the id answers; the others say 404. */
+/* Requests that name a job by its id in the path. Without a model, ask the resident servers. */
 bool id_route(const std::string& path) {
     return path.rfind("/v1/videos/", 0) == 0 || path.rfind("/status/", 0) == 0;
 }
@@ -494,7 +493,7 @@ Front::Got Front::lease(const std::string& model, const std::string& path, int64
     }
     if (e->state == State::Failed) {
         /* The failure prose quotes fetch errors and filesystem paths: operator-facing. A
-         * stranger learns the model failed -- that is public anyway -- never WHY (A-05). */
+         * stranger learns the model failed -- that is public anyway -- never why. */
         *refusal = refuse(path, 503, "service_unavailable",
                           "model '" + e->name + "' could not be loaded" +
                               (operator_ok ? ": " + e->why : std::string()));
@@ -548,11 +547,13 @@ static bool wants_stream(const HttpRequest& q) {
            q.body.compare(b, e - b, "true") == 0;
 }
 
-std::vector<std::pair<Front::Entry*, std::shared_ptr<void>>> Front::hold_open() {
+std::vector<std::pair<Front::Entry*, std::shared_ptr<void>>> Front::hold_open(bool include_draining_jobs) {
     std::vector<std::pair<Entry*, std::shared_ptr<void>>> held;
     std::lock_guard<std::mutex> lk(mu_);
     for (auto& p : entries_)
-        if (!p->removed && p->state == State::Open) held.emplace_back(p.get(), lease_entry(p.get()));
+        if (!p->removed && p->server &&
+            (p->state == State::Open || (include_draining_jobs && p->state == State::Closing)))
+            held.emplace_back(p.get(), include_draining_jobs ? lease_quiet(p.get()) : lease_entry(p.get()));
     return held;
 }
 
@@ -595,6 +596,16 @@ void Front::keep_job(const std::string& id, int64_t expires_at, int64_t max_kept
     if (jobs_.size() > cap) jobs_.erase(jobs_.begin(), jobs_.end() - (std::ptrdiff_t)cap);
 }
 
+std::shared_ptr<void> Front::hold_active_job(const Server* server) {
+    if (!server) return {};
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& p : entries_)
+        if (!p->removed && p->server == server &&
+            (p->state == State::Open || p->state == State::Closing))
+            return lease_quiet(p.get());
+    return {};
+}
+
 Handler Front::kept_job(const HttpRequest& q) {
     if (!id_route(q.path)) return nullptr;
     const std::string id = route_id(q.path);
@@ -614,8 +625,23 @@ Handler Front::kept_job(const HttpRequest& q) {
 }
 
 HttpResponse Front::forward(HttpRequest q) {
+    std::string canonical = path_canonical(q.path);
+    const bool names_job = id_route(canonical);
+    if (names_job) q.path = std::move(canonical);
     if (Handler kept = kept_job(q)) return kept(q);
     const std::string model = requested_model(q);
+    if (model.empty() && names_job) {
+        /* The default model is irrelevant to a job id. Polling must never start a cold model. */
+        for (auto& [entry, hold] : hold_open(/*include_draining_jobs=*/true)) {
+            HttpResponse response = entry->server->router().dispatch(q);
+            if (response.status == 404 || response.status == 501) continue;
+            hold_until_close(response, hold);
+            return response;
+        }
+        /* The worker may have finished and its model closed after the first lookup. */
+        if (Handler kept = kept_job(q)) return kept(q);
+        return refuse(q.path, 404, "not_found_error", "no model holds " + q.path);
+    }
     /* A dashboard read is not a use of the model: it does not bring one back, and it does not
      * keep one that nobody asks anything of from going idle. */
     if (dashboard_read(q)) {
@@ -683,20 +709,7 @@ HttpResponse Front::forward(HttpRequest q) {
         if (!open) return forward_waiting(std::move(q), model);
     }
     const Got g = lease(model, q.path, -1, nullptr, &e, &l, &refusal, caller_is_operator(q));
-    if (g != Got::Leased) {
-        if (model.empty() && id_route(q.path) && refusal.status == 400) {
-            /* Every loaded model that might hold the job, in turn; the first that knows it
-             * answers. */
-            for (auto& [ent, hold] : hold_open()) {
-                HttpResponse r = ent->server->router().dispatch(q);
-                if (r.status == 404) continue;
-                hold_until_close(r, hold);
-                return r;
-            }
-            return refuse(q.path, 404, "not_found_error", "no model holds " + q.path);
-        }
-        return refusal;
-    }
+    if (g != Got::Leased) return refusal;
     strip_base(&q, model);
     HttpResponse r = e->server->router().dispatch(std::move(q));
     hold_until_close(r, l);
@@ -776,6 +789,8 @@ void Front::forward_socket(const HttpRequest& q, WsConn& c) {
 }
 
 HttpResponse Front::models(const HttpRequest& q) {
+    /* Discovery holds the server alive without marking it used: polling cards must not
+     * restart the idle TTL or keep a warm-up model resident. */
     /* One model's card: asked of the model it names, under its own id. A model not loaded is
      * described without loading it. */
     if (q.path.rfind("/v1/models/", 0) == 0 && q.path.size() > 11) {
@@ -793,7 +808,7 @@ HttpResponse Front::models(const HttpRequest& q) {
                 return HttpResponse::json_body(200, card.dump());
             }
             e = r;
-            l = lease_entry(r);
+            l = lease_quiet(r);
         }
         HttpRequest one = q;
         const size_t colon = id.find(':');
@@ -807,7 +822,7 @@ HttpResponse Front::models(const HttpRequest& q) {
         for (auto& p : entries_) {
             if (p->removed) continue;
             Row r{p.get(), nullptr, p->name, p->aliases, p->state};
-            if (p->state == State::Open) r.hold = lease_entry(p.get());
+            if (p->state == State::Open) r.hold = lease_quiet(p.get());
             rows.push_back(std::move(r));
         }
     }

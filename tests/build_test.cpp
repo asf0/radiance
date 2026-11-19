@@ -1106,6 +1106,35 @@ TEST(the_drafter_name_survives_the_program_leaving_the_builder) {
     CHECK_EQ(p.drafter.depth, 3);
 }
 
+TEST(calibration_history_declares_no_draft_depth_or_proposal) {
+    Registry reg;
+    RadBuildCtx ctx = make_ctx();
+    ctx.max_spec = 0;
+    ctx.calib_dir = "/tmp/calibration";
+    ctx.calib_tokens = 16;
+
+    RadDrafterDecl d{};
+    d.name = "mtp";
+    d.kind = RAD_DRAFT_HISTORY;
+    Builder b(reg, make_meta(), ctx);
+    CHECK_OK(rad_declare_drafter(&b, &d));
+    CHECK_EQ(b.program().drafter.depth, 0);
+    CHECK_EQ(b.program().drafter.proposal, RAD_NULL_HANDLE);
+    CHECK_EQ(b.program().drafter.proposal_pitch, 0);
+
+    Builder proposed(reg, make_meta(), ctx);
+    d.proposal_pitch = 1;
+    CHECK_EQ(rad_declare_drafter(&proposed, &d), RAD_E_INVAL);
+    d.proposal_pitch = 0;
+    ctx.max_spec = 1;
+    Builder speculative(reg, make_meta(), ctx);
+    CHECK_EQ(rad_declare_drafter(&speculative, &d), RAD_E_INVAL);
+    ctx.max_spec = 0;
+    ctx.calib_dir = nullptr;
+    Builder serving(reg, make_meta(), ctx);
+    CHECK_EQ(rad_declare_drafter(&serving, &d), RAD_E_INVAL);
+}
+
 /* rad_drafter_short_block applies only to a declared block drafter, and only to a block shorter
  * than its own that still proposes a token; anything else is refused at declare, since the core
  * would stage a block the plugin has no ops for. */

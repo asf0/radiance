@@ -21,7 +21,8 @@ inline bool muse_draft_is_dflash2(const RadModelMeta* meta) {
     return da && std::strstr(da, "DFlash2");
 }
 
-/* Same 12 MiB prefetch qwen35 measured on two R9700s. */
+/* The drafter's weight prefetch window: 12 MiB, the value measured for the Qwen3.8 DFlash2
+ * drafter on two R9700s. */
 constexpr int64_t kMuseDf2Prefetch = (int64_t)12 << 20;
 
 inline int declare_muse_dflash2(Dflash2* ds, Dflash2::Wire* w, rad_kvgroup* kv,

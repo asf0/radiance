@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fit a candidate W6NL E4M3-exact codebook without loading/serving a model.
 Samples BF16 down-projection weight rows from safetensors in disjoint layer sets.
-This is a weight-distribution pilot, not held-out activation-weighted GPTQ validation.
+The table is fitted to the weight distribution; it is not validated on held-out activations.
 """
 import argparse, json, struct, pathlib
 import numpy as np

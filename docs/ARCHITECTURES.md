@@ -40,7 +40,7 @@ plugin claims.
 | `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B/8B and Rerank 8B: native BF16 bidirectional text/image retrieval with a Pixtral tower, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
 | `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense, the E2B/E4B form at one rank, and the 12B (`gemma4_unified`, its image and audio embedders in place of a tower), with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
 | `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
-| `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16, or their gate_up rotated int8 (`data/recipes/gemma4-26b-a4b-df-i8.recipe`) |
+| `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with the shared BF16 vision tower and z-lab's DFlash drafter; routed experts bf16, or their gate_up rotated int8 (`data/recipes/gemma4-26b-a4b-df-i8.recipe`) |
 | `arch/qwenimage21` | `qwenimage21` | *(empty)* | Qwen-Image 2.1 and 2.1-Turbo, an image generator, from the diffusers pipeline directory; DiT and text encoder bf16 or IQ8R |
 | `arch/krea2` | `krea2` | *(empty)* | Krea 2 Raw and Turbo, an image generator: Qwen3-VL-4B's tapped layers through a text-fusion transformer, a 12.9B single-stream DiT and Wan 2.1's VAE, from the diffusers pipeline directory; bf16 or IQ8R |
 | `arch/sdxl` | `sdxl` | *(empty)* | Stable Diffusion XL and its finetunes (Illustrious, NoobAI, Pony), an image generator: CLIP ViT-L and OpenCLIP bigG text encoders, the 2.6B UNet sampled by k-diffusion's Euler, Euler ancestral or DPM++ 2M on ComfyUI's schedules, the SDXL VAE; from the single-file checkpoint, bf16, one card |
@@ -1422,7 +1422,7 @@ parallel (the model is served on one card).
 
 ---
 
-# `gemma4`: Gemma 4 text and its DFlash drafter
+# `gemma4`: Gemma 4 vision, text and DFlash
 
 `arch/gemma4` serves a container converted from Google's bf16 checkpoint
 (`Gemma4ForConditionalGeneration` or `Gemma4ForCausalLM`), the recipe choosing what is int8:
@@ -1726,8 +1726,10 @@ tower and no audio encoder; `rad_block_gemma4_unified.h` holds what replaces the
   31B) a picture's or video frame's placeholders attend to each other both ways on the sliding
   layers; the global layers stay causal. That is transformers' Gemma 4 mask
   (`create_masks_for_vision_model`), KerasHub's and vLLM's; transformers' `gemma4_unified` forward
-  overlays every layer, which differs little on most pictures. The scheduler ends no prefill chunk
-  inside such a run (`Scheduler::bidi_fit`), the trunk pass names its runs (`RadBatch::n_bidi`), and
+  overlays every layer, which differs little on most pictures. The scheduler avoids splitting a
+  run that fits an admitted step, including alignment (`Scheduler::bidi_fit`). An over-budget run
+  is clipped to the staged chunk and does not have equivalent full-image attention. The trunk
+  pass names its runs (`RadBatch::n_bidi`), and
   each sliding layer attends a run's rows a second time with `attn_paged` at `causal` 0 over the
   cache up to the run's end, written over their causal result. The window stays, as in
   transformers' mask (the window AND (causal OR the same picture)): it bounds the keys behind a row.
@@ -1776,9 +1778,27 @@ is declared at the end of the layer it taps, where it is issued. Declared after 
 let the planner share `dflash_src` with `moe_edn`, which every MoE layer writes, and acceptance
 would collapse silently. arch_test holds the two live ranges to overlap.
 
-**Not declared.** The vision tower (`arch/gemma4_bf16` and `arch/embgemma2` declare Gemma 4's): a
-container that carries one is served with `mm-max-patches: 0`. An fp8 attention or dense arm:
-under a tenth of the weight bytes, and the dense arm's 2112 is not whole 128-blocks either.
+**Vision.** The 26B-A4B uses the same BF16 tower implementation as the 31B, with its own
+2816 × 1152 projector. Each rank runs the tower, and the decoder scatters the projected rows
+before the embedding all-reduce. With `use_bidirectional_attention: "vision"`, only the sliding
+layers read image spans in both directions. Without a paged attention kernel with unrestricted
+lookahead, the processor limits each image or video frame to the sliding window. Containers
+converted without the tower default to text-only serving. Set `mm-max-patches: 0` to disable
+vision explicitly.
+
+The shared BF16 tower does not depend on the experts' encoding. This integration retains the
+current BF16 and rotated-int8 expert paths; it does not re-enable retired block-FP8 linears.
+A split image run only sees keys staged in its chunk; correct row insertion does not establish
+full-image bidirectional numerical equivalence when a run cannot fit a step.
+
+**Adding a tower to an existing RAD.** `rad-convert VISION.safetensors --add-vision BASE.rad
+--config SOURCE_CONFIG -o NEW.rad` copies the compatible text/MoE/DFlash container's original
+weight planes, scales and vocabularies and adds BF16 Vision weights. `NEW.rad` must not exist;
+`--plan-only` validates without writing. Use a tower/config from the same checkpoint/tokenizer
+family: matching dimensions and token bounds alone do not establish checkpoint identity.
+
+**Not declared.** An fp8 attention or dense arm: under a tenth of the weight bytes, and the dense
+arm's 2112 is not whole 128-blocks either.
 
 ---
 

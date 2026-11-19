@@ -1,6 +1,6 @@
 # W6NL routed experts: candidate implementation
 
-`w6nl64a8h` is a six-bit scalar codebook for the routed experts' down projection. It is a candidate format, not a claim that six-bit down improves task quality. `data/recipes/qwen4exp-u4-w6nl-bf16ple.recipe` pairs it with U4 trellis gate/up and preserves the existing U5 trunk, protected BF16 experts, BF16 PLE/vision and draft recipe. The format needs this branch's Radiance build; an older build must not be expected to serve it.
+`w6nl64a8h` is a six-bit scalar codebook for the routed experts' down projection. It is a candidate format, not a claim that six-bit down improves task quality. `data/recipes/qwen4exp-u4-w6nl-bf16ple.recipe` pairs it with U4 trellis gate/up and preserves the existing U5 trunk, protected BF16 experts, BF16 PLE/vision and draft recipe.
 
 ## Format
 

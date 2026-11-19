@@ -358,12 +358,27 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch, int part) 
                     brows(w.page, work), bpos,
                     kv_cache(kv_bk, layer));
     if (part == 2) return true;
-    RAD_ISSUE_N(c_, op_tail, T,
-                bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
-                praw(batch->positions, RAD_I32, T),
-                praw(batch->cu_seqlens, RAD_I32, S + 1),
-                kv_cache(c.kv_tail, layer),
-                praw2(tlb->state_index, RAD_I32, S, tw));
+    if (S == 1 && batch->ckpt_cut > 0 && batch->ckpt_cut < T && batch->ckpt_cu) {
+        /* A checkpoint inside the step (RadBatch::ckpt_cut): the ring over the rows before it,
+         * the snapshot, then the rest -- the ring a chunk ending there leaves, and after both
+         * the ring the whole step leaves (a row writes its own position's slot). */
+        const int64_t ck = batch->ckpt_cut;
+        for (int64_t p = 0; p < 2; ++p) {
+            RAD_ISSUE_N(c_, op_tail, p == 0 ? ck : T - ck,
+                        bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
+                        praw(batch->positions, RAD_I32, T),
+                        praw(batch->ckpt_cu + p, RAD_I32, 2),
+                        kv_cache(c.kv_tail, layer),
+                        praw2(tlb->state_index, RAD_I32, S, tw));
+            if (p == 0) rad_ckpt_snap(c_, c.kv_tail, layer);
+        }
+    } else
+        RAD_ISSUE_N(c_, op_tail, T,
+                    bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
+                    praw(batch->positions, RAD_I32, T),
+                    praw(batch->cu_seqlens, RAD_I32, S + 1),
+                    kv_cache(c.kv_tail, layer),
+                    praw2(tlb->state_index, RAD_I32, S, tw));
     return true;
 }
 
@@ -448,11 +463,11 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
      * key is not 0 -- every block with a page and a score that is a number, whatever the number --
      * and what it writes (the pages in block order, the partial page, their count, seqused) is a
      * function of the positions and the block table: the same bytes from every layer's scores. So
-     * the pass's first full-attention layer issues the selection exactly as it always did, and
+     * the pass's first full-attention layer issues the selection in full, and
      * every later layer reads that one and issues none of its own: no query, no score. */
     if (use == kQsaOnce) use = first ? kQsaSelect : kQsaUnread;
     if (use != kQsaUnread) use = kQsaSelect;
-    /* RADIANCE_DEBUG_QSA_EAGER: the issue sequence as it was, every layer its own. */
+    /* RADIANCE_DEBUG_QSA_EAGER: every layer issues its own query, score and select. */
     if (qsa_eager()) use = kQsaSelect;
 
     /* The projection always: its raw-key head is the block keys' and the tail's. Local: rows

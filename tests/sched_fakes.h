@@ -331,7 +331,13 @@ struct FakeKV : IKVManager {
         for (int j = 0; j < n; ++j) out[j] = (s < 0 || j == 0) ? s : 1000 * j + s;
         return n;
     }
-    int64_t first_block_pos(uint64_t, int32_t) const override { return 0; }
+    /* A window group's first position after recycling (KVManager::recycle_window), per group; a
+     * test sets it between steps as trim_window does after a chunk. 0 for every other group. */
+    std::unordered_map<int32_t, int64_t> first_pos;
+    int64_t first_block_pos(uint64_t, int32_t g) const override {
+        auto it = first_pos.find(g);
+        return it == first_pos.end() ? 0 : it->second;
+    }
     int64_t take_table_changes(uint64_t id, int32_t g) const override {
         auto it = seqs.find(id);
         if (it == seqs.end()) return 0;

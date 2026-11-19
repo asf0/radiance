@@ -1017,6 +1017,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     /* Under --prefill-span every step but a lone prefill is planned at the shared budget
      * (Scheduler::step), so a wider step is one sequence; 0 without a span. */
     bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, prefill_shared_tok(cfg_)) : 0;
+    /* --prefill-span-pass step: the routed block's pass is the whole spanned step where the plugin
+     * runs such a step serially. */
+    bc.span_pass_step = cfg_.prefill_span > 1 && cfg_.prefill_span_step ? 1 : 0;
     /* --kv-resident in tokens, raised to kStreamFloorTokens as kvstream_ring_shape raises it: the
      * arch declares kv_resolve's ring depth from this, and the kernel refuses a carve deeper than
      * the declared table. */
@@ -1064,8 +1067,8 @@ int Engine::declare() {
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
     }
     /* --calib-corpus: every token of the corpus through prefill exactly once, so no prefix hit
-     * skips any and no drafter adds rows; the corpus is loaded here, before the plugins declare,
-     * because they are told its size. */
+     * skips any and no drafter adds rows. Load it before declaration so a plugin knows its size
+     * and can opt into a separate, proposal-free history pass (RAD_DRAFT_HISTORY). */
     if (cfg_.calib()) {
         if (cfg_.n_spec > 0) {
             RAD_ERR("--num-speculative-tokens %d: a calibration run drafts nothing; leave it at "
@@ -1075,7 +1078,7 @@ int Engine::declare() {
         cfg_.n_spec = 0;
         cfg_.prefix_cache = false;
         if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
-        decide("--num-speculative-tokens", "0", "a calibration run records the trunk's rows only");
+        decide("--num-speculative-tokens", "0", "a calibration run does not propose draft tokens");
         prefix_off_why_ = "a calibration run: a prefix hit would skip tokens the statistics must count";
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
         calib_ = std::make_unique<Kld>();
@@ -1307,11 +1310,54 @@ int Engine::declare() {
         /* A tree is verified only behind a step issued ahead (step_loop). The KL mode, which issues
          * none, drafts nothing either (n_spec is 0 there by now), so this never runs under it. */
         draft_tree_ = cfg_.n_spec > 0 && pb.tree_pays != 0;
+        ckpt_snap_ok_ = pb.ckpt_snap_ok != 0;
+        /* The checkpoint stage (KVManager::ckpt_stage), planned before any KV plan is made, where
+         * a tail snapshot can be taken inside the last chunk: the plugin cuts its step for it and
+         * a hit resumes at the nearest snapshot (the exact grid snapshots where a chunk starts). */
+        cfg_.ckpt_stage = ckpt_snap_ok_ && !cfg_.prefix_exact;
         if (draft_tree_) {
             const char* why = "the model's plugin measured a gain with them";
             RAD_INFO("draft trees: asked -- %s", why);
             decide("draft trees", "asked", why);
         }
+    }
+    /* --draft-suffix: SuffixDecoding's selector (core/sched/suffix.h). A suffix step verifies up to
+     * `draft_suffix_max` rows of the sequence's own history while the head still drafts its own
+     * `n_spec` rounds, so the verify window every consumer of `n_spec` sees (buffers, rings, the
+     * scheduler's window) becomes the larger of the two and the head's rounds are kept apart in
+     * `n_spec_head`. A serial head's chain only: a block drafter's block is fixed. It works with
+     * the fixed chain, with --draft-depth adaptive (whose depth stays within the head's rounds)
+     * and with the traversal verify (a suffix row binds no coupled state, so it is a leaf of the
+     * walk); the block verify decides a head chain as a whole and is refused. */
+    cfg_.n_spec_head = 0;
+    if (cfg_.draft_suffix) {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        const char* bad = nullptr;
+        if (cfg_.n_spec <= 0)                         bad = "speculation is off (this container carries no draft head)";
+        else if (draft_tree_)                         bad = "it needs the head's chain, not a block drafter's tree";
+        else if (pb.draft_depth_fixed)                bad = "this drafter is a block drafter, not a serial head";
+        else if (cfg_.draft_window == DraftWindow::Adaptive)
+                                                      bad = "it needs the fixed window (--draft-window fixed)";
+        else if (cfg_.draft_verify_block)             bad = "it cannot be combined with --draft-verify block "
+                                                            "(a suffix chain is no block; --draft-verify token | traversal)";
+        if (bad) {
+            RAD_ERR("--draft-suffix on: %s", bad);
+            return RAD_E_UNSUPPORTED;
+        }
+        const int window = std::max(cfg_.n_spec, cfg_.draft_suffix_max);
+        if (window > (int)RAD_SCHED_MAX_SPEC) {
+            RAD_ERR("--draft-suffix-max %d is past the largest verify window (%d)", cfg_.draft_suffix_max,
+                    (int)RAD_SCHED_MAX_SPEC);
+            return RAD_E_INVAL;
+        }
+        cfg_.n_spec_head = cfg_.n_spec;
+        cfg_.n_spec      = window;
+        RAD_INFO("draft suffix: on -- a host-built step verifies up to %d row(s) of the sequence's own "
+                 "history when its last %d token(s) recur (path score >= %.2f); the head drafts %d "
+                 "round(s), the verify window is %d", cfg_.draft_suffix_max, cfg_.draft_suffix_min_match,
+                 (double)cfg_.draft_suffix_min_score, cfg_.n_spec_head, window);
+        decide("draft suffix", "on", "--draft-suffix on");
     }
     /* The audio encoder's pass: the plugin's longest clip, when the model file carries an audio
      * encoder (`radiance.encoder` names one) and the deployment is not text-only. */
@@ -1565,7 +1611,13 @@ int Engine::declare() {
     drafter_       = p0.drafter;
     drafter_name_  = p0.drafter_name;
     drafter_.name  = drafter_name_.c_str();
-    if (cfg_.n_spec <= 0) drafter_ = RadDrafterDecl{};
+    const bool calib_history = drafter_.kind == RAD_DRAFT_HISTORY;
+    if (calib_history && !cfg_.calib()) {
+        RAD_ERR("'%s' history calibration requires --calib-corpus; it cannot run with "
+                "--kld-record", drafter_.name);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (cfg_.n_spec <= 0 && !calib_history) drafter_ = RadDrafterDecl{};
     /* A tree drafter (rad_drafter_tree): its parents plane rides with the proposal. */
     tree_         = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && p0.drafter_tree;
     tree_parents_ = tree_ ? p0.drafter_parents : 0;
@@ -1606,7 +1658,9 @@ int Engine::declare() {
                 "for the sequences the head declines", drafter_.name);
         return RAD_E_INVAL;
     }
-    if (drafter_.kind != RAD_DRAFT_NONE) {
+    if (calib_history) {
+        RAD_INFO("calib: '%s' history only; no draft proposals", drafter_.name);
+    } else if (drafter_.kind != RAD_DRAFT_NONE) {
         /* A zero proposal handle means the sampler's token buffer: the head's logits go through
          * the ordinary sampler chain. */
         RAD_INFO("speculation: %s",
@@ -4807,6 +4861,7 @@ int Engine::start() {
                  rad_aux_registry().plugins().size(),
                  rad_aux_registry().plugins().size() == 1 ? "y" : "ies");
     }
+    RAD_TRY(demote_call_delimiters());
     {
         /* The loaded libraries in selection order: as --kernels named them, or every library in
          * the home. */
@@ -4829,15 +4884,14 @@ int Engine::start() {
         r->device = devs[i];
         ranks_.push_back(std::move(r));
     }
-    /* Collectives run on these cards from here on; another engine's on the same cards must not be
-     * able to starve them of wave slots (rad_dev_cards_claim). */
-    if (cfg_.tp > 1) {
-        const int cs = rad_dev_cards_claim(devs.data(), cfg_.tp, 1);
-        if (cs < 0) {
-            RAD_ERR("device: the ranks' cards could not be claimed: %s", rad_strerror(cs));
-            return cs;
-        }
-        cards_claimed_ = true;
+    /* A single-rank engine can occupy wave slots on one of a peer engine's collective cards.
+     * Claim every engine's cards before it creates any work on them. The backend records the
+     * claim before draining outstanding work, so teardown also releases it on a drain failure. */
+    cards_claimed_ = true;
+    const int cs = rad_dev_cards_claim(devs.data(), cfg_.tp, 1);
+    if (cs < 0) {
+        RAD_ERR("device: the ranks' cards could not be claimed: %s", rad_strerror(cs));
+        return cs;
     }
 
     /* Peer access, measured before selection. Kernels that touch another card's memory constrain
@@ -5470,6 +5524,7 @@ int Engine::load_vocab() {
     auto v = std::make_shared<Vocab>();
     RAD_TRY(v->load(std::move(vb)));
     vocab_ = v;
+    vocab_own_ = v;
     if (file_ && file_->aux_vocab()) {
         VocabBuild ab;
         RAD_TRY(vocab_deserialize(file_->base(), (uint64_t)file_->size(), file_->aux_vocab().h, ab));
@@ -5479,12 +5534,17 @@ int Engine::load_vocab() {
         RAD_INFO("vocab: a second vocabulary of %d tokens", aux_vocab_->n_tokens());
     }
 
+    RAD_INFO("vocab: %d tokens, bos=%d eos=%d%s", vocab_->n_tokens(), vocab_->bos(), vocab_->eos(),
+             vocab_->chat_template().empty() ? ", no chat template" : "");
+    return build_vocab_view();
+}
+
+/* The sampler's view of the vocabulary and the grammar engine's index over it. The index sorts
+ * end-of-generation ids apart from text, so both are built again when that set changes. */
+int Engine::build_vocab_view() {
     auto view = std::make_unique<TokenView>();
     RAD_TRY(view->init(vocab_));
     vocab_view_ = std::move(view);
-
-    RAD_INFO("vocab: %d tokens, bos=%d eos=%d%s", vocab_->n_tokens(), vocab_->bos(), vocab_->eos(),
-             vocab_->chat_template().empty() ? ", no chat template" : "");
 
     /* Build the grammar engine's vocabulary index now rather than on the first grammar request
      * (nearly every tool-calling request has one), so admission pays only for its own grammar. */

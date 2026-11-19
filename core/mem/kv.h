@@ -627,6 +627,32 @@ public:
     int checkpoint_restore(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s,
                            const std::vector<int32_t>* win = nullptr);
 
+    /* ---------------- the checkpoint stage ----------------
+     *
+     * One snapshot of the linear state on the card, laid out as a checkpoint slot's linear section
+     * (checkpoint_copy's walk: group by group in plans() order, a layer after another), carved
+     * from the KV pool as a fixed cost. A checkpoint inside a step (RadBatch::ckpt_cut): the
+     * plugin copies each layer's state there between the recurrence's two pieces (rad_ckpt_snap,
+     * Ctx::set_ckpt_snap), since the live slot has moved on by the step's end; the engine then
+     * copies the layers the step left alone in (checkpoint_stage_rest) and the stage to the host
+     * slot in one copy (checkpoint_stage_out, Engine::save_checkpoints).
+     *
+     * Planned (plan_groups) where the engine snapshots linear state into a prefix cache and the
+     * slot has no window section, under Config::ckpt_stage (the plugin cuts its step at a tail
+     * snapshot and --prefix-resume is nearest); 0 bytes and a null stage otherwise, which keeps
+     * every checkpoint at a chunk's end. */
+    int64_t ckpt_stage_bytes() const { return stage_bytes_; }
+    void*   ckpt_stage() const { return stage_; }
+    /* Per group (by index): the group's offset in the stage and its bytes a layer, -1 / 0 for a
+     * group with no state. */
+    void    ckpt_stage_layout(std::vector<int64_t>* off, std::vector<int64_t>* lb) const;
+    /* The live slots' state of every stateful (group, layer) `skip` does not name into the stage,
+     * on `s`: the layers a step with a checkpoint inside it left alone. */
+    int     checkpoint_stage_rest(const int32_t* state_slots, int n_slots, RadStream s,
+                                  const std::function<bool(size_t, int64_t)>& skip);
+    /* The stage into checkpoint slot `ck`, as one copy on `s`. */
+    int     checkpoint_stage_out(int32_t ck, RadStream s);
+
     /* ---------------- window snapshots (the sliding-window half of a prefix hit) ----------------
      * A WINDOW group keeps only the blocks its window can still read, so the prefix cache's block
      * lists do not describe it. A prompt extending a cached prefix at position P needs blocks
@@ -720,6 +746,9 @@ private:
     int64_t   ck_rank_off_ = 0;
     int64_t   checkpoint_bytes_ = 0;
     int64_t   window_ck_bytes_ = 0;   /* the window section of checkpoint_bytes_ */
+    int64_t   stage_bytes_ = 0;       /* ckpt_stage_bytes */
+    void*     stage_ = nullptr;
+    int64_t   stage_off_ = 0;         /* in the pool */
     std::vector<StateClear> clears_;                  /* grabbed slots the engine must zero */
     void*     pool_base_ = nullptr;
     BundleComparison bundling_;

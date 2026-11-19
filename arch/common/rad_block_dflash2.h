@@ -147,7 +147,8 @@ struct Dflash2 {
         /* The target's embedding scale, applied to the query block as the drafter was trained
          * (dflash_config.input_embedding_scale): 1 for Qwen, sqrt(hidden) in bf16 for Gemma. */
         double  escale   = 1.0;
-        /* Optional DFlash2 logit transform shipped by Muse Glimmer. */
+        /* The drafter's logit transform: `omul` multiplies the final norm's output, `scap` > 0 is
+         * a tanh soft cap on the draft logits. 1 and 0 leave the logits as the head gives them. */
         double  omul     = 1.0;
         double  scap     = 0.0;
         /* Bytes of the next GEMM's weight read into the cache beside each all-reduce of the query
@@ -273,8 +274,9 @@ struct Dflash2 {
      * 31B's: the head read at w8a8, so the selector sees the candidates an 8-bit head ranks), and
      * the 2-bit grid otherwise. Set by declare from the copy's encoding. */
     bool       head_i8 = false;
-    /* Muse Glimmer's 202048-token vocab is not divisible by the int8/w2a8 head kernels' 128-row
-     * tile; its copied draft head stays BF16 and uses gemm_nt. */
+    /* The copy is plain bf16 where the container holds it so, read by gemm_nt: the form for a
+     * vocabulary that is not a multiple of the int8 and 2-bit head kernels' 128-row tile (Muse
+     * Glimmer's 202048 tokens). */
     bool       head_bf16 = false;
 
     /* per-layer weights */
@@ -993,7 +995,8 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
         op_afinal = all ? an(w_norm) : 0;
         if (!op_afinal)
             for (int i = 0; i < MAX_LAYERS; ++i) op_afn[i] = op_aan[i] = 0;
-        /* add_rmsnorm has no `mult`; keep Muse's output_multiplier on the final norm. */
+        /* The output multiplier is declared on the plain final rmsnorm only: a drafter with one
+         * takes the unfused add and norm. */
         if (cfg.omul != 1.0) op_afinal = 0;
     }
 

@@ -1,6 +1,10 @@
-/* halo_iqr.h -- the narrow int8-grid weights (IQR) as libhalo keeps them in VRAM: the stored codes
+/* Derived from libr4d/r4d_iqr.h by the libhalo rename transform (2026-11-17);
+ * see libhalo/README.md. Op schemas, row names and stored weight layouts are
+ * shared with libr4d by design. Everything else in this file is libhalo's own
+ * and diverges as it is measured on gfx1151. */
+/* halo_iqr.h -- the narrow int8-grid weights (IQR) as libr4d keeps them in VRAM: the stored codes
  * reordered for the GEMMs that decode them, never widened. Pure C++ (no HIP), shared by the layout
- * hooks (halo_iqr_layout.cpp) and the kernels (halo_gemm_iqr.hip).
+ * hooks (halo_iqr_layout.cpp) and the kernels (r4d_gemm_iqr.hip).
  *
  * Every form is an int8 value per weight times a scale per (row, 128 K), the int8 grid IQ8R's GEMMs
  * read, and every form's int8 value is a function of its codes alone, so a kernel decodes it where
@@ -51,7 +55,7 @@
  * they are read and the stored table regenerated on the way back) or, for Zero, its zero plane as
  * u8 in the scale order below. The scale buffer is
  * tile-major, [N/16][K/128][16]: the 16 rows of a tile side by side for one 128-K block, as the
- * int8 GEMMs' (halo_fp8_layout.cpp): bf16, or E4M3 bytes followed at s2_off() by the second level as
+ * int8 GEMMs' (r4d_fp8_layout.cpp): bf16, or E4M3 bytes followed at s2_off() by the second level as
  * f32 (one, or one a row) and, with rb > 1, at blk_off() the bf16 block scale B per [N/rb][K/128].
  */
 #pragma once
@@ -161,37 +165,17 @@ HALO_IQR_HD constexpr int64_t tile_major(int64_t r, int64_t kb, int64_t nkb) {
 
 /* The forms libhalo's kernels are built for, as (kind, B, log2 V, L, log2 rb, scale): one list, so
  * the layout hook refuses at declare a form no kernel reads. */
-#define HALO_IQR_FORMS(X)                                                                          \
-    /* IQR-V1: scalar tables, vector grids, 6-bit codes under a zero */                           \
-    X(kTable, 2, 0, 0, 0, kBf16) X(kTable, 3, 0, 0, 0, kBf16) X(kTable, 4, 0, 0, 0, kBf16)        \
-    X(kTable, 5, 0, 0, 0, kBf16)                                                                  \
-    X(kGrid, 8, 2, 0, 0, kBf16) X(kGrid, 9, 2, 0, 0, kBf16) X(kGrid, 10, 2, 0, 0, kBf16)          \
-    X(kGrid, 12, 2, 0, 0, kBf16)                                                                  \
-    X(kZero, 6, 0, 0, 0, kBf16)                                                                   \
-    /* IQR-V2: the 4096-state trellis, E4M3 scales under one f32 */                               \
-    X(kTrellis, 2, 0, 12, 0, kE4m3Tensor) X(kTrellis, 3, 0, 12, 0, kE4m3Tensor)                   \
-    X(kTrellis, 4, 0, 12, 0, kE4m3Tensor) X(kTrellis, 5, 0, 12, 0, kE4m3Tensor)                   \
-    X(kTrellis, 6, 0, 12, 0, kE4m3Tensor) X(kTrellis, 7, 0, 12, 0, kE4m3Tensor)                   \
-    /* IQR-V3: the 16384-state trellis on the tcq_rb=32 grid */                                   \
-    X(kTrellis, 2, 0, 14, 5, kE4m3Tensor) X(kTrellis, 3, 0, 14, 5, kE4m3Tensor)                   \
-    X(kTrellis, 4, 0, 14, 5, kE4m3Tensor) X(kTrellis, 5, 0, 14, 5, kE4m3Tensor)                   \
-    X(kTrellis, 6, 0, 14, 5, kE4m3Tensor) X(kTrellis, 7, 0, 14, 5, kE4m3Tensor)                   \
-    /* the computed 65536-state trellis on the tcq_rb=32 grid */                                  \
-    X(kTrellisMad, 2, 0, 16, 5, kE4m3Tensor) X(kTrellisMad, 3, 0, 16, 5, kE4m3Tensor)             \
-    X(kTrellisMad, 4, 0, 16, 5, kE4m3Tensor) X(kTrellisMad, 5, 0, 16, 5, kE4m3Tensor)             \
-    X(kTrellisMad, 6, 0, 16, 5, kE4m3Tensor) X(kTrellisMad, 7, 0, 16, 5, kE4m3Tensor)             \
-    /* the computed trellis with a scale a row (no rescale a value) */                            \
-    X(kTrellisMad, 2, 0, 16, 0, kE4m3Tensor) X(kTrellisMad, 3, 0, 16, 0, kE4m3Tensor)             \
-    X(kTrellisMad, 4, 0, 16, 0, kE4m3Tensor) X(kTrellisMad, 5, 0, 16, 0, kE4m3Tensor)             \
-    X(kTrellisMad, 6, 0, 16, 0, kE4m3Tensor) X(kTrellisMad, 7, 0, 16, 0, kE4m3Tensor)             \
-    /* the computed trellis under a bf16 scale a (row, 128): the fold reads it in place */        \
-    X(kTrellisMad, 4, 0, 16, 0, kBf16) X(kTrellisMad, 5, 0, 16, 0, kBf16)                         \
-    X(kTrellisMad, 6, 0, 16, 0, kBf16) X(kTrellisMad, 7, 0, 16, 0, kBf16)                         \
-    /* the computed trellis under one scale a row and a factor a 128-K block */                  \
+#define HALO_IQR_FORMS(X)                                                                         \
+    /* libhalo builds IQR-V4's form alone: the computed trellis under one scale a row and a factor \
+     * a 128-K block, and under a bf16 scale a (row, 128) (libr4d builds every IQR form; a       \
+     * container in another one is refused at declare and falls to another library). */          \
     X(kTrellisMad, 2, 0, 16, 0, kRowF32) X(kTrellisMad, 3, 0, 16, 0, kRowF32)                     \
     X(kTrellisMad, 4, 0, 16, 0, kRowF32) X(kTrellisMad, 5, 0, 16, 0, kRowF32)                     \
     X(kTrellisMad, 6, 0, 16, 0, kRowF32) X(kTrellisMad, 7, 0, 16, 0, kRowF32)                     \
-    X(kTrellisMad, 2, 0, 15, 0, kRowF32)
+    X(kTrellisMad, 2, 0, 15, 0, kRowF32)                                                          \
+    /* the computed trellis under a bf16 scale a (row, 128) (an IQR-V4 container's MTP layer) */  \
+    X(kTrellisMad, 4, 0, 16, 0, kBf16) X(kTrellisMad, 5, 0, 16, 0, kBf16)                         \
+    X(kTrellisMad, 6, 0, 16, 0, kBf16) X(kTrellisMad, 7, 0, 16, 0, kBf16)
 
 /* The form word without its run, which the kernels take as an argument. */
 HALO_IQR_HD constexpr uint32_t kernel_word(uint32_t w) {
@@ -248,7 +232,7 @@ HALO_IQR_HD constexpr EmbedOff embed_off(const Form& f, int64_t rows, int64_t K)
 
 /* ---- the lm_head ------------------------------------------------------------------------------
  *
- * logits_gemm's row form (halo_fp8_lm.h) at B bits a code: each row its K codes packed as the
+ * logits_gemm's row form (r4d_fp8_lm.h) at B bits a code: each row its K codes packed as the
  * container stores them, then its bf16 scale per 128 columns, padded to 16 bytes; the table of
  * 2^B int8 entries after the last row, 256-aligned. Table forms of 2 to 6 bits, unrotated. */
 HALO_IQR_HD constexpr int64_t lm_row(const Form& f, int64_t K) {

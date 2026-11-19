@@ -224,6 +224,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
     Geom& g = m.g;
+    /* The attention rows are keyed on a whole number of queries a KV head. */
+    if (g.n_head_kv <= 0 || g.n_head % g.n_head_kv != 0) {
+        fprintf(stderr, "radiance: lfm3: %lld attention heads over %lld key/value heads is not a "
+                        "whole number of queries a key/value head\n",
+                (long long)g.n_head, (long long)g.n_head_kv);
+        return RAD_E_UNSUPPORTED;
+    }
     RAD_ARCH_TRY(read_schedule(meta, g.n_layer, &m.layers));
     m.width = meta_int(meta, "conv_L_cache", 0);
     if (m.width < 2 || m.width > 8) {

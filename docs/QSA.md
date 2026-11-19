@@ -213,6 +213,136 @@ nothing is allocated past the sequence, so `bt[n] >= 0` would work there. Mid-ch
 query finds a later token's live page in `bt[n]`, which `seqused` would then cover. The partial
 page is appended only when `(pos + 1) % ratio != 0`.
 
+## The sparse launch at a prefill chunk
+
+A row a query is what the op is, not how libr4d has to run it. The split-KV decode kernel takes a
+launch row in one wave, and each row gathers its own 2051 keys from the paged cache: at a
+2048-row chunk that is 4.3 GB of K and V a layer and rank, about 3 ms at a ninth of the card's
+bf16 WMMA rate, 12 % of a Qwen3.8-Flash-Next prefill chunk past the bound. The rows of a chunk
+are consecutive queries over one history and their lists overlap: neighbours share 53 % to 73 %
+of their pages, and eight consecutive rows name 1000 to 1750 distinct pages where their lists sum
+to 4104.
+
+Pinned to it (`r4d_attn_usel_gqa12_pin`, r4d_selftest), libr4d runs the same op from 256
+launch rows of `q_len` 1 (lists no wider than 520 pages, the bf16 cache, twelve queries a KV
+head: the model at two ranks), `attn_paged`, `attn_paged_gate_quant` or
+`attn_paged_gate_had_quant` with the same operands, as **tiles of eight rows over the union of
+their page lists** (`libr4d/r4d_attn_usel.h`). Nothing above libr4d changes: no operand, no
+schema, no graph. It is a switch and not the rule because the form is exact to rounding and not
+bit for bit, and a served model shows it ("What a served model makes of it", below).
+
+1. `r4d_usel_build_kernel`, a workgroup a tile: the union of the tile's lists, and beside each of
+   its pages the rows that list it, a bit a row. A hash table in LDS collects the pages
+   (compare-and-swap) and ORs the rows' bits together, so the result does not depend on which
+   thread ran first. The union is **ordered by (first row, last row, place in the first row's
+   list)**: a page read by rows a to b of the tile sits beside the others read from row a on and
+   until row b, so the pages one row reads lie in runs. Order and bits depend on which entries of
+   the lists name the same page and on nothing else: the same lists under other page ids give
+   the same bytes. A row's partial page keeps its place and the number of keys the row sees of it.
+2. `r4d_attn_usel_kernel`: K and V of sixteen keys of the union are staged once in LDS for the
+   tile's eight rows, a wave a row (its twelve heads, as in the decode kernel). A key scores -inf
+   for a row that does not list its page, so a row's softmax is over exactly its own keys, and a
+   wave whose row lists none of a tile's four pages skips the tile's matmuls: on a chunk's real
+   lists a row meets 36 % to 61 % of its tile's sixteen-key tiles, where its own list alone is
+   30 % to 52 % of them. It stores the decode kernel's partial (O / l in f16, m, l) as the row's
+   one segment.
+3. `r4d_attn_decode_usel_fb_kernel`: the decode kernel itself, for the tiles the builder hands
+   back: those whose rows share too little (lists that sum to less than 3/2 of their union: rows
+   of unrelated sequences, which a workgroup would walk one row at a time). A tile is served by
+   one kernel or the other, never both.
+4. The decode launch's merge, unchanged, with one segment a row: the output row, the gate and the
+   quantiser are computed from the partial as the decode launch computes them.
+
+On a R9700, 2048 rows of a real chunk (`r4d_selftest --perfusel`, the gated merge included):
+
+| lists | union of 8 rows | decode kernel | tiled |
+|---|---|---|---|
+| BetterBench's shuffled filler, the chunk at 10 K tokens | 1219 pages | 2.81 ms | 1.59 ms |
+| the same at 20 K | 1511 | 2.83 ms | 1.82 ms |
+| the same at 28 K | 1656 | 2.86 ms | 1.92 ms |
+| the same at 35 K | 1726 | 2.87 ms | 1.98 ms |
+| this repository's documentation at 10 K | 1006 | 2.80 ms | 1.49 ms |
+| the same at 22 K | 1172 | 2.82 ms | 1.59 ms |
+| the same at 35 K | 1268 | 2.83 ms | 1.75 ms |
+| rows of unrelated sequences, 512 pages each (handed back) | 4096 | 7.15 ms | 7.39 ms |
+
+**What is exact and what is not.** A row attends exactly the keys of its own list, each once: the
+masks are the lists. Every score is the decode kernel's bit for bit (a score is a chain of WMMAs
+over the head dimension and does not depend on which keys share its tile), and `p`, the rescale
+rule, the partial's format and the merge are the decode kernel's arithmetic. What differs is the
+order in which a row's softmax meets its keys: the decode kernel takes them sixteen at a time in
+the order of the row's list, this form in the order of the tile's union. That moves two
+roundings. The reference max against which every `p = 2^(s - m_ref)` is rounded to f16 is the max
+of the first sixteen keys a row meets (and of each later sixteen that outgrow it by 14 octaves),
+so another first tile is another rounding of every `p`, by 2^-11; and float addition is not
+associative. The two forms therefore agree to that rounding, not bit for bit: on a chunk's lists
+about 13 % of the bf16 output values differ, each by one unit in the last place of a value near
+the row's largest (at most 1.2 % of it), and 4 % of the int8 codes of the gated merge, each by 1.
+Both forms are as close to an f64 evaluation of each row's own key set as each other, and to
+libref's `attn_paged` (rel_l2 2.1e-3 either way): neither is the more exact one.
+
+**What a workgroup loads.** A row attends its own keys, but its workgroup stages the pages of
+the tile's union for all eight rows; the decode kernel loads no key past its row's count (it
+clamps the key index to the row's last key). A key a row does not see gets a `p` of exactly 0,
+and 0 times V is nothing only while V is finite. Not every slot of a cache is: behind the last
+token of the block a sequence ends in nothing has ever been written, the memory holds whatever
+it held before, which read as bf16 is as often inf or NaN as a number, and 0 * inf in one row's
+V product is a NaN in every row of the workgroup that walks those sixteen keys. So the form
+stages no slot the decode kernel would not have read for some row of the same tile. Beside each
+page of the union the builder leaves the number of its slots that **no row of the tile sees**
+(the page is some rows' partial page and no row's whole one), and the kernel stages zeros for
+those slots, K and V. Every other slot is read by one of the tile's own rows under the decode
+form as well, so it has been written. The kernel is launched as two instances, each returning
+from the other's tiles: one that reads those counts and one that does not, because the walk
+has no register to spare and the masks, compiled into it, cost every tile 5 % to 9 %. Where a
+launch starts on a page and a tile's rows fill their pages (a cold chunk), only the tile at the
+prompt's end takes the masking instance; where a launch starts inside a page (the first chunk
+of a turn appended to a session), every tile ends in a page whose other keys belong to the next
+tile's rows, and all of them do.
+
+That is the difference the dense and the sparse kernel already have below the bound ("Below the
+bound"), with the same consequence: a prefill chunk past the bound may differ in the last bit of
+a hidden state from what the decode kernel gave it, and a near-tie in a later greedy pick may
+fall the other way. It is deterministic: the same lists give the same bytes on every run and
+under every allocation of pages. A chunk's rows are tiled from the launch's first row, so a
+prefix-cache hit, which resumes where a cold prefill starts a chunk, recomputes the cold run's
+own tiles.
+
+What a served model makes of it (Qwen3.8-Flash-Next at two ranks, six fixed prompts of 4.5 K to
+42 K tokens, greedy, the first eight tokens' logprobs): with every tile handed back
+(the pin's limit of 1) text and logprobs are the decode launch's bit for bit. Tiled, the logprob
+of a picked token moved by at most 0.15 nats. At the one position of these continuations where
+three candidates share the probability (" to", " respond", " answer", 0.13 to 0.49 each) a
+candidate's logprob moved by up to 0.43 nats, and the greedy pick changed in two of the six
+prompts (the decode launch's two best were 0.24 and 0.41 nats apart there). Tiles of sixteen
+rows (the second geometry), a second reordering of the same sums, lie as far from tiles of
+eight as either lies from the decode kernel, and change the pick in two prompts too, one of them
+another prompt. So the moves are what this model, with an int8 quantiser behind every sparse
+attention, makes of a last-bit change in 4 % of those codes, and not an error of one order; but
+they are not ties in the last digit either, which is why the form is asked for and not the rule.
+
+Where a tile's rows share one list the form is byte-identical to the decode kernel, and likewise
+below the exactness bound, where a row's list is a prefix of its successor's and the union keeps
+every row's own order. `r4d_selftest` checks both, the hand-back, the independence of the page
+ids, each form against an f64 evaluation of every sampled row's own key set and against libref,
+and prints the share of values the two forms disagree in. Two more of its checks are there
+because bounded random queries over two thousand keys cannot see a mask that is one key off:
+queries that single out one key (of the row's own: both forms return that key's V, bit for bit;
+one the row must not read, a later token of its own block or a page only its neighbour lists:
+both return the softmax over the row's own keys), and a context that ends inside a page with
+inf and NaN in the slots behind its end (no output moves with them and none is not finite,
+whether the launch starts on a page or inside one). Every launch of the case finds its scratch
+full of ones, as an engine's is full of another launch's bytes.
+
+A served engine runs every sparse launch on the decode kernel: on Qwen3.8-Flash-Next at two ranks
+the tiled form measured no faster (cold prefill of 2000- and 6000-word prompts within 0.5%, the
+same text on those prompts). The test pin's limit of 1 keeps the builder and hands every tile
+back, which is the decode kernel's bytes by another road, and the second built geometry tiles
+sixteen rows instead of eight (slower: more of a larger union is read by nobody). `r4d_selftest --perfusel T CTX` times the forms on its own lists, on a real chunk's
+(`R4D_USEL_SEL`, `R4D_USEL_SEQU`: dumps written with `RADIANCE_DUMP_BUF=qsa_sel:2048,qsa_sequ:2048`
+and `RADIANCE_DUMP_DIR`), or on rows of unrelated sequences (`R4D_USEL_KIND=2`). The four-rank
+unit (six queries a KV head) keeps the decode kernel: the form has not been run at that ratio.
+
 ## Cost
 
 The indexer is the only part of a decode step that grows with context: `qsa_score` and
