@@ -7319,9 +7319,16 @@ static void moe_iqr_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, i
     struct Proj { const char* what; int64_t n0, n1, k0, k1, parts, run; bool srt; };
     static const Proj kProj[] = { { "gate_up 768:512 x 2560", 768, 512, 2560, 2560, 2, 128, false },
                                   { "down 2560 x 384:256", 2560, 2560, 384, 256, 1, 256, true } };
+    /* Local (--moetp1): Flash-Next IQR-V4's whole-expert gate_up as the aux card runs it (1280 rows
+     * by 2560 in two parts; its down projection is w4nl64, not IQR), at four bits only: the old
+     * --perfiqr, e.g. --moetp1 --perfmoeiqr 4096 20 320 5 0 8. */
+    static const Proj kProjTp1[] = { { "gate_up 1280 x 2560 (tp1)", 1280, 1280, 2560, 2560, 2, 128, false } };
     static const uint32_t kU[] = { 0, RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6, RAD_U7 };
-    for (const int B : { 3, 4, 5 })
-        for (const Proj& P : kProj) {
+    const std::vector<int> bits = g_moe_tp1 ? std::vector<int>{ 4 } : std::vector<int>{ 3, 4, 5 };
+    const std::vector<Proj> projs = g_moe_tp1 ? std::vector<Proj>(std::begin(kProjTp1), std::end(kProjTp1))
+                                              : std::vector<Proj>(std::begin(kProj), std::end(kProj));
+    for (const int B : bits)
+        for (const Proj& P : projs) {
             const int64_t Nc[2] = { P.n0, P.n1 }, Kc[2] = { P.k0, P.k1 };
             const int64_t N = std::max(P.n0, P.n1), K = std::max(P.k0, P.k1), nkb = K / 128;
             std::vector<RadParam> lp = { PI("N", Nc[0]), PI("K", Kc[0]), PI("N_odd", Nc[1]),
