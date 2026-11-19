@@ -275,20 +275,25 @@ template <uint32_t PITCH, uint32_t ND>
 __device__ __forceinline__ void moeq_stage_i8(uint16_t* __restrict__ lds, uint32_t row, uint32_t k0,
                                               const uint32_t (&w)[ND]) {
     static_assert(ND == 4 || ND == 8, "sixteen or thirty-two elements");
-    typedef __fp16 v2hf __attribute__((ext_vector_type(2)));
+    /* Local (our 2026-11-15 port): b + 128 as the low byte of the f16 0x64XX (1024 + b + 128),
+     * then 2^-8 and -4.5 in one packed fma: 2^-8 b exactly, two VALU a pair of codes instead of
+     * four conversions, four multiplies and two packs. */
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
     uint16_t* p = lds + (size_t)row * (PITCH / 2u) + k0;
+    const h2 mul = { (_Float16)0.00390625f, (_Float16)0.00390625f };
+    const h2 add = { (_Float16)-4.5f, (_Float16)-4.5f };
 #pragma unroll
     for (uint32_t i = 0; i < ND / 4u; ++i) {
         uint32_t d[8];
 #pragma unroll
         for (uint32_t x = 0; x < 4; ++x) {
-            const int32_t v = (int32_t)w[i * 4 + x];
-            const float f0 = (float)((v << 24) >> 24) * 0.00390625f;
-            const float f1 = (float)((v << 16) >> 24) * 0.00390625f;
-            const float f2 = (float)((v << 8) >> 24) * 0.00390625f;
-            const float f3 = (float)(v >> 24) * 0.00390625f;
-            d[2 * x]     = __builtin_bit_cast(uint32_t, (v2hf)__builtin_amdgcn_cvt_pkrtz(f0, f1));
-            d[2 * x + 1] = __builtin_bit_cast(uint32_t, (v2hf)__builtin_amdgcn_cvt_pkrtz(f2, f3));
+            const uint32_t u = w[i * 4 + x] ^ 0x80808080u;           /* b + 128, each byte */
+            const uint32_t lo = __builtin_amdgcn_perm(0x64646464u, u, 0x05010400u);   /* bytes 0,1 */
+            const uint32_t hi = __builtin_amdgcn_perm(0x64646464u, u, 0x05030402u);   /* bytes 2,3 */
+            const h2 vlo = __builtin_bit_cast(h2, lo) * mul + add;
+            const h2 vhi = __builtin_bit_cast(h2, hi) * mul + add;
+            d[2 * x] = __builtin_bit_cast(uint32_t, vlo);
+            d[2 * x + 1] = __builtin_bit_cast(uint32_t, vhi);
         }
         *(v4u*)(p + i * 16)     = v4u{ d[0], d[1], d[2], d[3] };
         *(v4u*)(p + i * 16 + 8) = v4u{ d[4], d[5], d[6], d[7] };
@@ -354,15 +359,27 @@ __device__ __forceinline__ v16hf moeq_frag(const uint16_t* __restrict__ lds, uin
  * SIMD), hence the waves-per-EU floor: the down tile's two-half form drew 196 and ran at half the
  * occupancy, 18% slower. The floor is two blocks a WGP (MTP * WGN / 2 waves a SIMD); not at W4 3,
  * whose four scale groups' accumulators would spill under it. */
+/* Local: the body is the kernel itself, its chained form's completion a scope guard, so every
+ * return reaches halo_chain_done once (what 2.2.0's __device__ body + wrapper does). With the body a
+ * separate function the four classes were by-value copies: every block loaded all four and picked
+ * the run's class a field at a time (27 s_cselect, 7 more s_load_b128), where kernel arguments are
+ * picked by one address -- Flash-Next's int8-activation down GEMM was ~4% slower on the 8060S. */
 template <int W4, bool ES, uint32_t NTL, uint32_t WGN, uint32_t HC, uint32_t FKP, uint32_t MTP = 2,
-          uint32_t WMP = 1>
-__device__ __forceinline__ void moe_gemm_q_kernel_body(
+          uint32_t WMP = 1, class CH = HaloUnchained>
+__global__ __launch_bounds__((ES ? 1u : MTP / WMP) * WGN * kWave)
+__attribute__((amdgpu_waves_per_eu(!ES && MTP >= 4u && W4 != 3 ? MTP / WMP * WGN / 2u : 1u)))
+void moe_gemm_q_kernel(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
     uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
     uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
     uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    if (CH::on) halo_chain_wait();
+    struct ChainDone {
+        __device__ ~ChainDone() { if (CH::on) halo_chain_done(); }
+    } chain_done_;
+    (void)chain_done_;
     /* `mode`: bit 0 `a_sorted`, bits 1-2 the class shift (1 for two classes, 2 for four), bit 4
      * kModeNl, bits 8+ `parts`. */
     const uint32_t a_sorted = mode & 1u, cshift = (mode >> 1) & 3u, parts = mode >> 8;
@@ -1051,22 +1068,6 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
     }
 }
 
-/* moe_gemm_q_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
-template <int W4, bool ES, uint32_t NTL, uint32_t WGN, uint32_t HC, uint32_t FKP, uint32_t MTP = 2,
-          uint32_t WMP = 1, class CH = HaloUnchained>
-__global__ __launch_bounds__((ES ? 1u : MTP / WMP) * WGN * kWave)
-__attribute__((amdgpu_waves_per_eu(!ES && MTP >= 4u && W4 != 3 ? MTP / WMP * WGN / 2u : 1u)))
-void moe_gemm_q_kernel(
-    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
-    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
-    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
-    uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
-    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
-    if (CH::on) halo_chain_wait();
-    moe_gemm_q_kernel_body<W4, ES, NTL, WGN, HC, FKP, MTP, WMP>(Aq, As, c_even, c_odd, c_2, c_3, sorted, off, Y, map, T, N, n_expert, top_k, a_ld, as_ld, y_ld, mode, tab);
-    if (CH::on) halo_chain_done();
-}
 
 /* Where the (tile, run) decode grid ends and the run-aligned prefill grid begins: an average of 1.5
  * routed rows per expert (libr4d's r4d_moe_decode_band, same measurement). */
@@ -1576,13 +1577,21 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
  *
  * Sorted operand only: a run's activation rows are [rs, re) of `Aq` with no gather. Every row in a
  * run is a placed slot (the scatter fills exactly [0, off[n_expert])), so `sorted` is not read. */
-template <int W4>
-__device__ __forceinline__ void moe_down_dec_kernel_body(
+/* Local: the kernel itself with a scope guard for the chained form's completion, as
+ * moe_gemm_q_kernel (the by-value classes of a separate body cost every block ~100 instructions). */
+template <int W4, class CH>
+__global__ __launch_bounds__(4 * kWave)
+void moe_down_dec_kernel(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
     const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
     uint32_t T, uint32_t N, uint32_t n_expert, uint32_t G,
     uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    if (CH::on) halo_chain_wait();
+    struct ChainDone {
+        __device__ ~ChainDone() { if (CH::on) halo_chain_done(); }
+    } chain_done_;
+    (void)chain_done_;
     constexpr uint32_t FM = 16, FN = 64, NTHR = 4 * kWave;
     constexpr uint32_t kSub = W4 == 3 ? 4u : (W4 == 2 || W4 == 4) ? 2u : 1u;
     constexpr uint32_t NPT = kMaxExpert / NTHR;
@@ -1912,19 +1921,6 @@ __device__ __forceinline__ void moe_down_dec_kernel_body(
     }
 }
 
-/* moe_down_dec_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
-template <int W4, class CH>
-__global__ __launch_bounds__(4 * kWave)
-void moe_down_dec_kernel(
-    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
-    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
-    const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
-    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t G,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
-    if (CH::on) halo_chain_wait();
-    moe_down_dec_kernel_body<W4>(Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N, n_expert, G, a_ld, as_ld, y_ld, mode, tab);
-    if (CH::on) halo_chain_done();
-}
 
 }  // namespace
 
