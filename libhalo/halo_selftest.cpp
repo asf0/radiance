@@ -26609,9 +26609,15 @@ static void moe_w4_gemm_a8(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, i
                         bool w5 = false, bool four = false, int64_t top_k = 2, int act8 = 0,
                         int64_t ag = 128) {
     const bool g64 = sub > 1, w8 = act8 == 2;
-    /* libhalo reads the codebook's levels exactly against an int8 activation too (moe_gemm_w4a8i8's
-     * row), where libr4d reads the nearest of one int8 set; the host decode follows libhalo. */
-    const float* tab = w5 ? kW5nlTable : kW4nlTable;
+    /* Local (2026-11-19): against an int8 activation the subgroup-scaled codebooks are read at
+     * libr4d's int8 levels (halo_args.h kW4nlI8, the iu8 path), as libr4d's own selftest decodes
+     * them; HALO_MOE_I8=0 keeps the kernels' exact f16 path and the exact table here. */
+    float tab_i8[16];
+    for (int i = 0; i < 16; ++i)
+        tab_i8[i] = (float)(i < 8 ? kW4nlI8[i] : -kW4nlI8[i - 8]) * kW4nlI8Unit;
+    const char* const i8env = std::getenv("HALO_MOE_I8");
+    const bool i8lv = act8 == 1 && g64 && !(i8env && i8env[0] == '0');
+    const float* tab = w5 ? kW5nlTable : i8lv ? tab_i8 : kW4nlTable;
     const char* const rname = w8 ? "moe_gemm_i8a8" : act8 ? "moe_gemm_w4a8i8" : "moe_gemm_w4a8";
     if (act8 && (w5 || (w8 && sub))) {
         ok((std::string(rname) + " (" + sh.name + ")").c_str(), false, "no such int8 form");

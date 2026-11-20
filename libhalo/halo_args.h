@@ -298,6 +298,12 @@ static constexpr float kW5nlTable[32] = {
  * Qwen3.8-Flash-Next at group 64 (slightly lower at 32, half a binade lower for w5nl). Under
  * 2^-13 each is a normal E4M3 value, and E4M3 has three mantissa bits in every binade. */
 static constexpr float kW4G64Scale = 0x1p-13f;
+/* Local (2026-11-19): w4nl's magnitudes as the int8 levels an int8 activation's iu8 WMMA
+ * multiplies, in units of kW4nlI8Unit -- libr4d's r4d_args.h kW4nlI8 / kW4nlI8Unit, verbatim, so
+ * the iGPU's experts read the codebook as the R9700's do (each level within 1.2% of the table;
+ * 2.4e-3 of the weight in relative L2 over Qwen3.8-Flash-Next's GPTQ code histogram). */
+static constexpr int8_t kW4nlI8[8] = { 6, 17, 29, 42, 58, 74, 95, 116 };
+static constexpr float kW4nlI8Unit = 0.18965f;
 
 
 /* ================================================================== skinny-GEMM variants
