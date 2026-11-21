@@ -1494,8 +1494,10 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
          * none, as libr4d's. */
         const bool chain = halo_geti_or(a, "chain", 0) != 0;
         /* At most four rows an expert under w4nl64a8i8h, the GEMV (halo_moe_gemv.hip), which
-         * stages no 16-row tile for each row. */
-        if constexpr (W4 == 2)
+         * stages no 16-row tile for each row. Local: on the exact f16 path only; the GEMV dots the
+         * table's f16 levels, and the int8 path (I8) keeps every form at kW4nlI8's levels so the
+         * forms agree byte for byte (HALO_MOE_I8=0 takes this path and the GEMV). */
+        if constexpr (W4 == 2 && !I8)
             if (form == 0 && g_moe_down_dec_pin == 0 && ncls == 2) {
                 const int grc = halo_moe_w4nl_gemv(a, stream, chain);
                 if (grc != RAD_E_UNSUPPORTED) return grc;
