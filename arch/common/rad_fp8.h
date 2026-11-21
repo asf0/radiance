@@ -39,6 +39,7 @@
 
 #include "rad_arch.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -1106,6 +1107,19 @@ inline bool lora_plain_view_enc(const RadEncoding& e) {
     return c && s && c->dtype == RAD_I8 && c->block[1] == 1 &&
            s->dtype == RAD_BF16 && s->block[0] == 1 && s->block[1] == RAD_FP8_BLOCK;
 }
+/* Local: the plain bf16 view (9bb3c3e6) only where RADIANCE_LORA_PLAIN_VIEW=1 asks for it. Upstream
+ * declares it over every rotated int8 trunk, LoRA or not: on Qwen3.8-Flash-Next IQR-V4 and
+ * Qwen3.8-27B IQR-V4 attn_output, ssm_out and ffn_down_shexp then run as bf16 GEMMs over a relaid
+ * copy (about +2 GiB and slower decode, docs/LORA-ROTATED.md section 5), and only the lora_plain
+ * kernel library, not built by default, presents that view. A server that loads runtime adapters
+ * on such a trunk sets the variable and lists lora_plain in its kernels. */
+inline bool lora_plain_view_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_LORA_PLAIN_VIEW");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
 inline bool lora_plain_view_src(std::initializer_list<const char*> src) {
     static const char* const kOff[] = { "mtp", "draft", "visual", "vision_tower", "vision_model",
                                         "audio_tower", "audio_model", "embed_vision",
@@ -1275,7 +1289,8 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
                        enc.plane[0].dtype == RAD_BF16;
     /* The plain view reads the bf16 plane, not codes: pretending it were an int8 linear would
      * tell the block its producer may skip the bf16 plane (GateQuantFP8's want_x). */
-    const bool view = plain_bf16_view && known && !plain && lora_plain_view_enc(enc) &&
+    const bool view = plain_bf16_view && lora_plain_view_on() && known && !plain &&
+                      lora_plain_view_enc(enc) &&
                       lora_plain_view_src(src);
     probed_i8 = !view && known && (linear_is_w8(enc) || linear_is_w8h(enc) || linear_is_wnh(enc));
     probed_g8 = known ? linear_w8h_group(enc) : (int64_t)RAD_FP8_BLOCK;
@@ -1410,7 +1425,8 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * constraints. */
     /* The LoRA detour (plain_bf16_view): the same plain `gemm_nt`, over a rotated int8 weight's
      * bf16-read view of its planes. */
-    const bool view = plain_bf16_view && known && !plain && lora_plain_view_enc(enc) &&
+    const bool view = plain_bf16_view && lora_plain_view_on() && known && !plain &&
+                      lora_plain_view_enc(enc) &&
                       lora_plain_view_src(src);
     bf16 = g.w_bf16 || plain || view;
     if (bf16) {
