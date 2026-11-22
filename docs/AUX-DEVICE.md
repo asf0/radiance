@@ -1,6 +1,6 @@
 # Aux device: a second card of another architecture (fork-only)
 
-This fork ([asf0/radiance](https://github.com/asf0/radiance)) tracks upstream
+This fork ([asf0/radiance-strix-egpu](https://github.com/asf0/radiance-strix-egpu)) tracks upstream
 [StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance). Upstream radiance runs a model on
 one or more *ranks*, cards of the same family that split the model by tensor parallelism. This fork adds
 an **aux device**: a second card of a *different* architecture, with its own kernel library, beside the
