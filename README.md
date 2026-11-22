@@ -1,5 +1,16 @@
 # radiance
 
+> **This is a fork** of [StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance) for one
+> setup: a Strix Halo machine (Radeon 8060S iGPU, `gfx1151`, 128 GB unified memory) with an
+> external Radeon AI PRO R9700 (`gfx1201`). It adds an **aux device**, a second card of another
+> architecture beside the model's card. Qwen3.8-Flash-Next's routed experts are split between the
+> R9700 and the iGPU, so the 113 GiB model runs fully resident at about 4.9K t/s prefill and 117 t/s
+> decode. The fork also has hot-first expert placement, a pipelined prefill across both cards,
+> libhalo kernels for IQR-V4 experts with an int8 down GEMM, a startup warm-up, and
+> `api-key-remote-only`. Usage, flags and environment variables are in
+> [`docs/AUX-DEVICE.md`](docs/AUX-DEVICE.md). Upstream is merged in regularly. The rest of this
+> README is upstream's.
+
 An inference server for AMD GPUs, in C++ and HIP: language models, and image, video, speech and
 music generation. Its HTTP API speaks OpenAI's chat, completions, Responses, images, audio and video
 APIs, Anthropic's Messages API and llama-server's native one, so their clients and SDKs work
@@ -426,6 +437,7 @@ ctest --test-dir build -L oot              # rebuilds every bundled plugin out o
 
 | | |
 |---|---|
+| [`docs/AUX-DEVICE.md`](docs/AUX-DEVICE.md) | fork-only: an aux card of another architecture (R9700 + 8060S), its flags and environment variables |
 | [`docs/GUIDE.md`](docs/GUIDE.md) | installing, converting, serving, the HTTP API, operating a server |
 | [`docs/TOOLS.md`](docs/TOOLS.md) | every flag of every tool, and the recipe syntax |
 | [`docs/DIAGNOSE.md`](docs/DIAGNOSE.md) | `diagnose`: the engine measures itself, and what makes a run a measurement |
