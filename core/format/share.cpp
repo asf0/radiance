@@ -20,9 +20,7 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
      * ones for several planes. That is where the plugin declared its share and stacked parts; a
      * block-fp8 scale plane's parts are 1/128 of its weight's. */
     const bool single = w.n_sel == 1;
-    /* Local: one rank still cuts a stated span (rad_weight_shard_span at world 1, an aux split). */
-    const bool whole = (world <= 1 && w.shard_hi <= 0 && w.n_part_spans <= 0) ||
-                       w.decl.shard == RAD_SHARD_NONE;
+    const bool whole = world <= 1 || w.decl.shard == RAD_SHARD_NONE;
     /* A reshape: one whole plane of single elements (a byte or more each) declared under another
      * shape with the same element count, which decl_weight admits. The row-major bytes are
      * identical, so the entry takes the declared shape. A shard would be a different cut and a
