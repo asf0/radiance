@@ -139,6 +139,7 @@ rad-convert [options] <input> -o <model.rad>
                        states; a number given here is used as given). 0 leaves the draft
                        head out
       --reuse FILE     copy every weight an earlier container holds identically
+      --reuse-only     with --reuse, refuse any selected weight without a matching source
       --changed FILE   with --reuse: checkpoint tensors (one name a line) that differ from
                        the --reuse container's source; every weight that reads one is converted
       --lora FILE|DIR  a PEFT adapter merged into the checkpoint tensors it names before they
@@ -150,9 +151,23 @@ rad-convert [options] <input> -o <model.rad>
                        their rule changed; the old planes stay as unreachable bytes
       --defer GLOB     leave the matching weights out, for a later --in-place run to add
       --gpus LIST      the cards (HIP device numbers, comma separated) quantisers may run on;
-                       large weights then run two at a time. The bytes are the host's
+                       large weights then run one per card. The bytes are the host's
+      --gpu-workers N  with --gpus, prefer N OpenMP workers for small trellis GPTQ jobs;
+                       N must leave at least one worker for other jobs and cannot exceed the cards in --gpus
+      --cpu            every quantiser's host path, even when --gpus is given
+      --large-f32-bytes N  a weight of N f32 bytes or more is quantised across every thread
+                       (with --gpus a card each), a smaller one on one thread (default 32 MiB)
       --plan-only      declare, plan every weight's encoding, print the plan, and stop
+      --sources FILE   one JSON line a planned weight: its shape, encoding, storage and the
+                       checkpoint tensors (and rows) its pieces and scales read
+      --dump-f32 SPEC:OUT  the f32 rows a quantiser is handed for 'NAME ROW0 NROWS' lines
       --report N       the worst N quantisation errors to print (default 20)
+      --no-error       skip the error report: no quantised weight is decoded back to
+                       measure it (the container's bytes are unchanged; an importing
+                       quantiser, which encodes nothing, spends most of its run there)
+      --resume         continue a killed write from its journal (<out>.journal), keeping the
+                       finished large weights; the default when the journal is there
+      --no-resume      ignore a journal and write afresh
   -v, --verbose
 ```
 
@@ -183,7 +198,7 @@ encoding: plain f32, f16 or bf16, FP8 with a block or per-row scale plane, or Qu
 (`core/format/checkpoint.h`, "Trivial"), or an imported form. Anything else is named and refused.
 The plugins' declare then judges the planned encodings as the engine will: a block-fp8, MXFP4,
 M2XFP4 or ParoQuant trunk weight is refused there by name (`linear_retired`,
-`arch/common/rad_fp8.h`), so a release stored that way takes rules that re-quantise it.
+`arch/common/rad_linear.h`), so a release stored that way takes rules that re-quantise it.
 
 ```
 # PATTERN                      QUANTISER  OPTIONS
@@ -336,6 +351,17 @@ rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
 - `autoround` and `paroquant` are slow. AutoRound's 200 default steps each cost N·K² multiply-adds;
   on a 16-core Zen 5 at about 2.5 TFLOP/s that is minutes for a 17408-wide down projection and
   most of a working day for a 27B dense model. `iters=50` takes a quarter of the time.
+- `--gpu-workers N` separates small trellis GPTQ jobs from other converter jobs: N OpenMP
+  workers prefer the trellis queue and the rest prefer the host/copy queue; workers steal from the
+  other queue once their own is empty. It requires `--gpus`, at most one worker per listed card, and at least one remaining host worker,
+  e.g. `OMP_NUM_THREADS=8 rad-convert ... --gpus 0 --gpu-workers 4`. Large jobs retain their
+  existing scheduling. The option can reduce starvation but cannot guarantee card utilization:
+  Hessian preparation, storage, CPU work and the last few jobs may still leave cards idle.
+- `--reuse-only` requires `--reuse` without `--in-place` and refuses a selected, non-deferred
+  weight unless one of the supplied containers matches its encoding, quantiser, options, shape and
+  expert slot. It is useful for assembling verified partial containers without silently
+  quantising a missing weight. `--plan-only` stops before matching reusable weights; it is not a
+  reuse-only completeness check.
 - `--reuse` / `--in-place` match a weight on its encoding, quantiser, options and shape, not on its
   source bytes, and carry whatever calibration made the old planes. Use `--reuse` only when the
   source and the calibration are the same, or name the changed source tensors with `--changed`.
@@ -992,6 +1018,17 @@ container is recorded at any `tp`; an int8 trunk at `tp: 1` from the codes its G
 (`RADIANCE_CALIB_DIR`, `RADIANCE_CALIB_TOKENS` set to the corpus's token count), which the same
 run fills. The quantisers read `gram.r<rank>.<weight>.bin`; a file here is that matrix once its
 triangle is mirrored.
+
+`inkling2` (Inkling 2 Mini) writes the quantisers' files directly, `gram.r<rank>.<stem>.bin` in the
+model's own domain, from its bf16 calibration container (`data/recipes/inkling2-mini-bf16.recipe`,
+the release's experts dequantised and rounded to bf16; about 53 GB, so `tp: 2`), or from an IQR
+container, at any `tp`: the routed experts' gate_up input pooled over a layer's experts
+(`blk.<l>.gu`, the pooled stem libquant reads for `blk.<l>.e<e>.gu`), each expert's own down input
+(`blk.<l>.e<e>.dn`) and their sum (`blk.<l>.dn`), and the attention linears' three inputs
+(`blk.<l>.wq`, `.wr` and `.gate` alike, `.wk`, `.wv`). A layer's files sum every one of its loop
+applications. Under tensor parallelism the experts' split SiTU product is gathered and put back in
+each expert's column order. `data/recipes/inkling2-mini-iq4r-v4.recipe` reads the directory as
+`calib=$CALIB`.
 
 ```python
 import numpy as np, safetensors.numpy as st

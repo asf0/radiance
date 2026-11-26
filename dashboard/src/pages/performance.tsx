@@ -21,14 +21,30 @@ interface Metric {
   show: (s: Stats, h: Series, slots: number | undefined, noun: string) => [string, string?, string?]
   lines: Line[]; fmt: (v: number) => string
   stack?: boolean; max?: number; tight?: boolean; integer?: boolean; bytes?: boolean; join?: boolean
+  joinGap?: { seconds: number; while?: string }
 }
 const one = (key: string, label: string): Line[] => [{ key, label, color: 1 }]
+// A rate has no value in a sample where work of its kind was under way but no step of it finished
+// (a long prefill step holds decode back); such gaps are drawn through while the model is busy
+// (history's `busy`: requests running, a step open or one finished) and stay gaps when it is idle.
+const BUSY = { seconds: 60, while: "busy" }
+// Measurements rather than rates (step time, acceptance, tokens per step, expert hits) exist only
+// where their kind of step ran; their points are joined across every gap, idle ones included.
+const JOIN_ALL = { seconds: 3600 }
 const METRICS: Metric[] = [
-  { id: "decode", kinds: "chat", label: "Decode", unit: "tok/s", show: (s) => [fin(s.decode_tps) ? fTps(s.decode_tps) : DASH], lines: one("decode", "tokens a second"), fmt: fTps },
+  { id: "decode", kinds: "chat", label: "Decode", unit: "tok/s", show: (s) => [fin(s.decode_tps) ? fTps(s.decode_tps) : DASH], lines: one("decode", "tokens a second"), fmt: fTps, joinGap: BUSY },
   { id: "step", kinds: "chat", label: "Step", unit: "ms",
-    show: (s, h) => { const v = h.last("step"); return [fin(v) ? (v >= 100 ? v.toFixed(0) : v.toFixed(2)) : DASH, (s.step_ns_decode_best ?? 0) > 0 ? "best " + fMs(s.step_ns_decode_best! / 1e6) : ""] },
-    lines: [{ key: "step", label: "step", color: 1 }, { key: "stepBest", label: "best", dash: true }], fmt: fMs, tight: true },
-  { id: "prefill", kinds: "chat", label: "Prefill", unit: "tok/s", show: (_s, h) => { const v = h.last("prefillRate"); return [fin(v) ? fTps(v) : DASH] }, lines: one("prefillRate", "tokens a second"), fmt: fTps, join: true },
+    // The newest sample only: with no decode step in it the figure is –, never an older step
+    // shown as current. The detail is the engine's best decode step.
+    show: (s, h) => { const c = h.col("step") ?? []; const v = c.length ? c[c.length - 1] : null;
+                    // A bare number: the tile appends the unit, and fMs would add it again.
+                    return [fin(v) ? (v >= 100 ? v.toFixed(0) : v.toFixed(2)) : DASH, (s.step_ns_decode_best ?? 0) > 0 ? "best " + fMs(s.step_ns_decode_best! / 1e6) : ""] },
+    lines: [{ key: "step", label: "step", color: 1 }, { key: "stepBest", label: "best", dash: true }], fmt: fMs, tight: true,
+    joinGap: JOIN_ALL },
+  // The newest sample; an idle rate reads 0 and the dash is only for a ring with no sample yet. The
+  // draft tiles below keep their last value instead, since acceptance is undefined, not 0, when a
+  // sample drafted nothing.
+  { id: "prefill", kinds: "chat", label: "Prefill", unit: "tok/s", show: (_s, h) => { const c = h.col("prefill") ?? []; if (!c.length) return [DASH]; const v = c[c.length - 1]; return [fin(v) ? fTps(v) : fTps(0)] }, lines: one("prefill", "tokens a second"), fmt: fTps, joinGap: BUSY },
   // Time in the vision encoder. A model reading an image can sit here for seconds with its cards
   // busy and nothing stepping, which the decode and prefill lines alone show as idle.
   { id: "encode", kinds: "chat", label: "Vision encode", unit: "%",
@@ -42,17 +58,25 @@ const METRICS: Metric[] = [
     },
     lines: one("encBusy", "of the time encoding"), fmt: fPc, max: 1 },
   { id: "reqs", kinds: "chat", always: true, label: "Requests",
-    show: (s, _h, slots) => [String(s.running ?? 0), (slots ? "of " + slots + " slots" : "") + (s.waiting ? " · " + s.waiting + " waiting" : "")],
+    show: (s, _h, slots) => [String(s.running ?? 0), [slots ? "of " + slots + " slots" : "", s.waiting ? s.waiting + " waiting" : "",
+      (s.step_open_phase === 0 || s.step_open_phase === 2) && (s.step_open_s ?? 0) >= 1 ? "prefill step running for " + fDur(s.step_open_s) : ""].filter(Boolean).join(" · ")],
     lines: [{ key: "running", label: "running", color: 1 }, { key: "waiting", label: "waiting", color: 5 }, { key: "preempted", label: "preempted", color: 2 }], fmt: (v) => fNum(v), stack: true, integer: true },
   { id: "kv", kinds: "chat", label: "KV cache",
     show: (s) => { const [v, u] = bytesParts(s.kv_bytes_used); return [v, "of " + fBytes(s.kv_bytes_total), u] },
     lines: [{ key: "kvRead", label: "in use", color: 1 }, { key: "kvKept", label: "cached for the next turn", color: 4 }], fmt: fBytes, stack: true, bytes: true },
+  // The same pool counted in tokens: held now against what it holds at present and the most it can
+  // grow to when every lendable block goes to the cache. Absent for a model with no paged pool.
+  { id: "kvtok", kinds: "chat", label: "KV tokens",
+    show: (s) => [fNum(s.kv_tokens_used), "of " + fNum(s.kv_tokens_total)
+      + ((s.kv_tokens_max ?? 0) > (s.kv_tokens_total ?? 0) ? " · up to " + fNum(s.kv_tokens_max) : "")],
+    lines: [{ key: "kvTokUsed", label: "in use", color: 1 }, { key: "kvTokCap", label: "capacity now", color: 2, dash: true }, { key: "kvTokMax", label: "capacity if all flexible space is used", color: 5, dash: true }],
+    fmt: (v) => fNum(v), integer: true },
   { id: "hit", kinds: "chat", label: "Prefix cache hits", unit: "%", show: (s) => [fin(s.prefix_hit_rate) ? fPct(s.prefix_hit_rate) : DASH], lines: one("hit", "of prompt tokens"), fmt: fPc, max: 1 },
-  { id: "accept", kinds: "chat", label: "Acceptance", unit: "%", draft: true, show: (_s, h) => [fPct(h.last("accept"))], lines: one("accept", "of drafted tokens"), fmt: fPc, max: 1 },
-  { id: "tok", kinds: "chat", label: "Tokens per step", draft: true, show: (_s, h) => { const v = h.last("tokStep"); return [fin(v) ? v.toFixed(2) : DASH] }, lines: one("tokStep", "tokens"), fmt: (v) => v.toFixed(2), tight: true },
+  { id: "accept", kinds: "chat", label: "Acceptance", unit: "%", draft: true, show: (_s, h) => [fPct(h.last("accept"))], lines: one("accept", "of drafted tokens"), fmt: fPc, max: 1, joinGap: JOIN_ALL },
+  { id: "tok", kinds: "chat", label: "Tokens per step", draft: true, show: (_s, h) => { const v = h.last("tokStep"); return [fin(v) ? v.toFixed(2) : DASH] }, lines: one("tokStep", "tokens"), fmt: (v) => v.toFixed(2), tight: true, joinGap: JOIN_ALL },
   { id: "ethru", kinds: "embed", always: true, label: "Throughput", unit: "tok/s", show: (s) => [fin(s.prefill_tps) ? fTps(s.prefill_tps) : DASH], lines: one("prefill", "tokens a second"), fmt: fTps },
   { id: "erate", kinds: "embed", always: true, label: "Inputs", unit: "/s", show: (_s, h) => { const v = h.last("reqRate"); return [fin(v) ? fTps(v) : DASH] }, lines: one("reqRate", "inputs a second"), fmt: fTps },
-  { id: "estep", kinds: "embed", always: true, label: "Step", unit: "ms", show: (_s, h) => { const v = h.last("stepAny"); return [fin(v) ? v.toFixed(2) : DASH] }, lines: one("stepAny", "step"), fmt: fMs, tight: true },
+  { id: "estep", kinds: "embed", always: true, label: "Step", unit: "ms", show: (_s, h) => { const c = h.col("stepAny") ?? []; const v = c.length ? c[c.length - 1] : null; return [fin(v) ? v.toFixed(2) : DASH] }, lines: one("stepAny", "step"), fmt: fMs, tight: true },
   { id: "eflight", kinds: "embed", always: true, label: "Active requests", show: (s) => [String(s.in_flight ?? 0)], lines: one("flight", "in flight"), fmt: (v) => fNum(v), integer: true },
   { id: "jrun", kinds: "gen", always: true, label: "Running", show: (s) => [String(s.jobs?.running ?? 0)], lines: one("jobRun", "running"), fmt: (v) => fNum(v), integer: true },
   { id: "jdone", kinds: "gen", always: true, label: "Completed", show: (s) => [fNum(s.jobs?.done), s.jobs?.failed ? s.jobs.failed + " failed" : ""], lines: one("jobDone", "made"), fmt: (v) => fNum(v), integer: true },
@@ -155,10 +179,13 @@ export function Performance({ scope, kind, slots, noun, model, cards }: { scope:
                 className={cn("relative -mb-px flex min-w-0 flex-col gap-1 border-r border-b px-4 py-3 text-left transition-colors outline-none last:border-r-0 hover:bg-accent/50 focus-visible:bg-accent/60", on && "bg-accent/40")}>
                 <span className="truncate text-xs font-medium text-muted-foreground">{m.id === "jdone" && noun ? noun : m.label}</span>
                 <span className="num flex items-baseline gap-1 text-xl leading-none font-semibold tracking-tight">
-                  <span className="truncate">{v}</span>
+                  {/* Not `truncate`: a flex child with it shrinks before its unit sibling, so a five-character
+                      figure came out as `12.91 ⋯`. This is the tile the Performance page actually draws -
+                      `Kpi` is the Overview/Requests/Sessions one. */}
+                  <span>{v}</span>
                   {(unit ?? m.unit) && <span className="text-xs font-normal text-muted-foreground">{unit ?? m.unit}</span>}
                 </span>
-                <span className="min-h-4 truncate text-xs text-muted-foreground">{det}</span>
+                <span className="min-h-4 text-xs text-muted-foreground break-words [overflow-wrap:anywhere]">{det}</span>
                 {on && <span className="absolute inset-x-0 bottom-0 h-0.5 bg-primary" />}
               </button>
             )
@@ -168,7 +195,7 @@ export function Performance({ scope, kind, slots, noun, model, cards }: { scope:
           {metric.lines.length > 1 && <Legend lines={metric.lines} />}
           {shownOverlay && <Legend lines={shownOverlay.lines} />}
           <Chart key={metric.id} data={h} version={scope.version} lines={metric.lines} range={range} fmt={metric.fmt} height={300}
-            stack={metric.stack} max={metric.max} tight={metric.tight} integer={metric.integer} bytes={metric.bytes} join={metric.join}
+            stack={metric.stack} max={metric.max} tight={metric.tight} integer={metric.integer} bytes={metric.bytes} join={metric.join} joinGap={metric.joinGap}
             overlay={shownOverlay} bands={encSpans?.length ? encSpans : undefined} />
         </div>
       </div>
@@ -221,6 +248,8 @@ function HardwarePanels({ data, version, cards, range }: { data: Series; version
 const TIER: Record<string, string> = { active: "var(--series-1)", resident: "var(--series-1)", staged: "var(--series-4)", warm: "var(--series-3)", host: "var(--series-5)", ram: "var(--series-5)" }
 function ExpertsPanel({ ex, h, version, range }: { ex: Experts; h: Series; version: number; range: number }) {
   const parts: Part[] = (ex.tiers ?? []).filter((t) => t.units > 0).map((t) => ({ key: t.name, label: t.name, value: t.bytes || t.units, color: TIER[t.name.toLowerCase()] ?? "var(--idle)", text: `${fNum(t.units)} units · ${fBytes(t.bytes)}` }))
+  // With every unit in VRAM nothing is routed from elsewhere and nothing moves: the placement alone is shown.
+  const tiered = ex.tiered === true
   return (
     <div className="grid gap-4 lg:grid-cols-3">
       <Panel title="Experts" description={`${fNum(ex.n_units)} units by where they are`}>
@@ -233,15 +262,15 @@ function ExpertsPanel({ ex, h, version, range }: { ex: Experts; h: Series; versi
           )}
         </div>
       </Panel>
-      <Panel title="Expert hit rate" description="Share of routed experts already on the accelerator">
-        <Chart data={h} version={version} lines={[{ key: "expHit", label: "hits", color: 1 }]} range={range} fmt={fPc} max={1} height={170} />
-      </Panel>
-      <Panel title="Expert moves" description="Units per second">
+      {tiered && <Panel title="Expert hit rate" description="Share of routed experts already on the accelerator">
+        <Chart data={h} version={version} lines={[{ key: "expHit", label: "hits", color: 1 }]} range={range} fmt={fPc} max={1} height={170} joinGap={JOIN_ALL} />
+      </Panel>}
+      {tiered && <Panel title="Expert moves" description="Units per second">
         <div className="flex flex-col gap-2">
           <Legend lines={[{ key: "expIn", label: "onto the accelerator", color: 1 }, { key: "expOut", label: "off the accelerator", color: 2 }]} />
           <Chart data={h} version={version} lines={[{ key: "expIn", label: "onto the accelerator", color: 1 }, { key: "expOut", label: "off the accelerator", color: 2 }]} range={range} fmt={(v) => fTps(v) + "/s"} stack height={150} />
         </div>
-      </Panel>
+      </Panel>}
     </div>
   )
 }

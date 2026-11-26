@@ -161,7 +161,7 @@ static bool w4_asym(const RadParam* p, int n_p) {
  *
  * Not shardable: a packed row is K/2 bytes and a column shard could cut a byte in half. Under
  * expert parallelism an expert is whole on one rank, the only configuration that declares this
- * format; rad_block_moe_fp8.h refuses a width-sharded declaration.
+ * format; the architecture's MoE block refuses a width-sharded declaration.
  */
 /* `dtype=w4a8h` serves `i4*bf16[1x128]/fwht128`: the same bytes, but every group of K was
  * multiplied by a `group`-wide Hadamard before quantisation. Nothing in packing, extents or byte
@@ -572,61 +572,6 @@ extern "C" int r4d_rad_unrelayout_w5(const RadParam* p, int n_p, int operand, co
     return RAD_OK;
 }
 
-/* ---- givens pairs: ParoQuant's rotation pairs (i32 [P*S, K]), stored unchanged but checked. The
- * rotate kernels index a group's 128 LDS slots with them unchecked, so a stage that is not a
- * pairing within its own group (an index outside the group, or a column twice) is refused at load.
- * Operand 1 of the givens rows; the other operands are stored as they are. */
-namespace {
-constexpr int GV_PAIRS_OPERAND = 1;
-constexpr long long GV_GROUP = 128;
-
-}  /* namespace */
-
-/* ---- givens_dense: ParoQuant's rotation as one dense matrix per (part, group).
- *
- * The dense kernel (r4d_givens_dense.hip) applies a part's Givens stages over each group of 128
- * columns as T (x / D), T being their composition. rad-convert composes T and stores it as the
- * "givens" encoding's "t.dense" table, f16 [P * K/128, 128 * 128]: in row p * (K/128) + g, element
- * j * 128 + i is output j for unit input e_i (abi/rad_encoding.h). The kernel stages a (part,
- * group), 32 KiB, whole in that order, so the layout is the table as stored. Operand 1 of
- * givens_dense_quant; everything else stays as stored. */
-namespace {
-constexpr int GD_OPERAND = 1;
-constexpr long long GD_GROUP = 128;
-
-int gd_geom(const RadParam* p, int n_p, const RadEncoding* enc, const int* sel, const RadTensor* pl, int n,
-            long long* P, long long* K) {
-    if (n != 1 || std::strncmp(r4d_enc::role(enc, sel, 0), "t.dense", RAD_ENC_STR) != 0) return RAD_E_SHAPE;
-    *K = r4d_pgeti_or(p, n_p, "n", 0);
-    *P = r4d_pgeti_or(p, n_p, "parts", 1);
-    if (*K <= 0 || *K % GD_GROUP || *P < 1) return RAD_E_SHAPE;
-    if (!dims(pl[0], *P * (*K / GD_GROUP), GD_GROUP * GD_GROUP) || pl[0].dtype != RAD_F16) return RAD_E_SHAPE;
-    return RAD_OK;
-}
-}  /* namespace */
-
-extern "C" int r4d_rad_layout_gdense(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
-                                     const int* sel, const RadTensor* pl, int n, RadLayout* out) {
-    if (!out || !pl) return RAD_E_INVAL;
-    if (operand != GD_OPERAND) return RAD_E_UNSUPPORTED;
-    long long P, K;
-    const int rc = gd_geom(p, n_p, enc, sel, pl, n, &P, &K);
-    if (rc != RAD_OK) return rc;
-    fill(out, "r4d.givens.dense.g128", RAD_F16, P * K, GD_GROUP, P * K * GD_GROUP * 2);
-    return RAD_OK;
-}
-
-extern "C" int r4d_rad_relayout_gdense(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
-                                       const int* sel, const RadTensor* pl, int n, void* dst,
-                                       int64_t dst_bytes) {
-    RadLayout L;
-    int rc = r4d_rad_layout_gdense(p, n_p, operand, enc, sel, pl, n, &L);
-    if (rc != RAD_OK) return rc;
-    if (dst_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
-    std::memcpy(dst, pdata(pl[0]), (size_t)L.bytes);
-    return RAD_OK;
-}
-
 /* ---- w8: i8 codes, symmetric about zero, an f16 scale per group. The f16 kernel (a16) reads the
  * code as offset binary with zero 128 in the shared dword; the int8 kernel (a8) reads it signed
  * with a bare f16 scale plane. */
@@ -894,32 +839,6 @@ extern "C" int r4d_rad_relayout_mxfp4(const RadParam* p, int n_p, int operand,
     });
     return RAD_OK;
 }
-
-/* ---- M2XFP4: the M2 analogue of MXFP4 above, the paper's weight-side Sg-EM (arXiv 2601.19213
- * §4.4.2). The quantiser's own scheme "m2xfp4", three TILED planes over the same 32-column groups:
- *
- *   codes  fp4_e2m1  [1 x 1]   element 2j in bits 0-3 of byte j -- radiance MXFP4's codes
- *   scale  e8m0      [1 x 32]  per group, the adaptive bias already folded into the stored byte
- *   meta   u8        [1 x 32]  one byte a group: subgroup s = columns [8s, 8s+8), bits [2s, 2s+2)
- *
- * The exact element is e2m1mag[c&7] . sign(c) . 2^(scale-127) . (1 + k_s/4). What the kernels read
- * is the mxfp4 arrangement with the meta plane riding the stored weight's tail, in the scale
- * plane's [K/32][N] order: codes in fragment order, then K/32 rows of N meta bytes, so both GEMM
- * rows read it with the exponents' own geometry (r4d_gemm_m2xfp4a8_*.hip). b_ref stays each row's
- * largest exponent byte, the same derivation a reader of the plane could compute -- and it is what
- * bounds the fold: d >= 0 for every block, so the largest e4m3 a table cell holds is the x1.75
- * magnitude 10.5 scaled by 2^-d, a normal at every d >= 0.
- *
- * Anything else is refused: this kernel library decodes one scheme, and a weight whose meta plane
- * said something else would decode to other numbers.
- *
- * A rotated weight (ParoQuant's M2XFP4) carries the same three planes in the basis its "givens"
- * transform names, with the rotation's tables beside them -- the rotated MXFP4 weight's shape plus
- * the meta plane. The GEMM reads the planes as for an unrotated weight; the rotation is applied to
- * the activation (givens_dense_quant), whose tables are separate weight operands. */
-namespace {
-
-}  /* namespace */
 
 /* ---- bf16x12: libquant's lossless 12-bit form of a bf16 weight (lq_bf16x12.cpp), for
  * gemm_bf16x12_nt_m16, _m64 and _tiled. Its four planes, in natural k order:
