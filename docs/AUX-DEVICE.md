@@ -19,8 +19,9 @@ What runs on the aux device:
   layer (`aux-split`, the hottest ones with `RADIANCE_AUX_PERM`). The 8060S runs the rest straight from
   pinned host memory. A 113 GiB model can then run with every weight resident on a 32 GB card plus the
   iGPU, without streaming experts over the link per token.
-- **Qwen3.8-27B (`qwen35`)**, optional: the last N dense feed-forward channels of every layer
-  (`RADIANCE_AUX_FF`). Decode gets slightly faster and prefill slower, so it is off by default.
+
+Qwen3.8-27B runs on the R9700 alone. A dense feed-forward split onto the iGPU (`RADIANCE_AUX_FF`) cost
+7-15% prefill for under 2% decode and was dropped at the 2.3.0 merge.
 
 Everything else (attention, delta-net, shared experts, the head, MTP, KV cache) stays on the rank's
 card.
@@ -118,18 +119,15 @@ All of these are fork-only. Defaults are what the fleet runs.
 | variable | default | effect |
 |---|---|---|
 | `RADIANCE_AUX_PERM` | unset | Hot-first expert permutation file (above). |
-| `RADIANCE_AUX_FF` | unset (off) | `qwen35`: the last N feed-forward channels of each layer go to the aux card, rounded to the trunk's group. 27B, N=3072: decode 84.7 vs 83.2 t/s alone, prefill about 15% slower. |
 | `RADIANCE_WARMUP` | on | Before the server listens, run one synthetic prompt of a whole step plus one of 600 tokens, so the first request isn't cold (+3 s of startup). `0` skips it. |
 | `RADIANCE_MOE_PASS_ROWS` | `max-num-batched-tokens / 2` | Rows per MoE pass in the aux pipe (a multiple of 64). Wider passes read the aux experts less often per token. |
 | `RADIANCE_AUX_DMA_ROWS` | `64` | From this many rows up, the aux card's expert output is copied into VRAM by DMA on a separate lane instead of read over the link. `0` turns it off. |
-| `RADIANCE_AUX_SDMA` | `1` | `RADIANCE_AUX_FF`: wide copies go to the DMA engine. `0` uses copy kernels. |
 | `RADIANCE_AUX_R_EXPERTS` | unset | Older override for `aux-split` on `qwen4exp`. |
 | `RADIANCE_AUXPIPE_OFF` | unset | Turns off the pipelined prefill (two pieces per step, so the cards overlap). For debugging. |
 | `RADIANCE_AUXPIPE_NOQP` / `RADIANCE_AUXPIPE_NOPRE` | unset | Turn off per-piece attention, or the early projections, in the aux pipe. For debugging. |
 | `RADIANCE_AUX_MOE_OFF` | unset | Keeps the aux device loaded but runs the MoE on the rank's card. For debugging. |
 | `RADIANCE_AUX_NOCHAIN` | unset | Turns off chained launches beside an aux device. |
 | `HALO_MOE_I8` | `1` | `libhalo`: the w4nl expert down projection against an int8 activation runs on int8 WMMA, with the codebook at libr4d's int8 levels. That is 17-22% faster than f16 at the kernel. `0` selects the exact f16 levels and upstream's T ≤ 4 decode GEMV. |
-| `RADIANCE_LORA_PLAIN_VIEW` | unset (off) | `1` turns on upstream's LoRA plain bf16 view of attn_output, ssm_out and ffn_down_shexp on rotated int8 trunks. Off, because it costs about 2 GiB and needs the `lora_plain` library, which this setup doesn't load. |
 
 ## The iGPU alone
 
@@ -162,20 +160,18 @@ and long corpora.
 
 - **A GPU memory fault at startup, about 1 start in 14.** It happens in `r4dchain_copy16` on device
   0, during the warm-up's 8192-token prompt. It is most likely the lane-1 DMA of the aux experts'
-  output (`MoeFP8::pass_aux`). Restarting fixes it. Not yet fixed.
-- Only `qwen4exp` (routed experts, with shared experts and rotated experts) and `qwen35` (dense
-  feed-forward) have aux paths. Other models ignore `aux-device`.
+  output (`MoeQ::pass_aux`). Restarting fixes it. Not yet fixed.
+- Only `qwen4exp` (routed experts, with shared experts and rotated experts) has an aux path. Other models ignore `aux-device`.
 - One aux card per process. A fleet can hold several models, but only those that set `aux-device`
   use the card.
 
 ## For plugin authors
 
-The fork adds these to the plugin ABI (`abi/rad_runtime.h`, `abi/rad_device.h`), so the arch plugins
+The fork adds these to the plugin ABI (`abi/rad_runtime.h`, upstream's ABI 44), so the arch plugins
 here need this fork's core:
 
 - `rad_aux_device`, `rad_aux_split`, `rad_aux_window`
 - `rad_buf_aux_local`
-- `rad_memcpy_list_async`
 - `rad_lane_mark`, `rad_lane_wait_mark`, `rad_lane_stream`
 - `rad_weights_epoch`
 
@@ -191,5 +187,5 @@ git remote add upstream https://codeberg.org/StillDeadcode/radiance.git
 git fetch upstream && git merge upstream/main
 ```
 
-Upstream changes to `libhalo/halo_moe_gemm_q.hip`, `arch/common/rad_block_moe_fp8.h`,
+Upstream changes to `libhalo/halo_moe_gemm_q.hip`, `arch/common/rad_block_moe_q.h`,
 `arch/qwen4exp_fp8/` and `core/engine_bringup.cpp` are where conflicts usually show up.
